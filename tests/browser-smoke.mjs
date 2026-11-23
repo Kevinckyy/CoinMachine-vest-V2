@@ -574,6 +574,15 @@ try {
   assert.equal(accountCache.floors.Alpha.floor,970);
   await vest.evaluate("sessionStorage.removeItem('tradeSelector')");
   await vest.evaluate("sessionStorage.setItem('testPayout','yes')");
+  const quoteId=randomUUID();
+  await api('commands/'+quoteId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'profit.available',params:{}});
+  const pageQuote=await until(async()=>{
+    const c=await api('commands/'+quoteId);
+    if(c.status!=='succeeded')throw Error(c.status+' '+c.error);
+    return c.result;
+  },'read the platform withdrawable amount with no financial click');
+  assert.equal(pageQuote.available,40);
+  assert.equal(await vest.evaluate("sessionStorage.getItem('testPayoutDebited')"),null);
   const readLive=randomUUID();
   await api('commands/'+readLive,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'account.read',params:{}});
   await until(async()=>(await api('commands/'+readLive)).status==='succeeded','read funded test account before its claim');
@@ -586,6 +595,10 @@ try {
     return c;
   },'full claim across directly loaded documents with no navigation bar',45000);
   assert.deepEqual([claimed.result.amount,claimed.result.expected_received,claimed.result.balance_after],[40,32,1960]);
+  assert.equal(await vest.evaluate("sessionStorage.getItem('testPayoutDebited')"),'1');
+  const emptyQuote=randomUUID();
+  await api('commands/'+emptyQuote,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'profit.available',params:{}});
+  await until(async()=>(await api('commands/'+emptyQuote)).result?.available===0,'read zero withdrawable after the debit');
   assert.equal(await vest.evaluate("sessionStorage.getItem('testPayoutDebited')"),'1');
   await ui.evaluate("document.querySelector('[data-value=nodes]').click();document.querySelector('[data-op=deployUpdate]').click()");
   await ui.evaluate(`(() => {const f=document.getElementById('dialogForm'); for(const box of f.querySelectorAll('[name=target]')) box.checked=box.value==='lab'; f.elements.revision.value=${JSON.stringify(second)}; f.requestSubmit();})()`);

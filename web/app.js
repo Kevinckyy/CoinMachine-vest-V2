@@ -43,6 +43,7 @@ const actionTitles = {
   'accounts.read_all': '全量读取账户信息',
   'account.read': '读取账户状态',
   'positions.read': '读取持仓',
+  'profit.available': '读取可领利润',
   'history.read': '同步订单与盈亏历史',
   'order.open': '市价开仓',
   'order.close': '全量平仓',
@@ -82,7 +83,7 @@ const dir = {
   sell: '做空',
   random: '每批随机'
 };
-const READ = ['accounts.list', 'accounts.read_all', 'account.read', 'positions.read', 'history.read', 'page.navigate'];
+const READ = ['accounts.list', 'accounts.read_all', 'account.read', 'positions.read', 'profit.available', 'history.read', 'page.navigate'];
 const tag = (label, cls = '') => `<span class="tag ${cls}"><i class="dot"></i>${esc(label)}</span>`;
 const badge = c => c.cancel_requested ? tag('取消中', 'warn') : tag(...(statuses[c.status] || [c.status]));
 const money = n => Number.isFinite(n) ? n.toLocaleString('zh-CN', {

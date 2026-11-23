@@ -353,6 +353,7 @@ class FleetTest(unittest.TestCase):
             verify_financial_receipt(cmd,proof)
 
     def test_strategy_live_debit_is_verified_before_one_same_batch_reentry(self):
+        self.plugin_meta["plugin_version"] = self.center.plugin_version
         live = self.card("Live",category="funded",phase="live")
         obs = {**self.reading("Live"),"category":"funded","phase":"live"}
         self.card_report("east",[live])
@@ -373,31 +374,38 @@ class FleetTest(unittest.TestCase):
         self.plugin("east","result",id=opened["id"],ok=True,result={"observation":{**obs,"snapshot":filled}})
         self.center.sync("east")
         self.time += 1
-        flat = {**obs,"snapshot":{**obs["snapshot"],"observed_at":self.time,"balance":1020,"equity":1020}}
+        flat = {**obs,"snapshot":{**obs["snapshot"],"observed_at":self.time,"balance":1070,"equity":1070}}
         self.report("east",observation=flat)
         self.center.sync("east")
         self.center.decide()
         self.center.decide()
         self.center.sync("east")
+        quote = self.plugin("east","poll")["command"]
+        self.assertEqual(quote["action"],"profit.available")
+        self.plugin("east","result",id=quote["id"],ok=True,result=dict(account="Live",phase="live",available=20,observed_at=self.time))
+        self.center.sync("east")
+        self.center.decide()
+        self.center.sync("east")
         claim = self.plugin("east","poll")["command"]
         self.assertEqual((claim["action"],claim["params"]["amount"],claim["strategy_payout"]["open_id"]),
                          ("profit.withdraw",10,opened["id"]))
-        proof = dict(amount=10,received=8,balance_before=1020,available=20,recipient="main",
+        self.assertEqual(claim["strategy_payout"]["quote_id"],quote["id"])
+        proof = dict(amount=10,received=8,balance_before=1070,available=20,recipient="main",
                      flat=dict(leverage=0,position_margin=0,order_margin=0,observed_at=self.time))
         with self.assertRaisesRegex(Problem,"领取预览"):
             self.plugin("east","intent",id=claim["id"],stage="withdraw",proof={**proof,"available":40})
         self.assertTrue(self.plugin("east","intent",id=claim["id"],stage="withdraw",proof=proof)["authorize_click"])
         self.assertFalse(self.plugin("east","intent",id=claim["id"],stage="withdraw",proof=proof)["authorize_click"])
         self.time += 1
-        after = {**obs,"snapshot":{**flat["snapshot"],"observed_at":self.time,"balance":1010,"equity":1010,"daily_floor":959.75}}
+        after = {**obs,"snapshot":{**flat["snapshot"],"observed_at":self.time,"balance":1060,"equity":1060,"daily_floor":959.75}}
         res = self.plugin("east","result",id=claim["id"],ok=True,result=dict(observation=after,amount=10,expected_received=8,
-                               recipient="main",balance_before=1020,balance_after=1010,verification="source_balance_debited"))
+                               recipient="main",balance_before=1070,balance_after=1060,verification="source_balance_debited"))
         self.assertEqual(res["status"],"succeeded")
         self.center.sync("east")
         for _ in range(3):
             self.center.decide()
         records = self.center.state("east")["commands"]
-        self.assertEqual(len(records),3)
+        self.assertEqual(len(records),4)
         again, = [c for c in records if c.get("reentry_claim")]
         self.assertEqual((again["reentry_claim"],again["params"]["side"],again["expected_floor"]["floor"]),(claim["id"],"buy",959.75))
         self.assertEqual((again["params"]["size_percent"],again["params"]["take_profit"]),(75,30))
@@ -604,6 +612,44 @@ class FleetTest(unittest.TestCase):
         self.assertEqual((cfg["phase2_size_percent"],cfg["live_first_size_percent"],cfg["live_repeat_size_percent"]),(50,100,100))
         self.assertEqual((cfg["live_take_profit_mode"],cfg["live_take_profit"],cfg["live_reward_ratio"]),("fixed",30,1))
         self.assertNotIn("take_profit",cfg)
+
+    def test_full_payout_uses_native_six_decimal_amount_and_actual_debit(self):
+        policy = dict(open_id="fill",quote_id="quote",live_payout_mode="all",live_payout_recipient="main",
+                      live_payout_amount=10,live_payout_percent=50)
+        gross = 62.549876
+        proof = dict(available=gross,amount=gross,received=50.039900,balance_before=5062.55,recipient="main",
+                     flat=dict(leverage=0,position_margin=0,order_margin=0,observed_at=self.time))
+        cmd = dict(action="profit.withdraw",account="Live",phase="live",params={"amount":gross},
+                   strategy_payout=policy,intents={"withdraw":{"proof":proof}})
+        strategy_payout.validate(policy)
+        strategy_payout.check_quote(cmd,proof,self.time)
+        snap = dict(position_open=False,balance=5000)
+        receipt = dict(observation=dict(name="Live",phase="live",snapshot=snap),amount=gross,recipient="main")
+        verify_financial_receipt(cmd,receipt)
+        snap["balance"] = 4970
+        with self.assertRaises(Problem):
+            verify_financial_receipt(cmd,receipt)
+
+    def test_zero_page_quote_ends_live_settlement_without_a_withdrawal(self):
+        self.plugin_meta["plugin_version"] = self.center.plugin_version
+        self.card_report("east",[self.card("Live",category="funded",phase="live")])
+        self.report("east",observation={**self.reading("Live"),"category":"funded","phase":"live"})
+        self.center.sync("east")
+        s = {"run":"zero-test","policy_version":2,"claims":{}}
+        opened = dict(id="closed-fill",node_id="east",worker_id="browser",account="Live",
+                      source="strategy-zero-test",phase="live",updated_at=self.time-2)
+        def settle():
+            with self.center.db.tx() as db:
+                inv = self.center._inventory(db,"east")
+                return self.center._live_exit(db,s,opened,inv[2]["east","browser","Live"],inv,self.time)
+        self.assertFalse(settle())
+        self.center.sync("east")
+        quote = self.plugin("east","poll")["command"]
+        self.plugin("east","result",id=quote["id"],ok=True,result=dict(account="Live",phase="live",available=0,observed_at=self.time))
+        self.center.sync("east")
+        self.assertTrue(settle())
+        self.assertTrue(s["claims"]["closed-fill"]["done"])
+        self.assertFalse(any(c["action"]=="profit.withdraw" for c in self.center.state("east")["commands"]))
 
     def test_entry_tiers_only_use_confirmed_openings_of_that_account_and_day(self):
         req = self.req(action="order.open",params=dict(side="buy",micro=1))

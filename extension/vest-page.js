@@ -1127,7 +1127,8 @@
           if (data.action === 'reserve') {
             before = data.snapshot;
             if (cmd.strategy_payout && (Math.abs(before.equity-before.balance) > 0.005 ||
-                before.balance-cmd.strategy_payout.target_balance <= 0.005)) throw Error('Live 空仓余额或可领净利润已变化');
+                cmd.strategy_payout.target_balance != null && before.balance-cmd.strategy_payout.target_balance <= 0.005))
+              throw Error('Live 空仓余额或领取依据已变化');
             return {
               claim: {
                 ...claim,
@@ -1152,7 +1153,8 @@
           if (data.action === 'verify') {
             after = data.snapshot;
             if (Math.abs(after.balance - (before.balance - preview.amount)) > 0.005) throw Error('扣款后余额与预期不符，请核验平台记录');
-            if (cmd.strategy_payout?.live_payout_mode === 'all' && Math.abs(after.balance-cmd.strategy_payout.target_balance) > 0.005) throw Error('领取全部净利润后的余额未回到阶段起始余额');
+            if (cmd.strategy_payout?.live_payout_mode === 'all' && cmd.strategy_payout.target_balance != null &&
+                Math.abs(after.balance-cmd.strategy_payout.target_balance) > 0.005) throw Error('领取全部净利润后的余额未回到原指令起始余额');
             return {
               verified: true
             };
@@ -1190,7 +1192,7 @@
       query: queryOne, selected: isSelected, select: selectTab, report: hooks.report});
     async function continueCommand(cmd, step) {
       const claim = cmd.action === 'profit.withdraw', portfolio = step.stage === 'portfolio';
-      if (!claim && (cmd.action !== 'history.read' || !portfolio) || !portfolio && step.stage !== 'return')
+      if (!claim && (!['history.read','profit.available'].includes(cmd.action) || !portfolio) || !portfolio && step.stage !== 'return')
         throw Error('无法识别跨页指令步骤');
       const check = () => {
         hooks.guard(claim);
@@ -1209,12 +1211,18 @@
       if (current.name !== cmd.account || cmd.phase && current.phase !== cmd.phase || claim && current.phase !== 'live')
         throw Error('跳转后账户或阶段与指令不一致');
       if (claim) return withdraw(cmd,step);
+      if (cmd.action==='profit.available') {
+        if (current.phase!=='live') throw Error('只有 Live 账户可以读取可领取利润');
+        return globalThis.VestProfitClaimFlow.readAvailable({account:cmd.account,guard:assertLive,identity:observerIdentity,
+          visible,text:elementText,click,money:core.parseMoney});
+      }
       const tables = {...step.tables,payout:(await history(cmd.account,true,true)).payout};
       if (!Object.values(tables).some(t => t.ready)) throw Error('未读到已加载的历史表格，请检查页面布局后重试');
       return {observation:step.observation,tables};
     }
     async function execute(cmd, continuation) {
       if (continuation) return continueCommand(cmd,continuation);
+      if (cmd.action==='profit.available') return continueCommand(cmd,{stage:'portfolio'});
       const observation = await read(cmd.account, null, true);
       let approved;
       if (cmd.action === 'order.open') approved = await hooks.preflight(observation);

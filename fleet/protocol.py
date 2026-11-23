@@ -8,7 +8,7 @@ from .trading_day import entry_day_window
 
 
 PORTFOLIO_SCAN = "accounts.read_all"
-READ = {"accounts.list", PORTFOLIO_SCAN, "account.read", "positions.read", "history.read", "page.navigate"}
+READ = {"accounts.list", PORTFOLIO_SCAN, "account.read", "positions.read", "history.read", "profit.available", "page.navigate"}
 WRITE = {"order.open", "order.close", "position.protect", "profit.withdraw"}
 ACTIONS = READ | WRITE
 PENDING = {"pending", "sending", "queued", "running"}
@@ -103,7 +103,7 @@ def positive(value, label):
 
 def parameters(action, raw, legacy=False):
     p = dict(obj(raw))
-    if action in {"accounts.list", PORTFOLIO_SCAN, "account.read", "positions.read", "history.read"}:
+    if action in {"accounts.list", PORTFOLIO_SCAN, "account.read", "positions.read", "history.read", "profit.available"}:
         fields(p, ())
     elif action == "page.navigate":
         fields(p, ("destination",))
@@ -165,6 +165,9 @@ def validate_target(cmd, worker, account, now):
     require(worker["session_id"] == cmd["session_id"], "浏览器会话已更换，请刷新后重新下达指令", 409)
     if cmd["account"] is not None:
         require(account and account["present"] and not account["ambiguous"], "账户已消失或名称不唯一", 409)
+    if cmd["action"] == "profit.available":
+        require(account["phase"] == cmd["phase"] == "live" and account["category"] in ("live","funded"),
+                "仅 Live 账户可以读取可领利润",409)
     if cmd["action"] not in WRITE:
         return
     require(worker["mode"] == "execute", "插件处于只读模式", 409)

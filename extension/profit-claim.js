@@ -213,5 +213,44 @@
       },
     };
   }
-  globalThis.VestProfitClaimFlow={create,expectedAmount};
+  async function readAvailable(a) {
+    const check = () => {
+      a.guard();
+      const id=a.identity();
+      if(id.name!==a.account || id.phase!=='live' || !['funded','live'].includes(id.category) ||
+          location.pathname.replace(/\/$/,'')!=='/portfolio') throw Error('读取可领额期间来源账户发生变化');
+    };
+    const shown = (root,sel) => [...root.querySelectorAll(sel)].filter(a.visible);
+    const dialogs = () => shown(document,'[role="dialog"],[role="alertdialog"],dialog[open]');
+    check();
+    if(dialogs().length) throw Error('读取可领额前存在其他弹窗');
+    const buttons=shown(document,'button[data-testid="withdraw-open"]');
+    if(buttons.length!==1 || buttons[0].type!=='button') throw Error('未找到唯一的领取预览入口');
+    const open=buttons[0];
+    if(!open.disabled && open.getAttribute('aria-disabled')!=='true') a.click(open);
+    let prior;
+    const deadline=Date.now()+5000;
+    do {
+      check();
+      const list=dialogs();
+      if(list.length>1) throw Error('领取预览弹窗不唯一');
+      const dialog=list[0];
+      if(dialog) {
+        const heading=dialog.querySelector('[data-slot="dialog-title"],h2,[role="heading"]');
+        if(heading && !/^(领取利润|Claim Profits?)$/i.test(a.text(heading))) throw Error('未识别的领取预览弹窗');
+        if(!heading) { await new Promise(r=>setTimeout(r,150)); continue; }
+      }
+      const amounts=shown(dialog || document,'[data-testid="claim-profit-available"]');
+      const value=amounts.length===1 ? a.money(a.text(amounts[0])) : null;
+      if(value!==null && value>=0 && value===prior) {
+        const result={account:a.account,phase:'live',available:value,observed_at:Date.now()/1000};
+        if(dialog) dialog.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true,cancelable:true}));
+        return result;
+      }
+      prior=value;
+      await new Promise(r=>setTimeout(r,150));
+    } while(Date.now()<deadline);
+    throw Error('平台未明确显示可领取金额');
+  }
+  globalThis.VestProfitClaimFlow={create,expectedAmount,readAvailable};
 })();

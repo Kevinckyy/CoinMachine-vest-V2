@@ -100,6 +100,7 @@ Content-Type: application/json
 | `order.close` | 必填 | `{"position_id":"页面持仓ID"}` | 全量平仓后的空仓快照 |
 | `position.protect` | 必填 | `{"position_id":"页面持仓ID","stop_loss":100,"take_profit":250}` | 已核验的实际保护状态，至少指定一项金额 |
 | `profit.withdraw` | 必填 | `{"amount":50}` | 核验后的源账户余额、申请金额、预计到账额与主账户收款对象。可加 `"all_available":true`，仅在页面可领总额恰好等于申请金额时提交 |
+| `profit.available` | 必填，Live 账户 | `{}` | 只读打开 Portfolio 利润领取预览，返回 `account,phase,available,observed_at`。策略通过 `strategy_payout.quote_id` 关联这个读数，以本次页面可领额决定领取。节点需支持 `payout_quote_version=1`，插件需为 1.7.1 或更高版本 |
 
 开仓方向为 `buy` 或 `sell`。`micro` 是正整数，也可用 `size_percent` 指定 25、50、75 或 100 百分档。两者选一。`stop_buffer` 为净值缓冲 M，省略时使用该节点对应阶段的设置（初始 20 USD）。止损金额等于实读净值减去实读爆仓线，再减去缓冲，精确到美分。Live 开仓可传固定金额 `take_profit` 或 `reward_ratio` 配合 `min_take_profit`。盈亏比的风险基数是本单止损金额，免止损时使用净值至爆仓线的距离。平仓和修改保护会核对持仓 ID、方向、数量、品种和均价。
 

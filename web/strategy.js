@@ -198,7 +198,7 @@ function strategyDetail(node) {
   }
   const headers = ['账户 / 浏览器','阶段','候选状态','净值','健康度','日损 / 上限','回撤 / 上限','当日爆仓线','活动持仓',''];
   const outside = accounts.filter(a => !a.in_pool);
-  const ids = [...s.members, ...Object.values(s.claims || {}).flatMap(p => [p.read,p.withdraw].filter(Boolean))];
+  const ids = [...s.members, ...Object.values(s.claims || {}).flatMap(p => [p.read,p.quote,p.withdraw].filter(Boolean))];
   const records = ids.map(id => {
     const cmd = history?.get(id) || state.commands.find(c => c.id === id);
     return '<div class="batch-command">'+(cmd ? esc(cmd.account)+' · '+esc(actionTitles[cmd.action])+' '+badge(cmd) : esc(id))+

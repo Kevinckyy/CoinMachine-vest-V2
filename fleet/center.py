@@ -190,6 +190,7 @@ class Center:
             config = self._strategy(db,nid)["config"]
             nodes[nid] = {**node, "online": online, "release":snap.get("release",""), "agent_seen":agent["seen"] if agent else None,
                           "open_policy_version":snap.get("open_policy_version",0),
+                          "payout_quote_version":snap.get("payout_quote_version",0),
                           "agent_release":agent["actual"] if agent else "", "update":updates.view(last) if last else None,
                           "card_generation":refresh[0] if refresh else 0}
             for w in snap["workers"]:
@@ -832,7 +833,6 @@ class Center:
         claim = claims.setdefault(opened["id"],{})
         if claim.get("done"):
             return True
-        target = opened["intents"].get("open",{}).get("proof",{}).get("initial_balance")
         if claim.get("withdraw"):
             row = command(db,claim["withdraw"])
             if row["status"] in PENDING:
@@ -846,7 +846,7 @@ class Center:
                     s["next_at"] = now + self._strategy_delay(s,"order")
             claim["done"] = True
             return True
-        if not target or not account or not account["in_pool"] or account["phase"] != "live":
+        if not account or not account["in_pool"] or account["phase"] != "live":
             claim["done"] = True
             return True
         if account["name"] != opened["account"]:
@@ -871,14 +871,30 @@ class Center:
                 insert(db,cmd,"pending",now)
                 claim["read"] = cmd["id"]
             return False
-        gross = daily_floor.decimal(snap["balance"])-daily_floor.decimal(target)
-        if gross <= daily_floor.decimal(.005):
+        node, worker = inventory[0][req["node_id"]], inventory[1][req["node_id"],req["worker_id"]]
+        if not node["payout_quote_version"] or plugin_version_parts(worker.get("plugin_version")) < (1,7,1,0):
+            s["message"] = "等待节点桥和插件升级以读取 Live 页面可领额"
+            return False
+        quote = record(command(db,claim["quote"])) if claim.get("quote") else None
+        if quote and quote["status"] in PENDING:
+            s["message"] = "等待读取 Portfolio 页面可领额"
+            return False
+        if quote:
+            require(quote["status"] == "succeeded", "Live 页面可领额读取失败 · "+quote["error"],409)
+        if not quote or quote["session_id"] != worker["session_id"] or now-quote["result"]["observed_at"] > OBS_TTL:
+            cmd = self._prepare(db,uid(),request({**req,"action":"profit.available","params":{}}),inventory,opened["source"])
+            insert(db,cmd,"pending",now)
+            claim["quote"] = cmd["id"]
+            s["message"] = "等待读取 Portfolio 页面可领额"
+            return False
+        available = number(quote["result"].get("available"),"页面可领额",0,1e12)
+        if available == 0:
             claim["done"] = True
             return True
         policy = {k:v for k,v in s["config"].items() if k.startswith("live_payout_")}
-        policy.update(open_id=opened["id"],target_balance=target)
-        amount = strategy_payout.amount(gross,policy)
-        require(amount is not None, "可领取净利润不足配置的领取金额",409)
+        policy.update(open_id=opened["id"],quote_id=quote["id"])
+        amount = strategy_payout.amount(available,policy)
+        require(amount is not None, "页面可领额不足配置的领取金额",409)
         key = str(uuid.uuid5(uuid.NAMESPACE_URL,dump(["strategy-payout",opened["id"]])))
         cmd = self._prepare(db,key,request({**req,"action":"profit.withdraw","params":{"amount":amount}}),inventory,opened["source"])
         cmd["strategy_payout"] = policy

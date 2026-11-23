@@ -75,7 +75,7 @@ def verify_financial_receipt(cmd, result):
         if action == "profit.withdraw":
             require(ledger.verified_withdrawal(cmd, result, snap), "主账户收款对象、申请金额或扣款余额未核验")
             policy = cmd.get("strategy_payout")
-            if policy and policy["live_payout_mode"] == "all":
+            if policy and "target_balance" in policy and policy["live_payout_mode"] == "all":
                 require(abs(snap["balance"]-policy["target_balance"]) <= .005,"领取后的余额与 Live 阶段起始余额不符")
 
 
@@ -166,7 +166,7 @@ class Bridge:
                         FROM commands WHERE worker=? AND action=? ORDER BY created DESC,id DESC LIMIT 1""",
                                   (row["worker_id"], PORTFOLIO_SCAN)).fetchone()
                 workers.append({**worker_view(row), "portfolio_scan": dict(scan) if scan else None})
-            snap = {"version": 1, "open_policy_version":2, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
+            snap = {"version": 1, "open_policy_version":2, "payout_quote_version":1, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
                     "launch_id": self.launch_id,
                     "ledger_seq": db.execute("SELECT COALESCE(MAX(seq),0) FROM book").fetchone()[0],
                     "log_seq": db.execute("SELECT COALESCE(MAX(id),0) FROM node_logs").fetchone()[0],
@@ -471,6 +471,9 @@ class Bridge:
                     check_reservations(db, cmd, now)
                     if cmd["action"]=="order.open":
                         require(plugin_version_parts(body.get("plugin_version")) >= (1,6,0,0), "开仓前请重新加载 1.6.0 或更高版本插件",409)
+                    if cmd["action"] == "profit.available" or (cmd.get("strategy_payout") or {}).get("quote_id"):
+                        require(plugin_version_parts(body.get("plugin_version")) >= (1,7,1,0),
+                                "读取页面可领额需要 1.7.1 或更高版本插件",409)
                     if "omit_stop_below" in cmd["params"] or cmd.get("strategy_payout") or cmd.get("reentry_claim"):
                         require(body.get("strategy_version") == 1, "请重新加载 1.5.0 或更高版本插件", 409)
                     if cmd.get("strategy_payout"):
@@ -640,6 +643,14 @@ class Bridge:
                 verify_financial_receipt(cmd, result)
             except Problem as err:
                 status, error = "unknown", str(err)
+        if ok and row["action"] == "profit.available":
+            try:
+                require(result.get("account") == cmd["account"] and result.get("phase") == cmd["phase"] == "live",
+                        "页面可领额来源账户或阶段不符")
+                number(result.get("available"),"页面可领额",0,1e12)
+                number(result.get("observed_at"),"可领额读取时间",row["claimed"]-10,min(cmd["expires_at"]+RUN_TTL,now+10))
+            except Problem as err:
+                status, error = "failed", str(err)
         obs = result.get("observation")
         worker, current = target(db, cmd)
         if obs and cmd["account"] and current and current["present"] and worker["session_id"] == cmd["session_id"]:

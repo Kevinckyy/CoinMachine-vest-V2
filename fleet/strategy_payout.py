@@ -6,10 +6,14 @@ from .storage import command, record
 
 
 def validate(policy):
-    fields(policy, ("open_id", "target_balance", "live_payout_mode", "live_payout_recipient",
+    fields(policy, ("open_id", "target_balance", "quote_id", "live_payout_mode", "live_payout_recipient",
                     "live_payout_amount", "live_payout_percent"))
     ident(policy.get("open_id"))
-    number(policy.get("target_balance"), "Live 起始余额", 0.000001, 1e12)
+    require(("quote_id" in policy) != ("target_balance" in policy), "领取依据不明确")
+    if "quote_id" in policy:
+        ident(policy["quote_id"])
+    else:
+        number(policy.get("target_balance"), "Live 起始余额", 0.000001, 1e12)
     choice(policy.get("live_payout_mode"), {"all", "amount", "percent"}, "领取方式")
     choice(policy.get("live_payout_recipient"), {"main"}, "领取目标")
     number(policy.get("live_payout_amount"), "领取金额", 0.000001, 1e9)
@@ -32,10 +36,19 @@ def check_origin(db, cmd, account):
     require(opened["action"] == "order.open" and opened["status"] == "succeeded" and opened["phase"] == "live"
             and cmd["phase"] == "live" and cmd["source"].startswith("strategy-")
             and all(opened[k] == cmd[k] for k in ("source","node_id","worker_id","account","account_ref"))
-            and opened["intents"].get("open",{}).get("proof",{}).get("initial_balance") == policy["target_balance"]
-            and account.get("initial_balance") == policy["target_balance"]
             and opened.get("expected_risk",{}).get("card_id") == (account.get("card") or {}).get("id"),
-            "领取来源或阶段起始余额已变化", 409)
+            "领取来源或账户已变化", 409)
+    if "quote_id" in policy:
+        quote = record(command(db, policy["quote_id"]))
+        result = quote.get("result") or {}
+        require(quote["action"] == "profit.available" and quote["status"] == "succeeded"
+                and all(quote[k] == cmd[k] for k in ("node_id","worker_id","account","source","phase","session_id"))
+                and quote["created_at"] >= opened["updated_at"] and result.get("account") == cmd["account"]
+                and result.get("phase") == "live" and amount(result["available"],policy) == cmd["params"]["amount"],
+                "页面可领额回执与本笔领取不符", 409)
+    else:
+        require(opened["intents"].get("open",{}).get("proof",{}).get("initial_balance") == policy["target_balance"]
+                and account.get("initial_balance") == policy["target_balance"], "阶段起始余额已变化",409)
     other = db.execute("""SELECT 1 FROM commands WHERE node=? AND worker=? AND account=? AND action='profit.withdraw'
         AND json_extract(body,'$.strategy_payout.open_id')=? AND id!=?
         AND (status IN ('pending','sending','queued','running','succeeded','unknown') OR intents!='{}') LIMIT 1""",
@@ -53,5 +66,6 @@ def check_quote(cmd, proof, now):
             and type(flat.get("observed_at")) in (int,float) and now-15 <= flat["observed_at"] <= now+5
             and proof.get("recipient") == "main"
             and proof.get("amount") == amount(available, policy) == cmd["params"]["amount"]
-            and received <= available and abs(before - available - policy["target_balance"]) <= .005,
-            "平台领取预览与策略金额、主账户或阶段起始余额不符", 409)
+            and received <= available <= before + .005, "平台领取预览与策略金额、主账户或实际余额不符",409)
+    if "target_balance" in policy:
+        require(abs(before - available - policy["target_balance"]) <= .005, "领取预览与原指令的起始余额不符",409)

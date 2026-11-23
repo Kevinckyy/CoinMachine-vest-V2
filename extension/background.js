@@ -433,9 +433,9 @@ async function pollWork(owner,cfg,meta,url) {
   if (cmd) {
     const scan = cmd.action === 'accounts.read_all';
     const directory = cmd.action === 'accounts.list' || scan && data.scan?.stage === 'list';
-    const path = directory ? DESTINATIONS.accounts : scan ? DESTINATIONS.portfolio : DESTINATIONS.trade;
+    const path = directory ? DESTINATIONS.accounts : scan || cmd.action==='profit.available' ? DESTINATIONS.portfolio : DESTINATIONS.trade;
     if (scan) await chrome.storage.session.set({returnCards:owner.session_id});
-    if (!data.arrived && (directory || !onPath(url,path))) {
+    if (!data.arrived && (directory || cmd.action==='profit.available' || !onPath(url,path))) {
       return startRoute(owner,url,path,{...data,arrived:true,owner:publicBinding(owner)});
     }
     const lease = {...owner,action:cmd.action};
