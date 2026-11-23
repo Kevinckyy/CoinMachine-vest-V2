@@ -418,17 +418,19 @@
       if (!core.isNqTradePath(location.pathname)) throw new Error('请打开已登录的 Vest NQ-PERP 交易页面');
       if ([...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].some(visible)) throw new Error('页面存在弹窗，请先关闭后再读取账户');
     }
-    function observerTrigger() {
-      return queryOne('[data-testid="account-selector-trigger"]', document, true);
+    function observerTrigger(required = true) {
+      return queryOne(core.defaults.identity, document, required);
     }
-    function observerIdentity(allowLoading = false) {
-      const trigger = allowLoading ? queryOne('[data-testid="account-selector-trigger"]') : observerTrigger();
+    function observerIdentity(allowLoading = false, trigger = observerTrigger(!allowLoading)) {
       if (!trigger) return null;
       const names = [...trigger.querySelectorAll('span.truncate')].filter(visible);
       if (allowLoading && !names.length) return null;
       if (names.length !== 1) throw new Error('无法唯一读取当前账户名称，请使用桌面布局');
       const name = core.normalized(names[0].textContent);
-      if (!name) throw new Error('账户名称为空，请确认已登录');
+      if (!name) {
+        if (allowLoading) return null;
+        throw new Error('账户名称为空，请确认已登录');
+      }
       const labels = [...trigger.querySelectorAll('span')].filter(el => visible(el) && el !== names[0] && !el.contains(names[0])).map(el => core.normalized(el.textContent));
       // Vest replaces the 2/2 badge with "Evaluation Passed" while its native
       // result modal is open. The exact stage Profit Target label in the same
@@ -442,6 +444,23 @@
         phase,
         category: core.accountCategory(labels) || (phase === 'live' ? 'funded' : phase ? 'eval' : null)
       };
+    }
+    async function waitForAccountIdentity(assertPage, rootSelector) {
+      const deadline = Date.now() + 10000;
+      while (true) {
+        assertPage();
+        const rootReady = !rootSelector || queryOne(rootSelector);
+        const trigger = rootReady && observerTrigger(false);
+        if (trigger && !trigger.closest(':disabled,[aria-disabled="true"],[aria-busy="true"],[data-loading="true"],[aria-hidden="true"],[inert]')) {
+          const identity = observerIdentity(true, trigger);
+          if (identity) return identity;
+        }
+        if (Date.now() >= deadline) {
+          const control = rootReady ? '账户选择器及账户名称' : 'Portfolio 详情区域';
+          throw Error(`等待${control}加载超时（10 秒，${location.pathname}），请检查登录状态和桌面布局`);
+        }
+        await delay(200);
+      }
     }
     function readAccountHealth(scope = document) {
       const indicators = [...scope.querySelectorAll('[data-testid="account-health"]')].filter(el => visible(el) && !el.closest('[role="dialog"],[role="alertdialog"],[role="menu"],[aria-busy="true"],[data-loading="true"]'));
@@ -633,7 +652,7 @@
       });
     }
     function observerSelectorOpen() {
-      return observerItems().length > 0 || queryOne('[data-testid="account-selector-trigger"]')?.getAttribute('aria-expanded') === 'true';
+      return observerItems().length > 0 || observerTrigger(false)?.getAttribute('aria-expanded') === 'true';
     }
     async function observerOpenSelector(guard = () => {}, outerDeadline = Infinity, assertPage = observerAssertPage) {
       guard();
@@ -825,13 +844,7 @@
         assertNoDialogs();
       };
       const rootSelector = '[data-testid="portfolio-root"]';
-      const readyBy = Date.now() + 10000;
-      while (true) {
-        assertPage();
-        if (queryOne(rootSelector) && observerIdentity(true)) break;
-        if (Date.now() >= readyBy) throw Error('Portfolio 或账户选择器未加载，请检查登录状态和桌面布局');
-        await delay(200);
-      }
+      await waitForAccountIdentity(assertPage, rootSelector);
       try {
         await observerSelect({name},assertLive,Date.now()+6000,assertPage);
       } finally {
@@ -897,12 +910,12 @@
       }
     }
     async function read(name, category, verifyMenu = false) {
-      observerAssertPage();
+      const identity = await waitForAccountIdentity(observerAssertPage);
       const selected = {
         name,
         category
       };
-      const switched = observerIdentity().name !== name;
+      const switched = identity.name !== name;
       if (switched || verifyMenu) await observerSelect(selected, assertLive);
       const active = queryOne('[data-testid="account-tab-active-positions"]');
       if (active && !isSelected(active)) await selectTab('[data-testid="account-tab-active-positions"]', () => document, assertLive);

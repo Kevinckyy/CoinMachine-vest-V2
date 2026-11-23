@@ -474,14 +474,26 @@ try {
     const s=await api('state?node_id=lab');
     return s.workers[0].card_session===beforeUpdate.session_id && s.accounts.find(a=>a.name==='Alpha')?.fresh;
   },'execute profile has its own active directory');
-  await vest.evaluate("sessionStorage.setItem('tradeEquity','$1,040.00')");
+  await vest.evaluate("sessionStorage.setItem('tradeSelector','missing')");
+  const opensBeforeTimeout=await vest.evaluate("sessionStorage.getItem('opens')");
+  const missingId=randomUUID();
+  await api('commands/'+missingId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Alpha',action:'order.open',params:{side:'buy',micro:1}});
+  const missing=await until(async()=>{
+    const c=await api('commands/'+missingId);
+    return c.status==='failed' && c;
+  },'unavailable account selector times out before opening an order');
+  assert.match(missing.error,/账户选择器.*超时.*\/trade\/NQ-PERP/);
+  assert.deepEqual(missing.intents,{});
+  assert.equal(await vest.evaluate("sessionStorage.getItem('opens')"),opensBeforeTimeout);
+  await until(()=>vest.evaluate("location.pathname === '/accounts'"),'directory restored after the selector timeout');
+  await vest.evaluate("sessionStorage.setItem('tradeSelector','delayed');sessionStorage.setItem('tradeEquity','$1,040.00')");
   const staleId=randomUUID();
   await api('commands/'+staleId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Alpha',action:'order.open',params:{side:'buy',micro:1}});
   const stale=await until(async()=>{
     const c=await api('commands/'+staleId);
     if (c.status!=='cancelled') throw Error(c.status+' '+c.error);
     return c;
-  },'changed trade equity cancels before filling an order');
+  },'a late account selector and name allow the original order to reach risk preflight');
   assert.equal(stale.result.reselect,true);
   assert.ok(stale.result.changed.includes('equity'));
   assert.deepEqual(stale.intents,{});
@@ -490,6 +502,7 @@ try {
     const s=await api('state?node_id=lab'), a=s.accounts.find(a=>a.name==='Alpha');
     return s.workers[0].page==='/accounts' && a.risk.equity===1040 && a.daily_floor.verified;
   },'corrected risk cached after return to account cards');
+  await vest.evaluate("sessionStorage.removeItem('tradeSelector')");
   await ui.evaluate("document.querySelector('[data-value=nodes]').click();document.querySelector('[data-op=deployUpdate]').click()");
   await ui.evaluate(`(() => {const f=document.getElementById('dialogForm'); for(const box of f.querySelectorAll('[name=target]')) box.checked=box.value==='lab'; f.elements.revision.value=${JSON.stringify(second)}; f.requestSubmit();})()`);
   await until(async()=>{

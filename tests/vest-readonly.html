@@ -30,7 +30,17 @@
   let menu;
   const onAccounts=location.pathname==='/accounts';
   document.getElementById('deskAccounts').hidden=!onAccounts;
-  trigger.hidden=onAccounts;
+  const tradeSelector = location.pathname.startsWith('/trade/') && sessionStorage.getItem('tradeSelector');
+  trigger.hidden = onAccounts || !!tradeSelector;
+  if (tradeSelector === 'delayed') {
+    const label = trigger.querySelector('span.truncate');
+    const name = label.textContent;
+    label.textContent = '';
+    setTimeout(() => {
+      trigger.hidden = false;
+      setTimeout(() => { label.textContent = name; }, 500);
+    }, 1800);
+  }
   function renderCards() {
     const grid=document.querySelector('#deskAccounts .grid');
     grid.replaceChildren();
