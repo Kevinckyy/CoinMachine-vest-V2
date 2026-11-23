@@ -44,10 +44,11 @@
 | `side,size_percent,phase2_size_percent,stop_buffer` | 考核方向、1/2 与 2/2 各自的仓位百分档、USD 缓冲 M。考核开仓清空止盈 |
 | `live_take_profit_mode` | `fixed` 使用 `live_take_profit`，`ratio` 使用 `live_reward_ratio,live_min_take_profit`。这两种模式使用 `live_size_percent` |
 | `live_first_take_profit,live_first_size_percent,live_repeat_take_profit,live_repeat_size_percent` | `entries` 模式按单个账户本交易日确认成交情况选取首次或后续档。每个档位的金额和仓位独立 |
+| `skip_stop_loss_on_floor_gap,floor_gap_threshold` | 考核与 Live 共用的有符号底线差额开关和 USD 阈值，默认开启、20 USD |
 | `skip_stop_loss_on_low_drawdown,drawdown_stop_loss_threshold` | 考核号免止损开关与 USD 阈值，Live 使用对应的 `live_` 前缀。默认关闭，阈值初始为 200 |
 | `live_payout_recipient,live_payout_mode,live_payout_amount,live_payout_percent` | 主账户 `main` 收款。方式为 `all`、`amount`、`percent` |
 
-启用免止损的开仓指令包含 `params.omit_stop_below`。桥在交易页核验和最终许可时用 `equity − daily_floor.floor` 比较阈值，仅当余额大于零且严格低于阈值时返回 `stop_omitted=true,stop_loss=null`。等于阈值时仍扣除 M 计算止损。Live 策略和免止损指令需要节点上报 `workers[].strategy_version=1`。已核验的策略领取通过 `strategy_payout.open_id` 关联原开仓，再入场通过 `reentry_claim` 关联已扣款的领取指令。
+`order.open` 可携带 `omit_floor_gap_below`（今日底线减去最大回撤线）和 `omit_stop_below`（净值减去最大回撤线）。指标严格低于相应阈值时该规则命中。两项按或判断，未提供的阈值不启用。开仓前及签发点击许可时均核对本账户交易页，免止损返回 `stop_omitted=true,stop_loss=null`。Live 策略和免止损指令需要节点上报 `workers[].strategy_version=1`。已核验的策略领取通过 `strategy_payout.open_id` 关联原开仓，再入场通过 `reentry_claim` 关联已扣款的领取指令。
 
 ### 筛选交易与出金
 
@@ -102,11 +103,11 @@ Content-Type: application/json
 | `profit.withdraw` | 必填 | `{"amount":50}` | 核验后的源账户余额、申请金额、预计到账额与主账户收款对象。可加 `"all_available":true`，仅在页面可领总额恰好等于申请金额时提交 |
 | `profit.available` | 必填，Live 账户 | `{}` | 只读打开 Portfolio 利润领取预览，返回 `account,phase,available,observed_at`。策略通过 `strategy_payout.quote_id` 关联这个读数，以本次页面可领额决定领取。节点需支持 `payout_quote_version=1`，插件需为 1.7.1 或更高版本 |
 
-开仓方向为 `buy` 或 `sell`。`micro` 是正整数，也可用 `size_percent` 指定 25、50、75 或 100 百分档。两者选一。`stop_buffer` 为净值缓冲 M，省略时使用该节点对应阶段的设置（初始 20 USD）。止损金额等于实读净值减去实读爆仓线，再减去缓冲，精确到美分。Live 开仓可传固定金额 `take_profit` 或 `reward_ratio` 配合 `min_take_profit`。盈亏比的风险基数是本单止损金额，免止损时使用净值至爆仓线的距离。平仓和修改保护会核对持仓 ID、方向、数量、品种和均价。
+开仓方向为 `buy` 或 `sell`。`micro` 是正整数，也可用 `size_percent` 指定 25、50、75 或 100 百分档。两者选一。`stop_buffer` 为净值缓冲 M，省略时使用该节点对应阶段的设置（初始 20 USD）。需要设置止损时，止损金额取净值至今日底线的距离与剩余最大回撤的较小值，再减去 M，向下取整至美分。开仓许可记录 `equity`、`daily_floor.floor`、`max_drawdown_floor`、`floor_gap`、`distance_to_max_floor` 和 `remaining_max_drawdown`。Live 开仓可传固定金额 `take_profit` 或 `reward_ratio` 配合 `min_take_profit`。盈亏比的风险基数是本单止损金额，免止损时使用净值至爆仓线的距离。平仓和修改保护会核对持仓 ID、方向、数量、品种和均价。
 
 目录中的 `card,card_at` 对应活动卡片，`risk,risk_at` 保留风控读数及上次交易页实读时间。`in_pool` 表示允许策略选用，`candidate` 表示当前可以进入下单前核验。`open_locked` 表示当前日内开仓锁，`open_lock.reason,until` 给出原因和到期时间。`daily_floor.floor` 是平台实读值，`observed_at` 是其读取时间，`source` 为 `platform` 或 `pending`。每次开仓核验都需要本次交易页的 `snapshot.daily_floor`。日切或已确认提现后的底线等待读取。插件当前会话的 `card_session,card_generation,cards_full_at` 可用于检查全量刷新进度。
 
-`GET /v1/state` 的 `plugin_version` 为中心所附插件版本。每个 worker 的 `plugin_version` 为浏览器上报版本，`version_status` 为 `current,behind,ahead,unknown` 之一。节点 `GET /v1/status` 也返回各 worker 的版本，受管安装的 Git 提交保存在 `release`。开仓需要节点 `open_policy_version=2` 和插件 1.6.0 或更高版本。
+`GET /v1/state` 的 `plugin_version` 为中心所附插件版本。每个 worker 的 `plugin_version` 为浏览器上报版本，`version_status` 为 `current,behind,ahead,unknown` 之一。节点 `GET /v1/status` 也返回各 worker 的版本，受管安装的 Git 提交保存在 `release`。开仓需要节点 `open_policy_version=3` 和插件 1.8.0 或更高版本。
 
 从 1.7.0 起，稳定清单通过 `/v1/plugin/report` 的 `metrics` 上报。批次含 `generation,base_at,observed_at,directory,items`，每行只含账户名和变化的数字。持仓期间每秒读取活动卡片，常规清单核对时一并更新其他账户的变化值。基线过期、成员变动或强制拉取时重新传送清单。中心使用 `GET /v1/status?since=initial` 取得节点基线，随后携带返回的 `status_cursor`，按 `changes` 中的路径和值更新同一基线。
 

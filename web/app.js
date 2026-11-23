@@ -507,7 +507,7 @@ function commandForm(initial = []) {
   dialog('下达浏览器指令', grid(select('node', '服务器', '') + select('worker', '浏览器', '') + select('action', '操作', Object.entries(actionTitles).map(([k, v]) => option(k, v, k === (initial[2] ? 'account.read' : 'accounts.list'))).join('')) + '<div id="accountField"></div><div class="full" id="parameterFields"></div>'), '下达指令', async data => {
     const action = data.get('action'),
       params = {};
-    for (const k of ['micro', 'stop_loss', 'stop_buffer', 'take_profit', 'amount']) if (data.has(k) && data.get(k) !== '') params[k] = Number(data.get(k));
+    for (const k of ['micro', 'stop_loss', 'stop_buffer', 'omit_floor_gap_below', 'omit_stop_below', 'take_profit', 'amount']) if (data.has(k) && data.get(k) !== '') params[k] = Number(data.get(k));
     for (const k of ['side', 'position_id', 'destination']) if (data.has(k)) params[k] = data.get(k);
     const req = {
       node_id: data.get('node'),
@@ -528,7 +528,15 @@ function commandForm(initial = []) {
     const a = state.accounts.find(a => a.node_id === f.node.value && a.worker_id === f.worker.value && a.name === f.account?.value);
     let body = '';
     const amount = (k, label, v = '', required = false, step = 'any') => input(k, label, v, 'number', 'min="0.000001" step="' + step + '" ' + (required ? 'required' : ''));
-    if (action === 'order.open') body = grid(select('side', '市价方向', option('buy', '做多') + option('sell', '做空')) + input('micro', 'Micro 合约数', 1, 'number', 'min="1" step="1" required') + stopBufferInput(state.strategies.find(s => s.node_id===f.node.value)?.config[a?.phase==='live' ? 'live_stop_buffer' : 'stop_buffer'] ?? 20) + (a?.phase==='live' ? amount('take_profit', '止盈金额 · USDC（可选）') : ''));
+    if (action === 'order.open') {
+      const config = state.strategies.find(s => s.node_id === f.node.value)?.config || {};
+      const prefix = a?.phase === 'live' ? 'live_' : '';
+      body = grid(select('side','市价方向',option('buy','做多') + option('sell','做空')) +
+        input('micro','Micro 合约数',1,'number','min="1" step="1" required') + stopBufferInput(config[prefix+'stop_buffer'] ?? 20) +
+        input('omit_floor_gap_below','两线差额免止损阈值 · USD（留空关闭）',config.skip_stop_loss_on_floor_gap ? config.floor_gap_threshold : '', 'number','step="any"') +
+        amount('omit_stop_below','净值距最大回撤线免止损阈值 · USD（留空关闭）',config[prefix+'skip_stop_loss_on_low_drawdown'] ? config[prefix+'drawdown_stop_loss_threshold'] : '') +
+        (prefix ? amount('take_profit','止盈金额 · USDC（可选）') : ''));
+    }
     if (['order.close', 'position.protect'].includes(action)) {
       body = input('position_id', '目标持仓 ID', a?.snapshot.position_id || '', 'text', 'required readonly placeholder="请先刷新该账户的持仓"');
       if (action === 'position.protect') body += '<p class="form-note">填写需要修改的保护金额，留空的项目保留原值。</p>' + grid(amount('stop_loss', '止损金额 · USDC') + (a?.phase==='live' ? amount('take_profit', '止盈金额 · USDC') : ''));

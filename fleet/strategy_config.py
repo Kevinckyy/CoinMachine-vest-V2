@@ -9,6 +9,7 @@ DEFAULT_CONFIG = dict(strategy_id="random_entry", symbol="NQ-PERP", batch_size=2
                       order_delay_min=2, order_delay_max=8, batch_delay_min=15, batch_delay_max=45,
                       side="random", size_percent=25, phase2_size_percent=25, stop_buffer=20,
                       skip_stop_loss_on_low_drawdown=False, drawdown_stop_loss_threshold=200,
+                      skip_stop_loss_on_floor_gap=True, floor_gap_threshold=20,
                       live_priority=True, account_priority_order=list(DEFAULT_ACCOUNT_PRIORITY), refresh_account_pool=True,
                       live_default_locked=True, live_side="random", live_size_percent=25, live_stop_buffer=20,
                       live_take_profit_mode="fixed", live_take_profit=None, live_reward_ratio=1, live_min_take_profit=0,
@@ -30,6 +31,8 @@ def settings(base, patch):
         config["batch_delay_min"] = config["batch_delay_max"] = number(interval, "批间等待秒数", 1, 86400, True)
     choice(config["strategy_id"], {"random_entry"}, "策略")
     choice(config["symbol"], {"NQ-PERP"}, "品种")
+    boolean(config["skip_stop_loss_on_floor_gap"])
+    number(config["floor_gap_threshold"], "两条底线差额阈值", -1e9, 1e9)
     config["batch_size"] = number(config["batch_size"], "每批账户数", 1, 100, True)
     for prefix in ("order", "batch"):
         low, high = (number(config[f"{prefix}_delay_{bound}"], "等待秒数", 0, 86400) for bound in ("min", "max"))

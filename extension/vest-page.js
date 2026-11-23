@@ -527,46 +527,57 @@
       return [...scope.querySelectorAll('div.sticky.top-14 p,[data-testid="capital-indicator-daily-loss"]')].some(el =>
         visible(el) && /^(?:(?:max\.? daily loss|最大日亏损)\s*[:：]\s*)?(?:no daily loss limit|unlimited|无每日亏损上限|无日损限制|不限)$/i.test(core.normalized(el.innerText)));
     }
-    async function dailyReference(name) {
-      const groups = [...document.querySelectorAll('[data-testid="capital-indicator-daily-loss"]')]
-        .filter(visible).map(el=>el.parentElement).filter(el=>el && el!==document.body);
-      const group = groups.find(el=>el.querySelector('[data-slot="tooltip-trigger"]')) || groups[0];
-      if (!group) return {};
-      const trigger = group.querySelector('[data-slot="tooltip-trigger"]');
-      const readLabels = () => {
-        const linked = trigger?.getAttribute('aria-describedby');
-        const tooltip = linked && document.getElementById(linked);
-        const result = {};
-        for (const root of [group,tooltip].filter(Boolean)) {
-          for (const el of root.querySelectorAll('p,span,div')) {
-            if (el.children.length && !el.matches('span')) continue;
-            const label = core.normalized(el.textContent);
-            const m = label.match(/^(8\s*pm ET balance|美东时间晚上\s*8\s*点余额|today['’]s floor|今日底线|今日底線)\s*[:：]\s*(\$?\s*[\d,]+(?:\.\d+)?)$/i);
-            if (!m) continue;
-            if (!visible(el)) continue;
-            result[/^(?:8|美东)/.test(m[1])?'daily_reset_equity':'daily_floor'] = core.parseMoney(m[2]);
+    function riskTrigger(metric, label) {
+      const triggers = '[data-slot="tooltip-trigger"]';
+      const eligible = el => visible(el) && !el.closest('[role="dialog"],[role="menu"],[aria-busy="true"],[data-loading="true"]') && label.test(core.normalized(el.textContent));
+      const banner = [...document.querySelectorAll('div.sticky.top-14 '+triggers)].filter(eligible);
+      if (banner.length === 1) return banner[0];
+      const indicators = [...document.querySelectorAll(`[data-testid="capital-indicator-${metric}"]`)].filter(visible);
+      const local = new Set(indicators.flatMap(el => [...el.parentElement.querySelectorAll(triggers)].filter(eligible)));
+      return local.size === 1 ? [...local][0] : null;
+    }
+    async function readRiskTooltip(trigger, name, parse) {
+      if (!trigger) return {};
+      const opts = {bubbles:true,pointerType:'mouse'};
+      try {
+        trigger.dispatchEvent(new PointerEvent('pointerover',opts));
+        trigger.dispatchEvent(new PointerEvent('pointermove',opts));
+        for (let i=0;i<14;i++) {
+          assertLive();
+          if (observerIdentity().name!==name) throw Error('读取风控底线时账户已变化');
+          if (!trigger.isConnected || !visible(trigger)) return {};
+          const id = trigger.getAttribute('aria-describedby');
+          const tooltip = id && document.getElementById(id);
+          if (tooltip && visible(tooltip)) {
+            const value = parse(tooltip);
+            if (value) return value;
           }
+          await delay(100);
         }
-        return result;
-      };
-      let result = readLabels();
-      if (result.daily_floor==null && trigger && visible(trigger)) {
-        const opts = {bubbles:true,pointerType:'mouse'};
-        try {
-          trigger.dispatchEvent(new PointerEvent('pointerover',opts));
-          trigger.dispatchEvent(new PointerEvent('pointermove',opts));
-          for (let i=0;i<10;i++) {
-            await delay(110);
-            assertLive();
-            if (observerIdentity().name!==name) throw Error('读取日损基准时账户已变化');
-            result = readLabels();
-            if (result.daily_floor!=null) break;
-          }
-        } finally {
-          trigger.dispatchEvent(new PointerEvent('pointerout',{...opts,relatedTarget:document.body}));
-        }
+        return {};
+      } finally {
+        trigger.dispatchEvent(new PointerEvent('pointerout',{...opts,relatedTarget:document.body}));
       }
-      return result;
+    }
+    async function riskReferences(name) {
+      const daily = await readRiskTooltip(riskTrigger('daily-loss',/^(?:max\.? daily loss|daily loss|最大日亏损|每日亏损)$/i),name,root => {
+        const result = {};
+        for (const el of [root,...root.querySelectorAll('p,span,div')]) {
+          const match = core.normalized(el.textContent).match(/^(8\s*pm ET balance|美东时间晚上\s*8\s*点余额|today['’]s floor|今日底线|今日底線)\s*[:：]\s*(\$?\s*[\d,]+(?:\.\d+)?)$/i);
+          if (!match) continue;
+          const key = /^(?:8|美东)/.test(match[1]) ? 'daily_reset_equity' : 'daily_floor';
+          const value = core.parseMoney(match[2]);
+          if (result[key]!=null && result[key]!==value) return null;
+          result[key] = value;
+        }
+        return result.daily_floor!=null ? result : null;
+      });
+      const maximum = await readRiskTooltip(riskTrigger('drawdown',/^(?:max\.? drawdown|最大回撤)$/i),name,root => {
+        const match = core.normalized(root.textContent).match(/(?:若账户价值跌至\s*(\$[\d,]+(?:\.\d+)?)\s*[，,]\s*账户将被永久关闭|account is permanently closed if your account value drops to\s*(\$[\d,]+(?:\.\d+)?))\s*[.。]?$/i);
+        const value = match && core.parseMoney(match[1] || match[2]);
+        return value!=null ? {max_drawdown_floor:value} : null;
+      });
+      return {...daily,...maximum};
     }
     function bannerUnrealized() {
       // The desktop second-row banner has no account-upnl test ID. Read its
@@ -933,7 +944,7 @@
         position_open: null,
         observed_at: account.observed_at
       };
-      const reference = await dailyReference(name);
+      const reference = await riskReferences(name);
       if (observerIdentity().signature!==id.signature) throw Error('读取期间账户或阶段已变化');
       const restricted = ['default', 'main', 'primary', 'master', 'closed', 'failed'].includes(selected.category);
       return {
@@ -980,7 +991,7 @@
       observerAssertPage();
       const identity = observerIdentity();
       if (identity.name !== config.accountName) throw Error('提交前交易账户已变化');
-      const reference = await dailyReference(identity.name);
+      const reference = await riskReferences(identity.name);
       const latest = observerValues(identity.name,true);
       if (observerIdentity().signature !== identity.signature) throw Error('读取最新风控期间账户或阶段变化');
       return {name:identity.name,category:identity.category,phase:identity.phase,
@@ -1000,6 +1011,8 @@
         job.take_profit = checked.take_profit ?? job.take_profit;
         job.stop_omitted = checked.stop_omitted;
         job.remaining_drawdown = checked.remaining_drawdown;
+        job.distance_to_max_floor = checked.distance_to_max_floor;
+        job.floor_gap = checked.floor_gap;
         core.validateJob(job,config);
       }
       const verifiedForm = () => {
@@ -1026,6 +1039,8 @@
           job.take_profit = decision.take_profit;
           job.stop_omitted = decision.stop_omitted;
           job.remaining_drawdown = decision.remaining_drawdown;
+          job.distance_to_max_floor = decision.distance_to_max_floor;
+          job.floor_gap = decision.floor_gap;
           core.validateJob(job,config);
           continue;
         }
@@ -1277,6 +1292,8 @@
             take_profit:approved.take_profit ?? p.take_profit,
             stop_omitted:approved.stop_omitted,
             remaining_drawdown:approved.remaining_drawdown,
+            distance_to_max_floor:approved.distance_to_max_floor,
+            floor_gap:approved.floor_gap,
             type: 'open',
             ...(p.micro ? {
               quantity: core.nqInputToVest(p.micro, 'micro')

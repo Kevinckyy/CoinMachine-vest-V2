@@ -7,6 +7,7 @@ from .trading_day import entry_day_window
 
 
 CENT = Decimal("0.01")
+OPEN_POLICY_VERSION = 3
 
 
 def decimal(value):
@@ -94,18 +95,29 @@ def view(db, worker, account, now):
             "source":"platform" if verified else "pending","verified":verified}
 
 
-def stop_amount(equity, floor, buffer):
-    if not floor or not floor["verified"] or equity is None:
-        return None
-    return float((decimal(equity)-decimal(floor["floor"])-decimal(buffer)).quantize(CENT,rounding=ROUND_FLOOR))
-
-
-def stop_decision(equity, floor, params):
-    remaining = stop_amount(equity, floor, 0)
+def stop_decision(risk, floor, params):
+    """Either exemption can omit the stop. Otherwise both loss allowances constrain it."""
+    equity, used, limit = (risk.get(k) for k in ("equity", "drawdown", "drawdown_limit"))
+    daily = decimal(equity) - decimal(floor["floor"]) if equity is not None and floor and floor["verified"] else None
+    total = decimal(limit) - abs(decimal(used)) if used is not None and limit is not None else None
+    maximum_floor = risk.get("max_drawdown_floor")
+    gap = decimal(floor["floor"]) - decimal(maximum_floor) if daily is not None and maximum_floor is not None else None
+    gap_limit = params.get("omit_floor_gap_below")
     threshold = params.get("omit_stop_below")
-    omit = threshold is not None and remaining is not None and 0 < remaining < threshold
-    amount = None if omit else stop_amount(equity, floor, params.get("stop_buffer",20))
-    return remaining, amount, omit
+    max_distance = decimal(equity) - decimal(maximum_floor) if equity is not None and maximum_floor is not None else None
+    ready = (gap_limit is None and threshold is None) or max_distance is not None and gap is not None
+    omit = (ready and max_distance is not None and max_distance > 0 and
+            total is not None and total > 0 and daily is not None and daily > 0 and
+            ((gap_limit is not None and gap < decimal(gap_limit)) or
+             (threshold is not None and max_distance < decimal(threshold))))
+    amount = None
+    if ready and daily is not None and total is not None and not omit:
+        amount = (min(daily, total) - decimal(params.get("stop_buffer", 20))).quantize(CENT, rounding=ROUND_FLOOR)
+    return {"remaining_drawdown":float(daily) if daily is not None else None,
+            "floor_gap":float(gap) if gap is not None else None,
+            "distance_to_max_floor":float(max_distance) if max_distance is not None else None,
+            "remaining_max_drawdown":float(total) if total is not None else None,
+            "stop_loss":float(amount) if amount is not None else None, "stop_omitted":omit}
 
 
 def take_profit(params, risk_amount):

@@ -197,7 +197,7 @@ class Center:
                 actual,target = plugin_version_parts(w.get("plugin_version")),plugin_version_parts(self.plugin_version)
                 status = "unknown" if not actual or not target else "current" if actual==target else "behind" if actual<target else "ahead"
                 workers[nid, w["worker_id"]] = {**w, "node_id": nid, "online": online and now - w["last_seen"] < WORKER_TTL,
-                                                "supports_open_policy":nodes[nid]["open_policy_version"]>=2 and actual>=(1,6,0,0),
+                                                "supports_open_policy":nodes[nid]["open_policy_version"]>=daily_floor.OPEN_POLICY_VERSION and actual>=(1,8,0,0),
                                                 "plugin_version":w.get("plugin_version",""),"version_status":status}
             for a in snap["accounts"]:
                 key = (nid, a["worker_id"], a["name"])
@@ -331,10 +331,10 @@ class Center:
             require(worker.get("strategy_version")==1,"Live 策略和免止损规则需要节点桥及 1.5.0 或更高版本插件",409)
         if req["action"]=="order.open" and a:
             require(worker["supports_open_policy"],
-                    "开仓风控需要当前节点桥及 1.6.0 或更高版本插件",409)
+                    "开仓风控需要支持两条底线的节点桥及 1.8.0 或更高版本插件",409)
             require(a["phase"]=="live" or req["params"].get("take_profit") is None and "reward_ratio" not in req["params"],
                     "考核账户开仓不设止盈",409)
-            remaining,budget,omit = daily_floor.stop_decision((a.get("risk") or {}).get("equity"),a.get("daily_floor"),req["params"])
+            budget = daily_floor.stop_decision(a.get("risk") or {},a.get("daily_floor"),req["params"])["stop_loss"]
             last_lock = a.get("open_lock") or {}
             reread = last_lock and last_lock["until"] <= self.clock() and (a.get("risk_at") or 0) < last_lock["until"]
             if budget is not None and not reread:
@@ -727,6 +727,8 @@ class Center:
             params["side"] = side
             if config[prefix+"skip_stop_loss_on_low_drawdown"]:
                 params["omit_stop_below"] = config[prefix+"drawdown_stop_loss_threshold"]
+            if config["skip_stop_loss_on_floor_gap"]:
+                params["omit_floor_gap_below"] = config["floor_gap_threshold"]
             req = dict(node_id=nid,worker_id=wid,account=name,action="order.open",params=params)
             reentry = s.get("reentries",{}).get(a["account_ref"] or name)
             if reentry and command(db,reentry)["worker"] != wid:

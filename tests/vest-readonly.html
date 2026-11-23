@@ -7,7 +7,8 @@
 <p data-testid="account-health">90%</p>
 <div><span id="lossHelp" data-slot="tooltip-trigger">每日亏损</span><p data-testid="capital-indicator-daily-loss">$0.00 / $30.00</p></div>
 <div id="lossLabels" role="tooltip" hidden><span>美东时间晚上8点余额：$1,000.00</span><span>今日底线：$970.00</span></div>
-<span data-testid="capital-indicator-drawdown">$26.08 / $300</span>
+<div><span id="drawdownHelp" data-slot="tooltip-trigger">最大回撤</span><span data-testid="capital-indicator-drawdown">$26.08 / $300</span></div>
+<div id="drawdownLabels" role="tooltip" hidden>从初始账户价值起允许的最大总亏损。若账户价值跌至 <span>$750.00</span>，账户将被永久关闭。</div>
 </section>
 <button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active positions</button>
 <div id="positions"><p>No positions yet</p></div>
@@ -50,6 +51,9 @@
   const lossHelp=document.getElementById('lossHelp'), labels=document.getElementById('lossLabels');
   lossHelp.onpointerover=()=>{labels.hidden=false;lossHelp.setAttribute('aria-describedby',labels.id);};
   lossHelp.onpointerout=()=>{labels.hidden=true;lossHelp.removeAttribute('aria-describedby');};
+  const ddHelp=document.getElementById('drawdownHelp'), ddLabels=document.getElementById('drawdownLabels');
+  ddHelp.onpointerover=()=>{ddLabels.hidden=false;ddHelp.setAttribute('aria-describedby',ddLabels.id);};
+  ddHelp.onpointerout=()=>{ddLabels.hidden=true;ddHelp.removeAttribute('aria-describedby');};
   function tradeEquity(name,equity) {
     if(name==='Beta' && sessionStorage.getItem('testPayoutDebited')) return '$1,960.00';
     return name==='Alpha' && sessionStorage.getItem('tradeEquity') || equity;

@@ -29,7 +29,7 @@ class FleetTest(unittest.TestCase):
         self.center = Center(self.root / "center", self.clock, self.transport)
         self.lose_delivery = False
         self.plugin_meta = dict(worker_id="browser", session_id="session-1", generation=1,
-                                mode="execute", label="Browser A", page="/trade/NQ-PERP", strategy_version=1,plugin_version="1.6.0")
+                                mode="execute", label="Browser A", page="/trade/NQ-PERP", strategy_version=1,plugin_version=self.center.plugin_version)
         self.addCleanup(self.close)
         for nid in self.nodes:
             self.center.configure_node(nid, dict(url="https://" + nid + ".example", label=nid, token=secrets.token_hex(20)))
@@ -86,7 +86,7 @@ class FleetTest(unittest.TestCase):
 
     def reading(self, name):
         return dict(name=name,phase="1/2",category="eval",snapshot=dict(position_open=False,balance=1000,equity=1000,
-                    account_health=90,daily_reset_equity=1000,daily_floor=970,capital_metrics={"daily_loss":{"current":0,"limit":30},
+                    account_health=90,daily_reset_equity=1000,daily_floor=970,max_drawdown_floor=700,capital_metrics={"daily_loss":{"current":0,"limit":30},
                     "drawdown":{"current":26.08,"limit":300}},unrealized_pnl=0,observed_at=self.time))
 
     def observe(self, nid, name):
@@ -327,21 +327,22 @@ class FleetTest(unittest.TestCase):
     def test_skip_stop_compares_pre_buffer_floor_distance_and_verifies_absence(self):
         obs = self.reading("Shared")
         snap = obs["snapshot"]
-        snap.update(equity=9850,balance=9850,daily_reset_equity=10000,daily_floor=9700)
+        snap.update(equity=9850,balance=9850,daily_reset_equity=10000,daily_floor=9650,max_drawdown_floor=9700)
         snap["capital_metrics"].update(daily_loss={"current":150,"limit":300},drawdown={"current":60,"limit":300})
         self.report("east",observation=obs)
         self.center.sync("east")
-        floor = {"verified":True,"floor":9700}
-        self.assertEqual(daily_floor.stop_decision(9850,floor,dict(stop_buffer=20,omit_stop_below=150)),(150,130,False))
-        self.assertEqual(daily_floor.stop_decision(9850,floor,dict(stop_buffer=20,omit_stop_below=140)),(150,130,False))
-        self.assertEqual(daily_floor.stop_decision(9850,floor,dict(stop_buffer=20)),(150,130,False))
-        self.assertFalse(daily_floor.stop_decision(9700,floor,dict(stop_buffer=20,omit_stop_below=151))[2])
+        floor = {"verified":True,"floor":9650}
+        risk = dict(equity=9850, drawdown=60, drawdown_limit=300, max_drawdown_floor=9700)
+        for threshold in (None, 140, 150):
+            self.assertEqual(daily_floor.stop_decision(risk,floor,dict(stop_buffer=20,omit_stop_below=threshold)),
+                             dict(remaining_drawdown=200,remaining_max_drawdown=240,floor_gap=-50,distance_to_max_floor=150,stop_loss=180,stop_omitted=False))
+        self.assertFalse(daily_floor.stop_decision({**risk,"equity":9700},floor,dict(omit_stop_below=151))["stop_omitted"])
         params = dict(side="buy",micro=1,stop_buffer=20,omit_stop_below=150.01)
         self.center.submit("omit",self.req(action="order.open",params=params))
         self.center.sync("east")
         cmd = self.plugin("east","poll")["command"]
         checked = self.plugin("east","preflight",id=cmd["id"],observation=obs)
-        self.assertEqual((checked["remaining_drawdown"],checked["stop_loss"],checked["stop_omitted"]),(150,None,True))
+        self.assertEqual((checked["remaining_drawdown"],checked["stop_loss"],checked["stop_omitted"]),(200,None,True))
         self.plugin("east","intent",id="omit",stage="open",observation=obs,proof=dict(quantity=2,stop_loss=None))
         cmd = self.nodes["east"].get("omit")
         filled = {**snap,"position_open":True,"position_id":"p","symbol":"NQ-PERP","side":"buy","quantity":2,"entry_price":20000,
@@ -534,6 +535,76 @@ class FleetTest(unittest.TestCase):
         proof = self.nodes["east"].get("dynamic")["intents"]["open"]["proof"]
         self.assertEqual((proof["daily_floor"]["floor"],proof["stop_buffer"]),(9700,10))
 
+    def test_live_max_drawdown_caps_stop_and_ratio_at_final_intent(self):
+        obs = {**self.reading("Live"), "phase":"live", "category":"funded"}
+        snap = obs["snapshot"]
+        snap.update(equity=5000, balance=5000, daily_floor=4373.94, max_drawdown_floor=4700, daily_reset_equity=4865.40)
+        snap["capital_metrics"].update(daily_loss=dict(current=0,limit=145.96),drawdown=dict(current=0,limit=300))
+        self.card_report("east",[self.card("Live",phase="live",category="funded")])
+        self.report("east",observation=obs)
+        self.center.sync("east")
+        params = dict(side="sell",micro=1,stop_buffer=20,reward_ratio=1,omit_stop_below=180,min_take_profit=180)
+        self.center.submit("two-limits",self.req(name="Live",action="order.open",params=params))
+        self.center.sync("east")
+        cmd = self.plugin("east","poll")["command"]
+        def check(op,**kw):
+            return self.plugin("east",op,id=cmd["id"],observation=obs,**kw)
+        first = check("preflight")
+        self.assertEqual((first["stop_loss"],first["take_profit"]),(280,280))
+        snap["capital_metrics"]["drawdown"]["current"] = 55.07
+        def submit(stop):
+            return check("intent",stage="open",allow_refill=True,proof=dict(quantity=2,stop_loss=stop,take_profit=stop))
+        change = submit(280)
+        self.assertTrue(change["refill"])
+        self.assertFalse(change["authorize_click"])
+        self.assertEqual((change["stop_loss"],change["take_profit"]),(224.93,224.93))
+        self.assertTrue(submit(224.93)["authorize_click"])
+        proof = self.nodes["east"].get(cmd["id"])["intents"]["open"]["proof"]
+        self.assertEqual((proof["equity"],proof["daily_floor"]["floor"],proof["remaining_drawdown"],
+                          proof["remaining_max_drawdown"],proof["stop_loss"]),(5000,4373.94,626.06,244.93,224.93))
+
+    def test_incomplete_or_exhausted_max_drawdown_blocks_open(self):
+        for key,metric in (("missing",{}),("buffer",dict(current=280,limit=300))):
+            with self.subTest(key=key):
+                name = "Shared" if key=="missing" else "Second"
+                self.card_report("east",[self.card(name)])
+                self.center.sync("east")
+                self.center.submit(key,self.req(name=name,action="order.open",params=dict(side="buy",micro=1)))
+                self.center.sync("east")
+                cmd = self.plugin("east","poll")["command"]
+                obs = self.reading(name)
+                obs["snapshot"]["capital_metrics"]["drawdown"] = metric
+                check = self.plugin("east","preflight",id=cmd["id"],observation=obs)
+                self.assertFalse(check["approved"])
+                self.assertTrue(check["open_lock"])
+                self.assertFalse(self.nodes["east"].get(key)["intents"])
+
+    def test_default_gap_exemption_rechecks_both_lines_before_click(self):
+        self.center.strategy("config",dict(live_take_profit_mode="ratio",live_reward_ratio=1,
+                             live_skip_stop_loss_on_low_drawdown=True,live_drawdown_stop_loss_threshold=180),"east")
+        self.start_cards([self.card("Live",phase="live",category="funded")])
+        self.center.sync("east")
+        cmd = self.plugin("east","poll")["command"]
+        self.assertEqual(cmd["params"]["omit_floor_gap_below"],20)
+        obs = {**self.reading("Live"), "phase":"live", "category":"funded"}
+        snap = obs["snapshot"]
+        snap.update(equity=5000,balance=5000,daily_floor=4373.94,max_drawdown_floor=4700)
+        snap["capital_metrics"]["drawdown"] = dict(current=0,limit=300)
+        def check(op,**kwargs):
+            return self.plugin("east",op,id=cmd["id"],observation=obs,**kwargs)
+        approved = check("preflight")
+        self.assertEqual((approved["floor_gap"],approved["distance_to_max_floor"],approved["stop_loss"],
+                          approved["take_profit"]),(-326.06,300,None,626.06))
+        snap["daily_floor"] = 4720
+        refill = check("intent",stage="open",allow_refill=True,proof=dict(quantity=2,stop_loss=None,take_profit=626.06))
+        self.assertFalse(refill["authorize_click"])
+        self.assertEqual((refill["floor_gap"],refill["stop_loss"],refill["take_profit"]),(20,260,260))
+        snap.pop("max_drawdown_floor")
+        denied = check("intent",stage="open",proof=dict(quantity=2,stop_loss=260,take_profit=260))
+        self.assertFalse(denied["authorize_click"])
+        self.assertIn("最大回撤线",denied["reason"])
+        self.assertFalse(self.nodes["east"].get(cmd["id"])["intents"])
+
     def test_corrected_account_is_locked_until_new_york_cutoff_then_rechecked(self):
         items = [self.card("Shared")]
         self.card_report("east",items)
@@ -590,6 +661,7 @@ class FleetTest(unittest.TestCase):
         first = check()
         self.assertEqual((first["stop_loss"],first["take_profit"]),(10,50))
         obs["snapshot"]["daily_floor"] = 974
+        obs["snapshot"]["max_drawdown_floor"] = 980
         updated = check()
         self.assertEqual((updated["stop_loss"],updated["take_profit"]),(None,52))
         self.assertIn("daily_floor",updated["changed"])
@@ -667,7 +739,7 @@ class FleetTest(unittest.TestCase):
 
     def test_plugin_version_reporting_and_old_clients(self):
         target = self.center.plugin_version
-        for actual,status,can_open in (("1.5.1","behind",False),("1.6.0","behind",True),(target,"current",True),
+        for actual,status,can_open in (("1.5.1","behind",False),("1.7.1","behind",False),(target,"current",True),
                                       ("1.10.0","ahead",True),("","unknown",False)):
             self.plugin("east","heartbeat",plugin_version=actual)
             self.center.sync("east")
@@ -749,11 +821,12 @@ class FleetTest(unittest.TestCase):
                 return daily_floor.view(db,*route[1:],stamp)
             daily_floor.capture(db,*route[1:],at-2000,300)
             self.assertFalse(level()["verified"])
-            self.assertIsNone(daily_floor.stop_amount(9850,level(),10))
+            risk = dict(equity=9850,drawdown=0,drawdown_limit=300)
+            self.assertIsNone(daily_floor.stop_decision(risk,level(),dict(stop_buffer=10))["stop_loss"])
             daily_floor.capture(db,*route[1:],at-2000,300,10000,9700)
             day = level()
             self.assertEqual(day["end"]-day["start"],25*3600)
-            self.assertEqual(daily_floor.stop_amount(9850,day,20),130)
+            self.assertEqual(daily_floor.stop_decision(risk,day,dict(stop_buffer=20))["stop_loss"],130)
             for ref,stamp in (("a",at-600),("b",at-400)):
                 ledger.save(db,route,"withdrawal",ref,dict(phase="live",amount=40,expected_received=32,verified_at=stamp))
             def payout(ref,amount,created,executed):

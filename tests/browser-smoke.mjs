@@ -12,11 +12,14 @@ import '../extension/stop-protection.js';
 import '../extension/core.js';
 
 const stopJob = {id:'example',type:'open',account_id:'demo',side:'buy',symbol:'NQ-PERP',size_percent:25,
-  stop_buffer:20,stop_loss:null,stop_omitted:true,remaining_drawdown:150,omit_stop_below:150.01};
+  stop_buffer:20,stop_loss:null,stop_omitted:true,remaining_drawdown:320,distance_to_max_floor:150,omit_stop_below:150.01};
 const stopAccount = {accountId:'demo',accountName:'Demo',accountCategory:'eval'};
 assert.equal(VestBridgeCore.validateJob(stopJob,stopAccount),stopJob);
 assert.throws(()=>VestBridgeCore.validateJob({...stopJob,omit_stop_below:150},stopAccount),/stop_loss/);
 assert.throws(()=>VestBridgeCore.validateJob({...stopJob,stop_omitted:false},stopAccount),/stop_loss/);
+const gapJob={...stopJob,distance_to_max_floor:300,remaining_drawdown:626.06,floor_gap:-326.06,omit_floor_gap_below:20};
+assert.equal(VestBridgeCore.validateJob(gapJob,stopAccount),gapJob);
+assert.throws(()=>VestBridgeCore.validateJob({...gapJob,floor_gap:20},stopAccount),/stop_loss/);
 assert.equal(VestStopProtection.plan({native_sl_absent:true,native_sl_price:null},null).status,'omitted');
 for (const [side,trigger] of [['buy',20005.25],['sell',19994.75]]) {
   const checked=VestStopProtection.plan({side,quantity:6,entry_price:20000,native_tp_price:trigger},30.1,'tp',true,30.1);
@@ -318,6 +321,7 @@ try {
   assert.equal(receipt.result.observation.name,'Alpha');assert.equal(receipt.result.observation.snapshot.equity,1050);
   assert.equal(receipt.result.observation.snapshot.daily_reset_equity,1000);
   assert.equal(receipt.result.observation.snapshot.daily_floor,970);
+  assert.equal(receipt.result.observation.snapshot.max_drawdown_floor,750);
   await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
   const syncId=randomUUID();
   await api('commands/'+syncId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Alpha',action:'history.read',params:{}});
@@ -389,6 +393,10 @@ try {
   await setPolicy('live_priority',false);
   await checkFields({account_priority_order:false});
   await setPolicy('skip_stop_loss_on_low_drawdown',true);
+  await checkFields({floor_gap_threshold:true});
+  await setPolicy('skip_stop_loss_on_floor_gap',false);
+  await checkFields({floor_gap_threshold:false});
+  await setPolicy('skip_stop_loss_on_floor_gap',true);
   await checkFields({drawdown_stop_loss_threshold:true,live_drawdown_stop_loss_threshold:false});
   await setPolicy('skip_stop_loss_on_low_drawdown',false);
   await setPolicy('live_skip_stop_loss_on_low_drawdown',true);

@@ -169,7 +169,7 @@ function strategyDetail(node) {
   const queue = (s.planned || []).map(item => item.ref);
   const olderWorkers = state.workers.filter(w => w.node_id === node.id && w.online && w.mode === 'execute' && !w.supports_open_policy);
   const versionNote = olderWorkers.length ? '<p class="form-note">'+esc(olderWorkers.map(w => w.label).join('、'))+
-    ' 需要更新节点桥并加载 1.6.0 或更高版本插件，才能执行页面爆仓线与止盈核验。</p>' : '';
+    ' 需要更新节点桥并加载 1.8.0 或更高版本插件，才能核对每日亏损底线与最大回撤线。</p>' : '';
   const controls = '<div class="buttons">'+strategyControls(node,s)+'</div>';
   const summary = '<div class="panel-body"><div class="row"><h3>'+esc(poolNames[c.pool_strategy])+'</h3>'+strategyStatus(node,s)+'</div>'+
     '<div class="summary"><div><small>批次</small><strong>'+s.batch+'</strong></div><div><small>每批账户</small><strong>'+c.batch_size+'</strong></div>'+
@@ -238,7 +238,7 @@ function strategyFields(c) {
   const phase = prefix => choices(prefix+'side','方向',dir)+(prefix ? size('live_size_percent','仓位比例') :
     size('size_percent','考核 1/2 仓位比例')+size('phase2_size_percent','考核 2/2 仓位比例'))+
     numeric(prefix+'stop_buffer','爆仓线上方缓冲 M · USD',0,'any')+
-    flag(prefix+'skip_stop_loss_on_low_drawdown','剩余额度低于阈值时免设止损')+numeric(prefix+'drawdown_stop_loss_threshold','免止损阈值 · USD',.000001,'any');
+    flag(prefix+'skip_stop_loss_on_low_drawdown','净值距最大回撤线低于阈值时免止损')+numeric(prefix+'drawdown_stop_loss_threshold','净值距离阈值 · USD',.000001,'any');
   return group('账户池与阶段优先级',choices('pool_strategy','选池方式',poolNames)+numeric('batch_size','每批账户数',1,'1',100)+
       flag('same_stage_full_batch','同阶段账户不足一批时顺延')+flag('pool_limits_enabled','启用账户池上限')+
       limit('exam_pool_limit','考核号上限（∞ 为不限）')+limit('live_pool_limit','Live 上限（∞ 为不限）')+
@@ -250,6 +250,8 @@ function strategyFields(c) {
     group('批内与批间等待',
       numeric('order_delay_min','批内最短等待 · 秒',0,'any',86400)+numeric('order_delay_max','批内最长等待 · 秒',0,'any',86400)+
       numeric('batch_delay_min','批间最短等待 · 秒',0,'any',86400)+numeric('batch_delay_max','批间最长等待 · 秒',0,'any',86400))+
+    group('考核与 Live 通用风控',flag('skip_stop_loss_on_floor_gap','今日底线减最大回撤线低于阈值时免止损')+
+      numeric('floor_gap_threshold','两线差额阈值 · USD',-1e9,'any',1e9),true)+
     group('考核号下单与风控',phase(''))+
     group('Live 下单与风控','<div class="full">'+flag('live_default_locked','Live 默认锁定')+
       '<p class="form-note">开启后，可在「管理账户」中为指定 Live 账户勾选「加入自动策略池」以单独解锁。</p></div>'+phase('live_')+
@@ -262,7 +264,7 @@ function strategyFields(c) {
     group('Live 利润领取',choices('live_payout_recipient','收款账户',{main:'平台主账户'})+
       choices('live_payout_mode','领取方式',{all:'全部净利润',amount:'固定金额',percent:'按净利润比例'})+
       numeric('live_payout_amount','固定领取金额 · USDC',.000001,'.000001')+numeric('live_payout_percent','领取比例 · %',.000001,'any',100))+
-    '<p id="stopThresholdNote" class="form-note">免止损比较净值与当日爆仓线的差额。等于阈值时仍会设置止损，金额为该差额减去 M。</p>';
+    '<p class="form-note">任一已开启的免止损条件严格低于阈值时，止损留空。其余情况取净值距今日底线的金额和剩余最大回撤中的较小值，再减去缓冲 M。</p>';
 }
 
 function updateStrategyFields() {
@@ -288,6 +290,7 @@ function updateStrategyFields() {
     dynamic_live_target: dynamic && unlimitedLive, dynamic_exam_slots: dynamic && multiple,
     order_delay_min: orderDelay, order_delay_max: orderDelay,
     account_priority_order: fields.live_priority.checked,
+    floor_gap_threshold: fields.skip_stop_loss_on_floor_gap.checked,
     drawdown_stop_loss_threshold: fields.skip_stop_loss_on_low_drawdown.checked,
     live_drawdown_stop_loss_threshold: fields.live_skip_stop_loss_on_low_drawdown.checked,
     live_payout_amount: fields.live_payout_mode.value === 'amount',
@@ -300,7 +303,6 @@ function updateStrategyFields() {
   }
   fields.dynamic_exam_slots.max = multiple ? String(batch - 1) : '';
   fields.dynamic_reserve_high.min = String(Math.max(2,(fields.dynamic_reserve_low.valueAsNumber || 1) + 1));
-  $('stopThresholdNote').hidden = !available.drawdown_stop_loss_threshold && !available.live_drawdown_stop_loss_threshold;
   $('liveProfitNote').textContent = profit === 'ratio' ? '止盈取最低止盈额与风险金额乘盈亏比中的较大值。免设止损时，风险金额取净值至页面爆仓线的距离。' :
     profit === 'entries' ? '每个账户按美东 20:00 日切。已确认成交后使用后续档；未填止盈额的档位跳过开仓。' : '未填固定止盈额时，此模式下的 Live 账户跳过自动开仓。';
 }

@@ -59,8 +59,12 @@ def verify_financial_receipt(cmd, result):
                         gross = (trigger-snap["entry_price"])*(1 if params["side"]=="buy" else -1)*proof["quantity"]
                         require(gross+1e-6 >= params["min_take_profit"],"原生止盈低于设置的最低止盈金额")
                 if omitted:
-                    require(proof.get("stop_loss") is None and params.get("omit_stop_below") is not None and
-                            0 < proof["remaining_drawdown"] < params["omit_stop_below"] and snap.get("native_sl_absent") is True
+                    # Receipts issued before version 3 used the daily distance for the original exemption.
+                    distance = proof.get("distance_to_max_floor",proof["remaining_drawdown"])
+                    low_distance = params.get("omit_stop_below") is not None and distance is not None and 0 < distance < params["omit_stop_below"]
+                    low_gap = (params.get("omit_floor_gap_below") is not None and proof.get("floor_gap") is not None and
+                               proof["floor_gap"] < params["omit_floor_gap_below"])
+                    require(proof.get("stop_loss") is None and (low_distance or low_gap) and snap.get("native_sl_absent") is True
                             and snap.get("native_sl_price") is None, "原生止损应为空且须满足免止损阈值")
                 elif action=="order.open" and key=="stop_loss" and "stop_buffer" in params:
                     target_risk = proof["stop_loss"]
@@ -166,7 +170,7 @@ class Bridge:
                         FROM commands WHERE worker=? AND action=? ORDER BY created DESC,id DESC LIMIT 1""",
                                   (row["worker_id"], PORTFOLIO_SCAN)).fetchone()
                 workers.append({**worker_view(row), "portfolio_scan": dict(scan) if scan else None})
-            snap = {"version": 1, "open_policy_version":2, "payout_quote_version":1, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
+            snap = {"version": 1, "open_policy_version":daily_floor.OPEN_POLICY_VERSION, "payout_quote_version":1, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
                     "launch_id": self.launch_id,
                     "ledger_seq": db.execute("SELECT COALESCE(MAX(seq),0) FROM book").fetchone()[0],
                     "log_seq": db.execute("SELECT COALESCE(MAX(id),0) FROM node_logs").fetchone()[0],
@@ -470,7 +474,7 @@ class Bridge:
                     validate_target(cmd, *target(db, cmd), now)
                     check_reservations(db, cmd, now)
                     if cmd["action"]=="order.open":
-                        require(plugin_version_parts(body.get("plugin_version")) >= (1,6,0,0), "开仓前请重新加载 1.6.0 或更高版本插件",409)
+                        require(plugin_version_parts(body.get("plugin_version")) >= (1,8,0,0), "开仓前请重新加载 1.8.0 或更高版本插件",409)
                     if cmd["action"] == "profit.available" or (cmd.get("strategy_payout") or {}).get("quote_id"):
                         require(plugin_version_parts(body.get("plugin_version")) >= (1,7,1,0),
                                 "读取页面可领额需要 1.7.1 或更高版本插件",409)
@@ -525,16 +529,24 @@ class Bridge:
         floor = daily_floor.view(db,wid,cmd["account"],now)
         if (old_floor or {}).get("floor") != (floor or {}).get("floor"):
             changed.append("daily_floor")
-        remaining, amount, omit = daily_floor.stop_decision(risk["equity"],floor,cmd["params"])
+        stop = daily_floor.stop_decision(risk, floor, cmd["params"])
+        amount = stop["stop_loss"]
         qty = body.get("quantity") if body.get("stage")!="open" else obj(body.get("proof",{})).get("quantity")
         if qty is None and "micro" in cmd["params"]:
             qty = cmd["params"]["micro"]*2
         min_stop = number(qty,"实际 Vest 数量",0.000001,1e12)*0.25 if qty is not None else None
-        if snap.get("daily_floor") is None or remaining is None:
+        if (stop["remaining_drawdown"] is None or snap.get("daily_floor") != floor["floor"] or
+                snap["observed_at"] != floor["observed_at"]):
             issue = issue or "交易页未读到本交易日的爆仓线"
-        elif not omit and amount<=0:
-            issue = issue or "净值至爆仓线的余量不足以保留止损缓冲"
-        elif not omit and min_stop is not None and amount<min_stop:
+        elif stop["remaining_max_drawdown"] is None:
+            issue = issue or "交易页未读到已用回撤和最大回撤上限"
+        elif ("omit_floor_gap_below" in cmd["params"] or "omit_stop_below" in cmd["params"]) and stop["distance_to_max_floor"] is None:
+            issue = issue or "交易页未读到最大回撤线，无法核对免止损条件"
+        elif stop["distance_to_max_floor"] is not None and stop["distance_to_max_floor"] <= 0:
+            issue = issue or "账户价值已触及最大回撤线"
+        elif amount is not None and amount <= 0:
+            issue = issue or "每日或最大回撤余量不足以保留止损缓冲"
+        elif amount is not None and min_stop is not None and amount<min_stop:
             issue = issue or "止损余量不足当前仓位的一个价格跳动"
             risk["size_minimum"] = {"size_percent":cmd["params"].get("size_percent"),"minimum":min_stop}
             db.execute("UPDATE accounts SET risk=? WHERE worker_id=? AND name=?",(dump(risk),wid,cmd["account"]))
@@ -555,7 +567,7 @@ class Bridge:
             lock = None
         profit = None
         if not reason:
-            profit = daily_floor.take_profit(cmd["params"],remaining if omit else amount)
+            profit = daily_floor.take_profit(cmd["params"],stop["remaining_drawdown"] if stop["stop_omitted"] else amount)
             if profit is not None and profit<=0:
                 reason = "盈亏比计算的止盈金额不足一美分"
         result = {"risk":actual,"changed":changed,"daily_floor":floor,"open_lock":lock,"observed_at":snap["observed_at"]}
@@ -567,7 +579,7 @@ class Bridge:
             reporting.log(db,self.node_id,now,"preflight","交易页已更正缓存并通过开仓核对 · "+", ".join(changed),
                           worker=wid,account=cmd["account"],command_id=cmd["id"])
         db.execute("INSERT OR REPLACE INTO open_preflight VALUES(?,?,?)",(cmd["id"],sid,now))
-        return {**result,"approved":True,"stop_loss":amount,"take_profit":profit,"stop_omitted":omit,"remaining_drawdown":remaining}
+        return {**result, **stop, "approved":True, "take_profit":profit}
 
     def _intent(self, db, wid, sid, body, now):
         row = command(db, ident(body.get("id")))
@@ -595,6 +607,13 @@ class Bridge:
                 finish(db,cmd["id"],"cancelled",now,reason,{**checked,"approved":False,"reselect":True})
                 return {**checked,"approved":False,"authorize_click":False,"reselect":True,"reason":reason}
             proof["daily_floor"] = checked["daily_floor"]
+            proof["equity"] = checked["risk"]["equity"]
+            proof["drawdown"] = checked["risk"]["drawdown"]
+            proof["drawdown_limit"] = checked["risk"]["drawdown_limit"]
+            proof["remaining_max_drawdown"] = checked["remaining_max_drawdown"]
+            proof["max_drawdown_floor"] = checked["risk"].get("max_drawdown_floor")
+            proof["floor_gap"] = checked["floor_gap"]
+            proof["distance_to_max_floor"] = checked["distance_to_max_floor"]
             proof["stop_buffer"] = cmd["params"]["stop_buffer"]
             proof["stop_omitted"] = checked["stop_omitted"]
             proof["remaining_drawdown"] = checked["remaining_drawdown"]

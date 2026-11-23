@@ -124,7 +124,7 @@ def parameters(action, raw, legacy=False):
         for key in p.keys() & {"stop_loss", "take_profit"}:
             positive(p[key], key)
     elif action == "order.open":
-        fields(p, ("side", "micro", "size_percent", "stop_buffer", "take_profit", "reward_ratio", "min_take_profit", "omit_stop_below") + (("stop_loss",) if legacy else ()))
+        fields(p, ("side", "micro", "size_percent", "stop_buffer", "take_profit", "reward_ratio", "min_take_profit", "omit_stop_below", "omit_floor_gap_below") + (("stop_loss",) if legacy else ()))
         choice(p.get("side"), {"buy", "sell"}, "方向")
         require(("micro" in p) != ("size_percent" in p), "请指定 Micro 数量或仓位比例")
         if "micro" in p:
@@ -145,6 +145,8 @@ def parameters(action, raw, legacy=False):
             require("min_take_profit" not in p,"最低止盈金额仅适用于盈亏比模式")
         if "omit_stop_below" in p:
             positive(p["omit_stop_below"], "免止损剩余回撤阈值")
+        if "omit_floor_gap_below" in p:
+            number(p["omit_floor_gap_below"], "两条底线差额阈值", -1e9, 1e9)
     return p
 
 

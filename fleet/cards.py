@@ -27,6 +27,8 @@ def schema(db):
 def from_trade(snap):
     metrics = obj(snap.get("capital_metrics",{}))
     result = {"equity":snap.get("equity"), "health":snap.get("account_health"), "position_open":snap.get("position_open")}
+    if snap.get("max_drawdown_floor") is not None:
+        result["max_drawdown_floor"] = number(snap["max_drawdown_floor"],"交易页最大回撤线",0,1e12)
     for key, limit in (("daily_loss","daily_limit"),("drawdown","drawdown_limit")):
         metric = obj(metrics.get(key) or {})
         result[key], result[limit] = metric.get("current"), metric.get("limit")
