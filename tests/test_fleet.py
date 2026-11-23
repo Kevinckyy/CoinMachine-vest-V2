@@ -993,20 +993,38 @@ class FleetTest(unittest.TestCase):
         with self.assertRaisesRegex(Problem, "交易日"):
             self.center.submit("again", self.req(name="Only-east", action="order.open", params=cmd["params"]))
 
+    def fill_exam_order(self):
+        cmd = self.plugin("east", "poll")["command"]
+        self.assertEqual(cmd["action"],"order.open")
+        self.plugin("east", "intent", id=cmd["id"], stage="open", proof={"quantity":2})
+        snap = dict(position_open=True, position_id="position-"+cmd["id"], symbol="NQ-PERP", side=cmd["params"]["side"],
+                    quantity=2, entry_price=1000, balance=1000, equity=1000, unrealized_pnl=0, observed_at=self.time,
+                    native_sl_price=995 if cmd["params"]["side"]=="buy" else 1005,
+                    stop_check={"status":"verified","target_risk":10}, take_profit_check={"status":"omitted"})
+        receipt = self.plugin("east", "result", id=cmd["id"], ok=True,
+                              result={"observation":{"name":cmd["account"],"phase":cmd["phase"],"snapshot":snap}})
+        self.assertEqual(receipt["status"],"succeeded")
+        return cmd
+
+    def finish_exit_list(self, cards, full=True):
+        self.center.sync("east")
+        check = self.plugin("east","poll")["command"]
+        self.assertEqual(check["action"],"accounts.list")
+        self.time += 1
+        self.card_report("east",cards,full=full)
+        rows = [{k:c[k] for k in ("name","phase","category")} for c in cards]
+        self.plugin("east","result",id=check["id"],ok=True,
+                    result=dict(source="accounts",full=full,count=len(rows),inventory=rows))
+        self.center.sync("east")
+        self.center.decide()
+
     def test_batch_waits_for_observed_exit_then_interval(self):
         self.enable("east")
         self.center.strategy("config", {"interval_seconds":2}, "east")
         self.start_ready("east")
         self.center.decide()
         self.center.sync("east")
-        cmd = self.plugin("east", "poll")["command"]
-        self.plugin("east", "intent", id=cmd["id"], stage="open", proof={"quantity":2})
-        snap = dict(position_open=True, position_id="fixture", symbol="NQ-PERP", side=cmd["params"]["side"],
-                    quantity=2, entry_price=1000, balance=1000, equity=1000, unrealized_pnl=0, observed_at=self.time,
-                    native_sl_price=995 if cmd["params"]["side"]=="buy" else 1005,
-                    stop_check={"status":"verified","target_risk":10}, take_profit_check={"status":"omitted"})
-        self.plugin("east", "result", id=cmd["id"], ok=True,
-                    result={"observation":{"name":"Only-east","phase":"1/2","snapshot":snap}})
+        cmd = self.fill_exam_order()
         self.center.sync("east")
         self.enable("west")
         self.center.account_config(dict(node_id="east", worker_id="browser", account="Shared", in_pool=True))
@@ -1023,6 +1041,95 @@ class FleetTest(unittest.TestCase):
         self.center.decide()
         self.assertEqual(self.center.state()["commands"][0]["account"], "Shared")
         self.assertEqual(self.center.state("west")["commands"], [])
+
+    def test_disappeared_batch_shares_one_full_list_and_resumes_after_cooldown(self):
+        self.center.strategy("config",{"batch_size":2},"east")
+        self.start_cards([self.card("One"),self.card("Two")])
+        self.center.sync("east")
+        fills = [self.fill_exam_order() for _ in range(2)]
+        self.time += 1
+        next_cards = [self.card("Three"),self.card("Four")]
+        self.card_report("east",next_cards,full=False)
+        self.center.sync("east")
+        self.center.decide()
+        self.center.db.close()
+        self.center = Center(self.root/"center",self.clock,self.transport)
+        self.center.decide()
+        state = self.center.state("east")
+        self.assertEqual(set(state["strategy"]["members"]),{c["id"] for c in fills})
+        self.assertEqual([c["action"] for c in state["commands"]].count("accounts.list"),1)
+        self.assertEqual(self.center.state("west")["commands"],[])
+        self.finish_exit_list(next_cards)
+        waiting = self.center.state("east")["strategy"]
+        self.assertEqual((waiting["message"],waiting["members"],waiting["next_at"]),("批间等待",[],self.time+60))
+        with self.center.db.read() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM book WHERE kind='position' AND closed=1").fetchone()[0],0)
+        self.time += 59
+        self.card_report("east",next_cards)
+        self.center.sync("east")
+        self.center.decide()
+        self.assertEqual(self.center.state("east")["strategy"]["next_at"],waiting["next_at"])
+        self.time += 1
+        self.center.decide()
+        advanced = self.center.state("east")["strategy"]
+        self.assertEqual((advanced["run"],advanced["batch"]),(waiting["run"],2))
+        self.assertEqual({self.center.get(i)["account"] for i in advanced["members"]},{"Three","Four"})
+
+    def test_partial_list_and_renamed_open_position_do_not_finish_batch(self):
+        self.center.strategy("config",{"batch_size":2},"east")
+        self.start_cards([self.card("Gone"),self.card("Holding")])
+        self.center.sync("east")
+        for _ in range(2):
+            self.fill_exam_order()
+        self.time += 1
+        renamed = self.card("Renamed",id="card-Holding",active_positions=1)
+        self.card_report("east",[renamed])
+        self.center.sync("east")
+        self.center.decide()
+        self.finish_exit_list([renamed],full=False)
+        self.assertIn("核对本批",self.center.state("east")["strategy"]["message"])
+        self.time += 31
+        self.card_report("east",[renamed],full=False)
+        self.center.sync("east")
+        self.center.decide()
+        self.finish_exit_list([renamed])
+        self.assertEqual(self.center.state("east")["strategy"]["message"],"等待本批全部持仓确认结束")
+        self.time += 1
+        self.card_report("east",[{**renamed,"active_positions":0}],full=False)
+        self.center.sync("east")
+        self.center.decide()
+        self.assertEqual(self.center.state("east")["strategy"]["message"],"批间等待")
+
+    def test_name_reuse_needs_full_directory_confirmation(self):
+        self.start_cards([self.card("Reused")])
+        self.center.sync("east")
+        self.fill_exam_order()
+        self.time += 1
+        replacement = self.card("Reused",id="different-card")
+        self.card_report("east",[replacement])
+        self.center.sync("east")
+        self.center.decide()
+        self.assertIn("核对本批",self.center.state("east")["strategy"]["message"])
+        self.finish_exit_list([replacement])
+        self.assertEqual(self.center.state("east")["strategy"]["message"],"批间等待")
+
+    def test_account_reappearing_in_verification_keeps_its_batch_open(self):
+        self.start_cards([self.card("Visible")])
+        self.center.sync("east")
+        opened = self.fill_exam_order()
+        self.time += 1
+        self.card_report("east",[],full=False)
+        self.center.sync("east")
+        self.center.decide()
+        self.finish_exit_list([self.card("Visible",active_positions=1)])
+        state = self.center.state("east")["strategy"]
+        self.assertEqual((state["message"],state["members"]),("等待本批全部持仓确认结束",[opened["id"]]))
+        self.time += 1
+        self.card_report("east",[])
+        self.center.sync("east")
+        self.center.decide()
+        self.finish_exit_list([])
+        self.assertEqual(self.center.state("east")["strategy"]["message"],"批间等待")
 
     def test_overnight_windows_stage_win_rates_and_mirrors(self):
         def at(day, hour, minute=0):

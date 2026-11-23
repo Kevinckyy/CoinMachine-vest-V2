@@ -47,6 +47,51 @@ def initial_strategy(nid, config):
             "message": "尚未启动", "config": config, "draining": False}
 
 
+def batch_account(opened, accounts):
+    route = (opened["node_id"], opened["worker_id"], opened["account"])
+    account = accounts.get(route)
+    card_id = (opened.get("expected_risk") or {}).get("card_id")
+    if account and account["present"]:
+        current_id = (account.get("card") or {}).get("id")
+        if not card_id or not current_id or card_id == current_id:
+            return account
+    if card_id:
+        return next((a for (nid,wid,_),a in accounts.items() if (nid,wid) == route[:2] and a["present"]
+                     and (a.get("card") or {}).get("id") == card_id), None)
+
+
+def batch_flat(account, opened):
+    if not account or not account["fresh"] or account["ambiguous"]:
+        return False
+    card_at, trade_at = account.get("card_at") or 0, account["observed_at"] or 0
+    if account["card_fresh"] and card_at >= trade_at:
+        return card_at > opened["updated_at"] and account["card"].get("active_positions") == 0
+    return (trade_at > opened["updated_at"] and not account["read_error"]
+            and account["read_session"] == account["listed_session"]
+            and account["snapshot"].get("position_open") is False)
+
+
+def exit_list_excludes(check, opened, worker, accounts):
+    result = check["result"] or {}
+    rows = result.get("inventory")
+    if (check["status"] != "succeeded" or check["session_id"] != worker["session_id"]
+            or worker.get("card_session") != worker["session_id"] or not check["claimed_at"]
+            or (worker.get("cards_full_at") or 0) < check["claimed_at"]
+            or result.get("source") != "accounts" or result.get("full") is not True
+            or not isinstance(rows,list) or type(result.get("count")) is not int or result["count"] != len(rows)
+            or any(not isinstance(r,dict) or not isinstance(r.get("name"),str) or not r["name"] for r in rows)):
+        return False
+    matches = [r for r in rows if r["name"] == opened["account"]]
+    if not matches:
+        return True
+    # The platform can reuse a name. The full read and the corresponding card must identify a replacement.
+    a = accounts.get((opened["node_id"],opened["worker_id"],opened["account"]))
+    original_id = (opened.get("expected_risk") or {}).get("card_id")
+    return bool(len(matches) == 1 and not matches[0].get("ambiguous") and a and not a["ambiguous"]
+                and a["card_fresh"] and a["card_at"] >= check["claimed_at"] and original_id
+                and a["card"].get("id") and a["card"]["id"] != original_id)
+
+
 class Center:
     def __init__(self, path, clock=time.time, transport=remote):
         self.db = Database(path)
@@ -602,6 +647,7 @@ class Center:
                         AND status IN ('pending','sending','queued','running','unknown') LIMIT 1""",
                         (node_id,"strategy-"+s["run"])).fetchone(),"上一轮策略仍有未结束的指令",409)
                 self._request_cards(db,node_id)
+                s.pop("exit_lists",None)
                 s.update(enabled=True, draining=False, run=uid(), batch=0, members=[], replace=0,
                          next_at=self.clock(), message="等待浏览器全量拉取账户列表",planned=[], reentries={}, claims={},
                          policy_version=2, avoid_once=[], pool_day=entry_day_window(self.clock())["start"])
@@ -774,15 +820,19 @@ class Center:
                 s["message"] = "等待 Live 利润领取和扣款核验"
                 return False
             require(row["status"] == "succeeded","Live 利润领取未确认 · "+(row["error"] or row["status"]),409)
-            s["reentries"][opened["account_ref"]] = row["id"]
-            if s["config"]["pool_strategy"] != "dynamic" and account["in_pool"]:
-                s["planned"].append({"ref":opened["account_ref"],"phase":"live"})
-                s["next_at"] = now + self._strategy_delay(s,"order")
+            if account and account["name"] == opened["account"]:
+                s["reentries"][opened["account_ref"]] = row["id"]
+                if s["config"]["pool_strategy"] != "dynamic" and account["in_pool"]:
+                    s["planned"].append({"ref":opened["account_ref"],"phase":"live"})
+                    s["next_at"] = now + self._strategy_delay(s,"order")
             claim["done"] = True
             return True
-        if not target or not account["in_pool"] or account["phase"] != "live":
+        if not target or not account or not account["in_pool"] or account["phase"] != "live":
             claim["done"] = True
             return True
+        if account["name"] != opened["account"]:
+            s["message"] = "Live 开仓账户已更名，等待核对领取账户"
+            return False
         if claim.get("read"):
             row = command(db,claim["read"])
             if row["status"] not in PENDING:
@@ -824,6 +874,76 @@ class Center:
         cfg = s["config"]
         return random.uniform(cfg[kind+"_delay_min"],cfg[kind+"_delay_max"])
 
+    def _removed_batch_members(self, db, s, missing, inventory, now):
+        """Share one post-fill Accounts page read per browser and persist its ID across restarts."""
+        _, workers, accounts = inventory
+        checks = s.setdefault("exit_lists",{})
+        confirmed, pending_workers, requests, receipts = set(), set(), {}, {}
+        for opened in missing:
+            key, wid = opened["id"], opened["worker_id"]
+            entry = checks.get(key,{})
+            if entry.get("removed"):
+                confirmed.add(key)
+                continue
+            worker = workers.get((s["node_id"],wid))
+            if not worker or not worker["online"]:
+                continue
+            check_id = entry.get("id")
+            if check_id:
+                if check_id not in receipts:
+                    receipts[check_id] = record(command(db,check_id))
+                check = receipts[check_id]
+                if check["status"] in PENDING:
+                    pending_workers.add(wid)
+                    continue
+                if exit_list_excludes(check,opened,worker,accounts):
+                    entry["removed"] = True
+                    confirmed.add(key)
+                    continue
+                if now - check["updated_at"] < 30:
+                    continue
+            requests.setdefault(wid,[]).append(key)
+        for wid, keys in requests.items():
+            if wid in pending_workers:
+                continue
+            req = request(dict(node_id=s["node_id"],worker_id=wid,action="accounts.list"))
+            try:
+                check = self._prepare(db,uid(),req,inventory,"strategy-"+(s.get("run") or "legacy"))
+            except Problem:
+                continue
+            insert(db,check,"pending",now)
+            for key in keys:
+                checks[key] = {"id":check["id"]}
+        return confirmed
+
+    def _monitor_batch(self, db, s, members, inventory, now):
+        accounts = {m["id"]:batch_account(m,inventory[2]) for m in members if m["status"] == "succeeded"}
+        missing = [m for m in members if m["id"] in accounts and accounts[m["id"]] is None]
+        for key, account in accounts.items():
+            if account is not None:
+                s.get("exit_lists",{}).pop(key,None)
+        removed = self._removed_batch_members(db,s,missing,inventory,now) if missing else set()
+        complete = True
+        for opened in members:
+            account = accounts.get(opened["id"])
+            if opened["id"] not in removed and not batch_flat(account,opened):
+                complete = False
+                continue
+            if not s.get("draining") and not self._live_exit(db,s,opened,account,inventory,now):
+                return
+        if s["planned"]:
+            s["message"] = "Live 领取已核验，等待本批同向再入场"
+        elif not complete:
+            s["message"] = ("等待全量拉取活动账户列表，核对本批已移出的账户"
+                            if len(removed) < len(missing) else "等待本批全部持仓确认结束")
+        else:
+            s.pop("exit_lists",None)
+            s["members"] = []
+            if s.get("draining"):
+                s.update(enabled=False,draining=False,message="升级前的批次已结束")
+            else:
+                s.update(claims={},next_at=now+self._strategy_delay(s,"batch"),message="批间等待")
+
     def _advance_node(self, db, s, inventory, now):
         s.setdefault("planned",[])
         members = [record(command(db,k)) for k in s["members"]]
@@ -856,25 +976,7 @@ class Center:
             s["message"] = "等待浏览器全量拉取账户列表"
             return
         if members and not s["planned"] and not s.get("replace"):
-            complete = True
-            for m in members:
-                a = inventory[2].get((m["node_id"],m["worker_id"],m["account"]))
-                if (m["status"] != "succeeded" or not a or not a["fresh"] or
-                    (a.get("risk") or a["snapshot"]).get("position_open") is not False or
-                    max(a.get("card_at") or 0,a["observed_at"] or 0) <= m["updated_at"]):
-                    complete = False
-                    continue
-                if not s.get("draining") and not self._live_exit(db,s,m,a,inventory,now):
-                    return
-            if s["planned"]:
-                s["message"] = "Live 领取已核验，等待本批同向再入场"
-                return
-            if not complete:
-                s["message"] = "等待本批全部持仓确认结束"
-            elif s.get("draining"):
-                s.update(enabled=False,draining=False,members=[],message="升级前的批次已结束")
-            else:
-                s.update(members=[],claims={},next_at=now+self._strategy_delay(s,"batch"),message="批间等待")
+            self._monitor_batch(db,s,members,inventory,now)
             return
         candidates = {}
         for cmd in self._strategy_candidates(db,s,inventory,s.get("batch_side","buy")):

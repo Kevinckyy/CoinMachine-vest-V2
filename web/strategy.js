@@ -51,7 +51,7 @@ function executingPoolAccounts(view, nodeId, commands) {
     const a = accounts.get(JSON.stringify([nodeId,c.worker_id,c.account]));
     const active = unfinishedStatuses.includes(c.status) && (!READ.includes(c.action) || (s?.run && c.source === 'strategy-'+s.run));
     // A filled batch member still belongs to the strategy until flat confirmation and Live settlement.
-    const settling = members.has(c.id) && c.status === 'succeeded' &&
+    const settling = members.has(c.id) && c.status === 'succeeded' && !s.exit_lists?.[c.id]?.removed &&
       (!a || positionCount(a) !== 0 || Math.max(a.card_at || 0,a.observed_at || 0) <= c.updated_at ||
        c.phase === 'live' && s.enabled && s.policy_version === 2 && !s.draining && !s.claims?.[c.id]?.done);
     if (active || settling) executing.add(c.account_ref || a?.account_ref || c.account);
@@ -114,6 +114,25 @@ function strategyControls(node, s) {
   return edit + run;
 }
 
+function strategyMessage(s, note = '') {
+  if (!s.enabled || s.message !== '批间等待' || !Number.isFinite(s.next_at)) return esc(note || s.message);
+  return (note ? esc(note)+' · ' : '')+'批间等待 · 剩余 <time class="batch-countdown" data-batch-until="'+s.next_at+'"></time>';
+}
+
+function updateBatchCountdowns() {
+  if (!state || page !== 'strategy' || document.hidden) return;
+  const now = state.now + (performance.now() - state.receivedAt)/1000;
+  for (const timer of document.querySelectorAll('[data-batch-until]')) {
+    const seconds = Math.max(0,Math.ceil(Number(timer.dataset.batchUntil) - now));
+    const hours = Math.floor(seconds/3600);
+    const minutes = String(Math.floor(seconds/60)%60).padStart(2,'0');
+    const value = (hours ? hours+':' : '')+minutes+':'+String(seconds%60).padStart(2,'0');
+    if (timer.textContent !== value) timer.textContent = value;
+  }
+}
+setInterval(updateBatchCountdowns,1000);
+document.addEventListener('visibilitychange',updateBatchCountdowns);
+
 function strategyCard(node) {
   const s = strategyFor(node.id);
   const accounts = state.accounts.filter(a => a.node_id === node.id && a.present && !a.excluded &&
@@ -136,7 +155,7 @@ function strategyCard(node) {
   return '<article class="strategy-card" data-node="'+esc(node.id)+'">'+
     '<a class="strategy-card-body" href="#strategy/'+encodeURIComponent(node.id)+'" aria-label="'+esc(node.label+' 策略详情')+'">'+
     '<div class="row"><div class="card-identity"><h2>'+esc(node.label)+'</h2><small>'+esc(node.id)+'</small></div>'+strategyStatus(node,s)+'</div>'+
-    '<dl class="stage-counts">'+counters+'</dl><div class="card-message">'+esc(note || s.message)+'<span aria-hidden="true">›</span></div></a>'+
+    '<dl class="stage-counts">'+counters+'</dl><div class="card-message"><div>'+strategyMessage(s,note)+'</div><span aria-hidden="true">›</span></div></a>'+
     '<div class="strategy-controls">'+strategyControls(node,s)+'</div></article>';
 }
 
@@ -156,7 +175,7 @@ function strategyDetail(node) {
     '<div class="summary"><div><small>批次</small><strong>'+s.batch+'</strong></div><div><small>每批账户</small><strong>'+c.batch_size+'</strong></div>'+
     '<div><small>本批方向</small><strong>'+esc(s.members.length || queue.length ? dir[s.batch_side] || '—' : '—')+'</strong></div>'+
     '<div><small>可候选 / 入池</small><strong>'+pool.filter(a => a.candidate).length+' / '+pool.length+'</strong></div></div>'+
-    '<p class="strategy-line">'+esc(s.message)+'</p>'+(queue.length ? '<p>等待下单 · '+queue.map(esc).join('、')+'</p>' : '')+versionNote+'</div>';
+    '<p class="strategy-line">'+strategyMessage(s)+'</p>'+(queue.length ? '<p>等待下单 · '+queue.map(esc).join('、')+'</p>' : '')+versionNote+'</div>';
   function accountRow(a) {
     const risk = a.risk || {};
     const key = addressKey(a), label = a.in_pool ? '出池' : '入池';
@@ -202,6 +221,7 @@ function strategyView() {
     target.innerHTML = '<div data-strategy-view>'+content+'</div>';
     target._strategyTemplate = content;
   }
+  updateBatchCountdowns();
 }
 
 function strategyFields(c) {

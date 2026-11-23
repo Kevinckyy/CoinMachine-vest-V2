@@ -443,6 +443,37 @@ try {
   await until(async()=>!(await api('state?node_id=spare')).strategy.enabled,'explicit node stop');
   await ui.evaluate("document.querySelector('[data-node=lab] a').click()");
   await until(()=>ui.evaluate("location.hash==='#strategy/lab' && document.getElementById('content').textContent.includes('Alpha') && document.getElementById('content').textContent.includes('Beta')"),'node details pool and open position');
+  // Serve a synthetic cooldown to a separate dashboard tab. Its clock deliberately differs from the browser.
+  const cooldown=await tab(), sample=await api('state?node_id=lab'), startTime=Date.now();
+  const serverNow=()=>1700000000+(Date.now()-startTime)/1000;
+  let nextBatch=serverNow()+3700, message='批间等待';
+  await cooldown.send('Fetch.enable',{patterns:[{urlPattern:centerURL+'/v1/state*'}]});
+  cooldown.on('Fetch.requestPaused',p=>{
+    sample.now=serverNow();
+    Object.assign(sample.strategies[0],{enabled:true,members:[],next_at:nextBatch,message});
+    return cooldown.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:200,
+      responseHeaders:[{name:'Content-Type',value:'application/json'}],body:Buffer.from(JSON.stringify(sample)).toString('base64')});
+  });
+  await browserCdp.send('Target.activateTarget',{targetId:cooldown.targetId});
+  await cooldown.send('Page.navigate',{url:centerURL+'/#strategy'});
+  await until(()=>cooldown.evaluate("!!document.querySelector('#loginForm')?.onsubmit"),'cooldown dashboard login');
+  await cooldown.evaluate(`document.querySelector('#loginForm input').value=${JSON.stringify(admin)};document.querySelector('#loginForm').requestSubmit()`);
+  await until(async()=>{
+    const view=await cooldown.evaluate("({timer:document.querySelector('.card-message time')?.textContent,hidden:document.hidden,error:document.getElementById('loginError').textContent || document.getElementById('banner').textContent})");
+    if (!/^1:\d{2}:\d{2}$/.test(view.timer)) throw Error(JSON.stringify(view));
+    return true;
+  },'node card cooldown in server time');
+  await cooldown.evaluate("window.originalTimer=document.querySelector('.card-message time');window.initialText=originalTimer.textContent");
+  await until(()=>cooldown.evaluate("originalTimer.isConnected && originalTimer.textContent!==initialText"),'countdown ticks without replacing node card');
+  nextBatch=serverNow()+3;
+  await cooldown.evaluate("document.querySelector('[data-node=lab] a').click();document.getElementById('refresh').click()");
+  await until(()=>cooldown.evaluate("/^00:0[1-3]$/.test(document.querySelector('.strategy-line time')?.textContent)"),'node detail countdown');
+  await until(()=>cooldown.evaluate("document.querySelector('.strategy-line time')?.textContent==='00:00'"),'expired timer holds at zero');
+  message='等待本批全部持仓确认结束';
+  await cooldown.evaluate("document.getElementById('refresh').click()");
+  await until(()=>cooldown.evaluate("document.querySelector('.strategy-line')?.textContent==='等待本批全部持仓确认结束' && !document.querySelector('[data-batch-until]')"),'new batch state removes countdown');
+  await browserCdp.send('Target.closeTarget',{targetId:cooldown.targetId});
+  await browserCdp.send('Target.activateTarget',{targetId:ui.targetId});
   await ui.send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   assert.equal(await ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
   await ui.evaluate('history.back()');

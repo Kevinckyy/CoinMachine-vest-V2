@@ -176,6 +176,7 @@ async function refresh() {
   const requestToken = token;
   try {
     const latest = await api('state');
+    latest.receivedAt = performance.now();
     const nodeId = page === 'strategy' && strategyNode;
     if (nodeId && latest.commands.length >= recentCommandLimit && latest.nodes.some(n => n.id === nodeId)) {
       latest.poolHistory = {nodeId,commands:await nodePoolCommands(latest,nodeId)};
