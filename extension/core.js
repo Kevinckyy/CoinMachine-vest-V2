@@ -148,7 +148,9 @@
       if (job.symbol !== 'NQ-PERP') throw new Error('桥接当前仅校准 NQ-PERP');
       if (!['buy', 'sell'].includes(job.side)) throw new Error('交易方向无效');
       if (job.size_percent !== undefined && ![25,50,75,100].includes(job.size_percent)) throw new Error('仓位大小仅支持 25%、50%、75%、100%');
-      const required = ['stop_loss'];
+      const omit = job.stop_loss === null && job.stop_omitted === true && Number.isFinite(job.omit_stop_below) &&
+        Number.isFinite(job.remaining_drawdown) && job.remaining_drawdown > 0 && job.remaining_drawdown < job.omit_stop_below;
+      const required = omit ? [] : ['stop_loss'];
       if (job.size_percent === undefined) required.push('quantity');
       if (job.take_profit != null) required.push('take_profit');
       for (const key of required) {

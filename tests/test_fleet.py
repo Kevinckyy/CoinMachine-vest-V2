@@ -10,9 +10,9 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from datetime import datetime
 
-from fleet.bridge import Bridge
+from fleet.bridge import Bridge, verify_financial_receipt
 from fleet.center import Center
-from fleet import daily_floor, ledger
+from fleet import account_pool, daily_floor, ledger, strategy_config, strategy_payout
 from fleet.http import make_server
 from fleet.protocol import Problem
 from fleet.reporting import ZONE
@@ -29,10 +29,12 @@ class FleetTest(unittest.TestCase):
         self.center = Center(self.root / "center", self.clock, self.transport)
         self.lose_delivery = False
         self.plugin_meta = dict(worker_id="browser", session_id="session-1", generation=1,
-                                mode="execute", label="Browser A", page="/trade/NQ-PERP")
+                                mode="execute", label="Browser A", page="/trade/NQ-PERP", strategy_version=1)
         self.addCleanup(self.close)
         for nid in self.nodes:
             self.center.configure_node(nid, dict(url="https://" + nid + ".example", label=nid, token=secrets.token_hex(20)))
+            self.center.strategy("config",dict(batch_size=1,order_delay_min=0,order_delay_max=0,
+                                 batch_delay_min=60,batch_delay_max=60,live_default_locked=False),nid)
             self.report(nid, inventory=[dict(name="Shared", category="eval", phase="1/2"),
                                         dict(name="Only-" + nid, category="eval", phase="1/2"),
                                         dict(name="Main", category="default")])
@@ -221,6 +223,183 @@ class FleetTest(unittest.TestCase):
         with self.assertRaises(Problem):
             self.report("east",page="/portfolio",portfolio=dict(id=key,name="A",card_id="card-A",error="旧回执"))
 
+    def start_cards(self, items):
+        self.center.strategy("start",{},"east")
+        self.center.sync("east")
+        self.card_report("east",items)
+        self.center.sync("east")
+        self.center.decide()
+
+    def test_defaults_presets_node_copies_and_legacy_config(self):
+        original = self.center.state()["strategy_settings"]["defaults"]
+        self.assertEqual((original["batch_size"],original["order_delay_min"],original["order_delay_max"],
+                          original["batch_delay_min"],original["batch_delay_max"]),(2,2,8,15,45))
+        defaults = self.center.save_defaults({"batch_size":5,"live_size_percent":75})
+        preset = self.center.preset("evening",{"name":"Evening","config":{"batch_size":3,"pool_strategy":"dynamic","dynamic_exam_slots":1}})
+        with self.assertRaisesRegex(Problem,"名称"):
+            self.center.preset("other",{"name":"evening","config":{}})
+        self.assertEqual(preset["config"]["live_size_percent"],75)
+        self.center.configure_node("new",dict(label="new",url="https://new.example",token=secrets.token_hex(20)))
+        self.assertEqual(self.center.state("new")["strategy"]["config"],defaults)
+        self.center.strategy("config",preset["config"],"west")
+        self.center.preset("evening",{"name":"Night","config":{"live_size_percent":50}})
+        self.center.save_defaults({"live_size_percent":100})
+        self.center.db.close()
+        self.center = Center(self.root/"center",self.clock,self.transport)
+        self.assertEqual(self.center.state("new")["strategy"]["config"],defaults)
+        self.assertEqual(self.center.state("west")["strategy"]["config"],preset["config"])
+        self.assertEqual(self.center.state("east")["strategy"]["config"]["batch_size"],1)
+        self.assertEqual(self.center.state()["strategy_settings"]["presets"][0]["name"],"Night")
+        self.center.preset("evening",{},remove=True)
+        self.assertEqual(self.center.state()["strategy_settings"]["presets"],[])
+        with self.assertRaises(Problem):
+            self.center.save_defaults({"order_delay_min":25})
+        old = {"interval_seconds":37,"batch_size":4,"size_percent":50,"side":"sell","take_profit":12,"stop_buffer":7}
+        with self.center.db.tx() as db:
+            db.execute("UPDATE node_strategy SET data=json_set(data,'$.config',json(?)) WHERE node='east'",(json.dumps(old),))
+        self.center.db.close()
+        self.center = Center(self.root/"center",self.clock,self.transport)
+        migrated = self.center.state("east")["strategy"]["config"]
+        self.assertEqual((migrated["batch_delay_min"],migrated["batch_delay_max"],migrated["live_stop_buffer"],
+                          migrated["live_side"],migrated["order_delay_max"]),(37,37,7,"sell",0))
+
+    def test_stage_priority_order_jitter_and_restart(self):
+        items = [self.card("First"),self.card("Second",phase="2/2"),self.card("Funded",phase="live",category="funded")]
+        self.center.strategy("config",dict(batch_size=2,order_delay_min=12,order_delay_max=12,
+                         side="random",live_side="sell",live_size_percent=75,live_stop_buffer=11,
+                         live_skip_stop_loss_on_low_drawdown=True,live_drawdown_stop_loss_threshold=150),"east")
+        self.start_cards(items)
+        state = self.center.state("east")
+        first, = state["commands"]
+        self.assertEqual((first["account"],first["params"]["size_percent"],first["params"]["stop_buffer"],
+                          first["params"]["omit_stop_below"],first["params"]["side"]),("Funded",75,11,150,"sell"))
+        self.assertEqual((state["strategy"]["planned"],state["strategy"]["next_at"]),
+                         ([{"ref":"Second","phase":"2/2"}],self.time+12))
+        self.center.db.close()
+        self.center = Center(self.root/"center",self.clock,self.transport)
+        self.time += 11
+        self.center.decide()
+        self.assertEqual(len(self.center.state("east")["commands"]),1)
+        self.time += 1
+        self.center.decide()
+        second = self.center.state("east")["commands"][0]
+        self.assertEqual((second["account"],second["params"]["side"],second["params"]["size_percent"],
+                          second["params"]["stop_buffer"],second["created_at"]),("Second","sell",25,20,self.time))
+        self.assertNotIn("omit_stop_below",second["params"])
+
+    def test_mixed_directions_and_explicit_live_unlock(self):
+        live = self.card("Funded",phase="live",category="funded")
+        items = [self.card("First"),live]
+        self.center.strategy("config",dict(batch_size=2,live_default_locked=True,side="buy",live_side="sell"),"east")
+        self.start_cards(items)
+        self.assertFalse(self.center.state("east")["commands"])
+        self.assertTrue(next(a for a in self.center.state("east")["accounts"] if a["name"]=="Funded")["live_default_locked"])
+        self.center.account_config(dict(node_id="east",worker_id="browser",account="Funded",in_pool=True))
+        self.center.decide()
+        s = self.center.state("east")
+        self.assertFalse(s["commands"])
+        self.assertFalse(s["strategy"]["enabled"])
+        self.assertIn("方向冲突",s["strategy"]["message"])
+
+    def test_grouped_and_dynamic_pools(self):
+        items = [self.card("First"),self.card("Second",phase="2/2"),self.card("Another",phase="2/2"),
+                 self.card("Live",phase="live",category="funded")]
+        self.center.strategy("config",dict(batch_size=2,pool_strategy="same_stage",same_stage_full_batch=True),"east")
+        self.start_cards(items)
+        self.assertEqual({c["phase"] for c in self.center.state("east")["commands"]},{"2/2"})
+        import random
+        cfg = strategy_config.settings(strategy_config.DEFAULT_CONFIG,dict(pool_strategy="dynamic",batch_size=3,
+                     pool_limits_enabled=True,exam_pool_limit=2,live_pool_limit=3,dynamic_exam_slots=1))
+        accounts = {str(i):dict(phase="live" if i>3 else "1/2",status="active",phase_started_at=i) for i in range(8)}
+        state = {"batch":0}
+        chosen = account_pool.choose_pool_batch(state,cfg,accounts,list(accounts),lambda a:a["phase"],
+                                                account_pool.account_priority_ranks(cfg),random.Random(4))
+        self.assertEqual((len(state["pool_live_ids"]),len(state["pool_waiting_live_ids"])),(3,1))
+        self.assertEqual(sum(accounts[i]["phase"]=="live" for i in chosen),2)
+        accounts["8"] = dict(phase="live",status="active",phase_started_at=8)
+        chosen = account_pool.choose_pool_batch(state,cfg,accounts,list(accounts),lambda a:a["phase"],
+                                                account_pool.account_priority_ranks(cfg),random.Random(4))
+        self.assertFalse(state["pool_refilling"])
+        self.assertEqual(sum(accounts[i]["phase"]=="live" for i in chosen),3)
+
+    def test_skip_stop_compares_pre_buffer_floor_distance_and_verifies_absence(self):
+        obs = self.reading("Shared")
+        snap = obs["snapshot"]
+        snap.update(equity=9850,balance=9850,daily_reset_equity=10000,daily_floor=9700)
+        snap["capital_metrics"].update(daily_loss={"current":150,"limit":300},drawdown={"current":60,"limit":300})
+        self.report("east",observation=obs)
+        self.center.sync("east")
+        floor = {"verified":True,"floor":9700}
+        self.assertEqual(daily_floor.stop_decision(9850,floor,dict(stop_buffer=20,omit_stop_below=150)),(150,130,False))
+        self.assertEqual(daily_floor.stop_decision(9850,floor,dict(stop_buffer=20,omit_stop_below=140)),(150,130,False))
+        self.assertEqual(daily_floor.stop_decision(9850,floor,dict(stop_buffer=20)),(150,130,False))
+        self.assertFalse(daily_floor.stop_decision(9700,floor,dict(stop_buffer=20,omit_stop_below=151))[2])
+        params = dict(side="buy",micro=1,stop_buffer=20,omit_stop_below=150.01)
+        self.center.submit("omit",self.req(action="order.open",params=params))
+        self.center.sync("east")
+        cmd = self.plugin("east","poll")["command"]
+        checked = self.plugin("east","preflight",id=cmd["id"],observation=obs)
+        self.assertEqual((checked["remaining_drawdown"],checked["stop_loss"],checked["stop_omitted"]),(150,None,True))
+        self.plugin("east","intent",id="omit",stage="open",observation=obs,proof=dict(quantity=2,stop_loss=None))
+        cmd = self.nodes["east"].get("omit")
+        filled = {**snap,"position_open":True,"position_id":"p","symbol":"NQ-PERP","side":"buy","quantity":2,"entry_price":20000,
+                  "stop_check":{"status":"omitted"},"take_profit_check":{"status":"omitted"},"native_sl_absent":True,"native_sl_price":None}
+        proof = {"observation":{**obs,"snapshot":filled}}
+        verify_financial_receipt(cmd,proof)
+        filled["native_sl_price"] = 19950
+        with self.assertRaisesRegex(Problem,"原生止损"):
+            verify_financial_receipt(cmd,proof)
+
+    def test_strategy_live_debit_is_verified_before_one_same_batch_reentry(self):
+        live = self.card("Live",category="funded",phase="live")
+        obs = {**self.reading("Live"),"category":"funded","phase":"live"}
+        self.card_report("east",[live])
+        self.report("east",observation=obs)
+        self.center.strategy("config",dict(live_side="buy",live_payout_mode="percent",live_payout_percent=50),"east")
+        self.start_cards([live])
+        self.center.sync("east")
+        opened = self.plugin("east","poll")["command"]
+        checked = self.plugin("east","preflight",id=opened["id"],observation=obs)
+        self.assertTrue(checked["approved"],checked)
+        self.plugin("east","intent",id=opened["id"],stage="open",observation=obs,proof=dict(quantity=2,stop_loss=10))
+        filled = {**obs["snapshot"],"position_open":True,"position_id":"live-position","symbol":"NQ-PERP","side":"buy",
+                  "quantity":2,"entry_price":1000,"native_sl_price":995,"stop_check":{"status":"verified","target_risk":10},
+                  "take_profit_check":{"status":"omitted"}}
+        self.plugin("east","result",id=opened["id"],ok=True,result={"observation":{**obs,"snapshot":filled}})
+        self.center.sync("east")
+        self.time += 1
+        flat = {**obs,"snapshot":{**obs["snapshot"],"observed_at":self.time,"balance":1020,"equity":1020}}
+        self.report("east",observation=flat)
+        self.center.sync("east")
+        self.center.decide()
+        self.center.decide()
+        self.center.sync("east")
+        claim = self.plugin("east","poll")["command"]
+        self.assertEqual((claim["action"],claim["params"]["amount"],claim["strategy_payout"]["open_id"]),
+                         ("profit.withdraw",10,opened["id"]))
+        proof = dict(amount=10,received=8,balance_before=1020,available=20,recipient="main",
+                     flat=dict(leverage=0,position_margin=0,order_margin=0,observed_at=self.time))
+        with self.assertRaisesRegex(Problem,"领取预览"):
+            self.plugin("east","intent",id=claim["id"],stage="withdraw",proof={**proof,"available":40})
+        self.assertTrue(self.plugin("east","intent",id=claim["id"],stage="withdraw",proof=proof)["authorize_click"])
+        self.assertFalse(self.plugin("east","intent",id=claim["id"],stage="withdraw",proof=proof)["authorize_click"])
+        self.time += 1
+        after = {**obs,"snapshot":{**flat["snapshot"],"observed_at":self.time,"balance":1010,"equity":1010}}
+        res = self.plugin("east","result",id=claim["id"],ok=True,result=dict(observation=after,amount=10,expected_received=8,
+                               recipient="main",balance_before=1020,balance_after=1010,verification="source_balance_debited"))
+        self.assertEqual(res["status"],"succeeded")
+        self.center.sync("east")
+        for _ in range(3):
+            self.center.decide()
+        records = self.center.state("east")["commands"]
+        self.assertEqual(len(records),3)
+        again, = [c for c in records if c.get("reentry_claim")]
+        self.assertEqual((again["reentry_claim"],again["params"]["side"],again["expected_floor"]["floor"]),(claim["id"],"buy",960))
+        self.assertEqual(self.center.state("east")["strategy"]["batch"],1)
+        self.center.sync("east")
+        self.assertEqual(self.plugin("east","poll")["command"]["id"],again["id"])
+        self.assertEqual(strategy_payout.amount(20.123457,{"live_payout_mode":"percent","live_payout_percent":25}),5.030864)
+
     def test_full_directory_generation_and_new_accounts_during_strategy(self):
         self.center.strategy("start",{},"east")
         self.center.sync("east")
@@ -252,6 +431,30 @@ class FleetTest(unittest.TestCase):
         self.assertFalse(by_name["New"]["in_pool"])
         self.assertFalse(by_name["Shared"]["present"])
         self.assertTrue(next(a for a in self.center.state("west")["accounts"] if a["name"]=="Shared")["present"])
+
+    def test_unclassified_new_card_is_read_once_before_using_stage_policy(self):
+        card = self.card("New",phase=None,category="active")
+        self.start_cards([card])
+        self.center.decide()
+        self.center.sync("east")
+        probe = self.plugin("east","poll")["command"]
+        self.assertEqual((probe["account"],probe["action"]),("New","account.read"))
+        self.assertEqual(len(self.center.state("east")["commands"]),1)
+        self.time += 1
+        self.plugin("east","result",id=probe["id"],ok=True,result={"observation":{**self.reading("New"),"phase":"2/2"}})
+        self.center.sync("east")
+        self.center.decide()
+        records = self.center.state("east")["commands"]
+        self.assertEqual([(c["action"],c["phase"]) for c in records],[("order.open","2/2"),("account.read",None)])
+
+    def test_disabled_pool_refresh_finishes_after_authoritative_list(self):
+        self.center.strategy("config",dict(batch_size=3,refresh_account_pool=False),"east")
+        self.start_cards([self.card("First")])
+        state = self.center.state("east")
+        self.assertGreater(state["nodes"][0]["card_generation"],0)
+        self.assertFalse(state["commands"])
+        self.assertFalse(state["strategy"]["enabled"])
+        self.assertIn("无法组成下一批",state["strategy"]["message"])
 
     def test_preflight_replaces_one_member_without_disturbing_batch(self):
         items = [self.card(name) for name in ("One","Two","Three")]

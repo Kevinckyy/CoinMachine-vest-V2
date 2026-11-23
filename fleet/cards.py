@@ -18,7 +18,8 @@ def schema(db):
         CREATE TABLE IF NOT EXISTS open_preflight(id TEXT PRIMARY KEY,session TEXT NOT NULL,checked REAL NOT NULL);
     """)
     cols = {r[1] for r in db.execute("PRAGMA table_info(accounts)")}
-    for name, spec in (("card","TEXT"), ("card_at","REAL"), ("risk","TEXT"), ("risk_at","REAL"), ("portfolio","TEXT"), ("preflight_at","REAL"), ("history_due_at","REAL")):
+    for name, spec in (("card","TEXT"), ("card_at","REAL"), ("risk","TEXT"), ("risk_at","REAL"), ("portfolio","TEXT"), ("preflight_at","REAL"), ("history_due_at","REAL"),
+                       ("initial_balance","REAL"), ("baseline_phase","TEXT"), ("phase_started_at","REAL")):
         if name not in cols:
             db.execute(f"ALTER TABLE accounts ADD COLUMN {name} {spec}")
 
@@ -91,7 +92,7 @@ def update(db, wid, sid, data, now):
         items[item["name"]] = item
     for name,row in previous.items():
         if row["present"] and name not in items:
-            db.execute("UPDATE accounts SET present=0,card=NULL,card_at=NULL,risk=NULL,risk_at=NULL,portfolio=NULL,read_session=NULL WHERE worker_id=? AND name=?",(wid,name))
+            db.execute("UPDATE accounts SET present=0,card=NULL,card_at=NULL,risk=NULL,risk_at=NULL,portfolio=NULL,read_session=NULL,initial_balance=NULL,baseline_phase=NULL WHERE worker_id=? AND name=?",(wid,name))
     for name,item in items.items():
         row = previous.get(name)
         prior = json.loads(row["card"]) if row and row["card"] else {}
@@ -128,7 +129,9 @@ def update(db, wid, sid, data, now):
           (wid,name,category,phase,name in duplicate,excluded,sid,dump(item),observed,dump(risk)))
         if not same or name in duplicate:
             db.execute("""UPDATE accounts SET snapshot='{}',observed_at=NULL,read_session=NULL,risk_at=NULL,read_error='',
-                       preflight_at=NULL,history_due_at=NULL,tracked_position=NULL,portfolio=NULL WHERE worker_id=? AND name=?""",(wid,name))
+                       preflight_at=NULL,history_due_at=NULL,tracked_position=NULL,portfolio=NULL,initial_balance=NULL,baseline_phase=NULL WHERE worker_id=? AND name=?""",(wid,name))
+        if not same or row["phase"] != phase or row["phase_started_at"] is None:
+            db.execute("UPDATE accounts SET phase_started_at=? WHERE worker_id=? AND name=?", (observed if phase else None,wid,name))
     db.execute("""INSERT INTO card_sync VALUES(?,?,?,?,?) ON CONFLICT(worker) DO UPDATE SET
                 session=excluded.session,generation=excluded.generation,full_at=excluded.full_at,seen=excluded.seen""",
                (wid,sid,gen,observed if full else sync["full_at"],observed))

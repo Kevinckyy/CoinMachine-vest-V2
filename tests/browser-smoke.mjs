@@ -9,6 +9,15 @@ import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import '../extension/stop-protection.js';
+import '../extension/core.js';
+
+const stopJob = {id:'example',type:'open',account_id:'demo',side:'buy',symbol:'NQ-PERP',size_percent:25,
+  stop_buffer:20,stop_loss:null,stop_omitted:true,remaining_drawdown:150,omit_stop_below:150.01};
+const stopAccount = {accountId:'demo',accountName:'Demo',accountCategory:'eval'};
+assert.equal(VestBridgeCore.validateJob(stopJob,stopAccount),stopJob);
+assert.throws(()=>VestBridgeCore.validateJob({...stopJob,omit_stop_below:150},stopAccount),/stop_loss/);
+assert.throws(()=>VestBridgeCore.validateJob({...stopJob,stop_omitted:false},stopAccount),/stop_loss/);
+assert.equal(VestStopProtection.plan({native_sl_absent:true,native_sl_price:null},null).status,'omitted');
 
 for (const [side,quantity,trigger] of [['buy',2,19930],['sell',2,20070],['buy',6,19976.75],['sell',6,20023.25]]) {
   const position={side,quantity,entry_price:20000,native_sl_price:trigger};
@@ -310,11 +319,35 @@ try {
   await until(()=>ui.evaluate("document.querySelector('#nodeScope')?.options.length===2"),'node switcher');
   await ui.evaluate("const scope=document.getElementById('nodeScope');scope.value='spare';scope.dispatchEvent(new Event('change'))");
   assert.equal(await ui.evaluate("document.querySelectorAll('[data-op=account]').length"),0);
-  await ui.evaluate("document.querySelector('[data-value=strategy]').click();document.querySelector('[data-op=strategyConfig]').click();const sf=document.getElementById('dialogForm');sf.elements.batch_size.value='3';sf.elements.stop_buffer.value='0';sf.requestSubmit()");
-  await until(async()=>(await api('state?node_id=spare')).strategy.config.batch_size===3,'node-only strategy settings');
-  assert.equal((await api('state?node_id=lab')).strategy.config.batch_size,1);
+  await ui.evaluate("document.querySelector('[data-value=strategy]').click()");
+  assert.equal(await ui.evaluate("document.querySelectorAll('.strategy-card').length"),2);
+  assert.deepEqual(await ui.evaluate("Array.from(document.querySelectorAll('[data-node=lab] dd'),n=>n.textContent)"),['1','0','1']);
+  await ui.evaluate("document.querySelector('[data-op=strategyDefaults]').click();document.querySelector('[name=batch_size]').value='4';document.getElementById('dialogForm').requestSubmit()");
+  await until(async()=>(await api('state')).strategy_settings.defaults.batch_size===4,'center defaults');
+  await until(()=>ui.evaluate("!document.getElementById('dialog').open"),'default settings saved');
+  await ui.evaluate("document.querySelector('[data-op=strategyPresets]').click();document.querySelector('[data-op=editPreset]').click();document.querySelector('[name=presetName]').value='晚间';document.querySelector('[name=batch_size]').value='3';document.querySelector('[name=stop_buffer]').value='0';document.querySelector('[name=live_size_percent]').value='75';document.getElementById('dialogForm').requestSubmit()");
+  await until(async()=>(await api('state')).strategy_settings.presets.some(p=>p.name==='晚间'),'preset saved');
+  await until(()=>ui.evaluate("!document.getElementById('dialog').open && state.strategy_settings.presets.length===1"),'preset available for node');
+  await ui.evaluate("document.querySelector('[data-node=spare] [data-op=strategyConfig]').click();const src=document.getElementById('presetSource');src.value=src.options[2].value;src.dispatchEvent(new Event('change'));document.getElementById('dialogForm').requestSubmit()");
+  await until(async()=>(await api('state?node_id=spare')).strategy.config.batch_size===3,'node-only preset application');
+  assert.equal((await api('state?node_id=lab')).strategy.config.batch_size,2);
+  assert.equal((await api('state?node_id=spare')).strategy.config.live_size_percent,75);
   assert.equal((await api('state?node_id=spare')).strategy.config.stop_buffer,0);
   await until(()=>ui.evaluate("!document.getElementById('dialog').open"),'settings saved');
+  await api('nodes/offline','PUT',{label:'离线模拟节点',url:'http://127.0.0.1:'+await port(),token:token()});
+  assert.equal((await api('state?node_id=offline')).strategy.config.batch_size,4);
+  await ui.evaluate("document.querySelector('[data-node=spare] [data-op=start]').click();document.getElementById('dialogForm').requestSubmit()");
+  await until(()=>ui.evaluate("document.querySelector('[data-node=offline] .tag.bad') && document.querySelector('[data-node=spare] .tag.good')?.textContent==='执行中' && document.querySelector('[data-node=lab] .tag.info')?.textContent==='在线'"),'three distinct node states');
+  await ui.evaluate("document.querySelector('[data-node=spare] [data-op=stop]').click()");
+  await until(async()=>!(await api('state?node_id=spare')).strategy.enabled,'explicit node stop');
+  await ui.evaluate("document.querySelector('[data-node=lab] a').click()");
+  await until(()=>ui.evaluate("location.hash==='#strategy/lab' && document.getElementById('content').textContent.includes('Alpha') && document.getElementById('content').textContent.includes('Beta')"),'node details pool and open position');
+  await ui.send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  assert.equal(await ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
+  await ui.evaluate('history.back()');
+  await until(()=>ui.evaluate("location.hash==='#strategy' && document.querySelectorAll('.strategy-card').length===3"),'back to fleet strategy cards');
+  assert.equal(await ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
+  await ui.send('Emulation.setDeviceMetricsOverride',{width:1400,height:950,deviceScaleFactor:1,mobile:false});
   await ui.evaluate("document.querySelector('[data-value=logs]').click()");
   await until(()=>ui.evaluate("document.querySelector('#logTable')?.textContent.includes('更新策略参数')"),'per-node runtime logs');
   await ui.evaluate("document.querySelector('[data-value=analytics]').click()");
@@ -399,7 +432,7 @@ try {
   }
   await ui.send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   assert.equal(await ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
-  console.log('PASS: extension rebind, active card cache, directory-first portfolio scans, incomplete directory recovery, strategy refresh, new purchase, stop buffer, preflight, history, analytics, node isolation, navigation and center-issued upgrade');
+  console.log('PASS: extension rebind, cached accounts, portfolio scans, risk preflight, stop threshold, history, analytics, fleet strategy cards, scoped presets, node details, mobile layout and center-issued upgrade');
 } finally {
   if(browserCdp) await browserCdp.send('Browser.close').catch(()=>{});
   for(const ws of sockets)ws.close();

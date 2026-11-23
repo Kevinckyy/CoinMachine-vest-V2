@@ -21,7 +21,7 @@ const descriptions = {
   overview: '查看节点连接、账户读数和指令执行进度。',
   nodes: '管理云端桥接服务及其连接的浏览器。',
   accounts: '查看账户最近一次页面读数，维护别名、执行权限和策略账户池。',
-  strategy: '管理所选节点的账户池、执行参数和当前批次。',
+  strategy: '按节点查看账户阶段、策略状态和当前批次。',
   commands: '跟踪所选节点的指令投递、执行和核验结果。',
   logs: '查看节点连接、浏览器状态、策略批次和指令的变更记录。',
   analytics: '查看各节点的交易结果、阶段胜率和已核验出金。'
@@ -106,7 +106,12 @@ const table = (headers, rows) => `<div class="scroll"><table><thead><tr>${header
 let token = sessionStorage.getItem('vest.admin') || '',
   state,
   busy = false;
-let page = Object.hasOwn(titles, location.hash.slice(1)) ? location.hash.slice(1) : 'overview';
+function activeRoute() {
+  const hash = location.hash.slice(1);
+  const detail = /^strategy\/([a-zA-Z0-9_.-]+)$/.exec(hash);
+  return detail ? {page:'strategy', node:detail[1]} : {page:Object.hasOwn(titles,hash) ? hash : 'overview', node:''};
+}
+let page = activeRoute().page, strategyNode = activeRoute().node;
 let selectedNode = sessionStorage.getItem('vest.node') || '',
   accountQuery = '',
   commandFilter = '',
@@ -117,8 +122,7 @@ const addressKey = a => JSON.stringify([a.node_id, a.worker_id, a.name]);
 const nodeLabel = id => state.nodes.find(n => n.id === id)?.label || id;
 const workerLabel = (nid, wid) => state.workers.find(w => w.node_id === nid && w.worker_id === wid)?.label || wid;
 const routeLabel = a => esc(nodeLabel(a.node_id)) + ' / ' + esc(workerLabel(a.node_id, a.worker_id));
-const nodeScopes = ['accounts', 'strategy', 'commands', 'logs'];
-const currentStrategy = () => state.strategies.find(s => s.node_id === selectedNode);
+const nodeScopes = ['accounts', 'commands', 'logs'];
 const strategyPath = (id, op) => 'nodes/' + encodeURIComponent(id) + '/strategy/' + op;
 function selectNode(id) {
   selectedNode = id;
@@ -195,10 +199,11 @@ async function refresh() {
     busy = false;
   }
 }
-function changePage(next) {
+function changePage(next, node = '') {
   if (!Object.hasOwn(titles, next)) return;
   page = next;
-  location.hash = next;
+  strategyNode = next === 'strategy' ? node : '';
+  location.hash = strategyNode ? 'strategy/' + encodeURIComponent(strategyNode) : next;
   render();
 }
 function render() {
@@ -206,12 +211,13 @@ function render() {
   $('navigation').innerHTML = Object.entries(titles).map(([key, label]) => `<button class="${page === key ? 'active' : ''}" data-op="page" data-value="${key}" ${page === key ? 'aria-current="page"' : ''}>${icon(key)}${label}</button>`).join('');
   $('crumb').textContent = titles[page];
   const scoped = nodeScopes.includes(page);
-  const toolbar = page === 'nodes' || page === 'overview' ? btn('addNode', '＋ 添加服务器', 'primary') : selectedNode && ['commands', 'accounts'].includes(page) ? btn('send', '下达指令', 'primary') : '';
+  const toolbar = page === 'strategy' ? strategyToolbar() : page === 'nodes' || page === 'overview' ? btn('addNode', '＋ 添加服务器', 'primary') : selectedNode && ['commands', 'accounts'].includes(page) ? btn('send', '下达指令', 'primary') : '';
   const choices = state.nodes.map(n => option(n.id, n.label + ' · ' + n.id, n.id === selectedNode)).join('');
   const scope = scoped && choices ? '<label class="node-scope">当前节点<select id="nodeScope">' + choices + '</select></label>' : '';
   const refreshCards = page === 'accounts' && selectedNode ?
     btn('refreshCards', actionTitles['accounts.list']) + btn('readAll', actionTitles['accounts.read_all']) : '';
-  const heading = `<div><h1>${titles[page]}</h1><p>${descriptions[page]}</p></div><div class="buttons">${scope}${refreshCards}${toolbar}</div>`;
+  const strategyDetail = page === 'strategy' && strategyNode;
+  const heading = `<div><h1>${strategyDetail ? esc(nodeLabel(strategyNode)) : titles[page]}</h1><p>${strategyDetail ? '节点策略详情 · '+esc(strategyNode) : descriptions[page]}</p></div><div class="buttons">${scope}${refreshCards}${toolbar}</div>`;
   if ($('heading')._template !== heading) {
     $('heading').innerHTML = heading;
     $('heading')._template = heading;
@@ -284,13 +290,6 @@ function overview() {
   const strategies = s.strategies.map(st => '<div class="node-row"><div>' + btn('nodeStrategy', nodeLabel(st.node_id), 'link', st.node_id) + '<small>' + esc(st.message) + '</small></div>' + tag(st.enabled ? '运行中' : '已停止', st.enabled ? 'good' : '') + '</div>').join('');
   $('content').innerHTML = summary + '<div class="split">' + panel('服务器状态', nodeRows ? '<div class="nodes-list">' + nodeRows + '</div>' : empty('尚未添加服务器', '登记桥地址与节点密钥后开始同步。'), btn('page', '查看全部', 'link', 'nodes')) + panel('各节点策略', strategies ? '<div class="nodes-list">' + strategies + '</div>' : empty('尚无节点策略')) + '</div>' + panel('活动持仓', positions(s.accounts), btn('page', '查看账户', 'link', 'accounts')) + panel('最近指令', commandsTable(s.commands.slice(0, 5)), btn('page', '查看记录', 'link', 'commands'));
 }
-function strategySummary() {
-  const s = currentStrategy(),
-    c = s.config;
-  return `<div class="panel-body"><div class="row"><h3>随机下单</h3>${tag(s.enabled ? '运行中' : '已停止', s.enabled ? 'good' : '')}</div>
-    <div class="summary"><div><small>每批账户</small><strong>${c.batch_size} 个</strong></div><div><small>批间等待</small><strong>${c.interval_seconds} 秒</strong></div></div>
-    <p class="strategy-line">${esc(s.message)}</p></div>`;
-}
 function nodesView() {
   const version = sha => sha ? '<code title="' + esc(sha) + '">' + esc(sha.slice(0,12)) + '</code>' : '—';
   const rows = state.nodes.map(n => `<tr><td class="cell"><strong>${esc(n.label)}</strong><small>${esc(n.id)}</small></td><td>${tag(n.online ? '在线' : '离线', n.online ? 'good' : '')}<small class="record-note"> ${esc([n.error,n.history_error,n.log_error].filter(Boolean).join(' · '))}</small></td><td class="num">${esc(n.url)}</td><td class="num">${time(n.last_seen)}</td><td><div class="actions">${btn('nodeAccounts', '账户', 'link', n.id)}${btn('nodeStrategy', '策略', 'link', n.id)}${btn('nodeLogs', '日志', 'link', n.id)}${btn('editNode', '编辑', 'link', n.id)}</div></td></tr>`);
@@ -357,14 +356,6 @@ async function renderCommands() {
   } catch (err) {
     if (sequence === historyRequest && $('commandTable')) $('commandTable').textContent = err.message;
   }
-}
-function strategyView() {
-  const s = currentStrategy(),
-    c = s.config;
-  const keys = [['方向', dir[c.side]], ['仓位', c.size_percent + '%'], ['爆仓线上方净值缓冲', money(c.stop_buffer) + ' USD'], ['止盈金额', c.take_profit == null ? '不设置' : money(c.take_profit) + ' USDC'], ['策略池', state.accounts.filter(a => a.node_id === selectedNode && a.present && a.in_pool && a.enabled).length + ' 个账户'], ['当前批次', s.batch]];
-  const controls = btn('strategyConfig', '修改参数') + btn(s.enabled ? 'stop' : 'start', s.enabled ? '停止策略' : '启动策略', s.enabled ? 'danger' : 'primary');
-  const batch = s.members.length ? s.members.map(id => btn('detail', id, 'link', id)).join('<br>') : '当前没有正在跟踪的指令。';
-  $('content').innerHTML = '<div class="detail-grid">' + panel('策略状态', strategySummary() + '<div class="panel-body buttons">' + controls + '</div>') + panel('执行参数', '<div class="panel-body summary">' + keys.map(([k, v]) => '<div><small>' + esc(k) + '</small><strong>' + esc(v) + '</strong></div>').join('') + '</div>') + '</div>' + panel('本批指令', '<div class="panel-body record-note">' + batch + '</div>') + panel('账户选择规则', '<div class="panel-body"><p>只选取已加入策略池、执行授权有效且有新鲜空仓读数的账户。同批同向，全部确认平仓后开始批间等待。每个账户每阶段、每个美东交易日最多开仓一次。</p></div>', btn('page', '管理账户池', 'link', 'accounts'));
 }
 const input = (name, label, value = '', type = 'text', extra = '') => `<label>${label}<input name="${name}" type="${type}" value="${esc(value)}" ${extra}></label>`;
 const stopBufferInput = value => input('stop_buffer', '爆仓线上方净值缓冲 M · USD', value, 'number', 'min="0" step="0.01" required');
@@ -486,17 +477,6 @@ function commandForm(initial = []) {
   f.action.onchange = accounts;
   workers();
 }
-function strategyConfig() {
-  const s = currentStrategy(),
-    c = s.config;
-  if (s.enabled) throw Error('请先停止策略再修改参数');
-  dialog('随机下单参数', grid(input('batch_size', '每批账户数', c.batch_size, 'number', 'min="1" max="100" required') + input('interval_seconds', '批间等待 · 秒', c.interval_seconds, 'number', 'min="1" max="86400" required') + select('side', '同批方向', Object.entries(dir).map(([k, v]) => option(k, v, k === c.side)).join('')) + select('size_percent', '每账户仓位比例', [25, 50, 75, 100].map(v => option(v, v + '%', c.size_percent === v)).join('')) + stopBufferInput(c.stop_buffer) + input('take_profit', '单笔止盈 · USDC（可选）', c.take_profit ?? '', 'number', 'step="any" min="0.000001"')), '保存参数', async data => {
-    const body = Object.fromEntries(data);
-    for (const k of Object.keys(body)) if (k !== 'side') body[k] = body[k] === '' ? null : Number(body[k]);
-    await api(strategyPath(s.node_id, 'config'), 'POST', body);
-    notify('策略参数已保存');
-  });
-}
 async function detail(id) {
   const c = await api('commands/' + encodeURIComponent(id));
   if (nodeScopes.includes(page) && c.node_id !== selectedNode) throw Error('此指令属于其他节点');
@@ -531,7 +511,7 @@ const operations = {
   },
   page: changePage,
   nodeAccounts: id => { selectNode(id); changePage('accounts'); },
-  nodeStrategy: id => { selectNode(id); changePage('strategy'); },
+  nodeStrategy: id => { selectNode(id); changePage('strategy',id); },
   nodeLogs: id => { selectNode(id); changePage('logs'); },
   refreshCards: async () => {
     await api('nodes/'+encodeURIComponent(selectedNode)+'/accounts/refresh','POST',{});
@@ -557,19 +537,22 @@ const operations = {
   send: () => commandForm(),
   workerCmd: value => commandForm(JSON.parse(value)),
   accountCmd: value => commandForm(JSON.parse(value)),
-  strategyConfig,
+  strategyConfig: id => strategyConfig(id),
+  strategyDefaults: () => strategyEditor('defaults'),
+  strategyPresets: () => strategyPresets(),
+  editPreset: id => strategyEditor('preset',id),
+  deletePreset: id => deletePreset(id),
   lookup,
   detail,
   dismiss: () => $('dialog').close(),
-  start: () => {
-    const nid = selectedNode;
-    dialog('启动 ' + nodeLabel(nid) + ' 的自动策略', '<p>将按该节点已保存的参数向其策略池内的账户下达开仓指令。</p>', '启动策略', async () => {
+  start: nid => {
+    dialog('启动 ' + nodeLabel(nid) + ' 的自动策略', '<p>将先全量拉取该节点的账户列表，再按已保存的参数选择账户。同批同向下单，Live 平仓后按本节点的领取设置处理净利润。</p>', '启动策略', async () => {
       await api(strategyPath(nid, 'start'), 'POST', {});
       notify('节点策略已启动');
     });
   },
-  stop: async () => {
-    await api(strategyPath(selectedNode, 'stop'), 'POST', {});
+  stop: async nid => {
+    await api(strategyPath(nid, 'stop'), 'POST', {});
     notify('策略已停止');
     await refresh();
   },
@@ -614,7 +597,12 @@ $('loginForm').onsubmit = async e => {
 };
 $('logout').onclick = loginScreen;
 $('refresh').onclick = refresh;
-window.addEventListener('hashchange', () => changePage(Object.hasOwn(titles, location.hash.slice(1)) ? location.hash.slice(1) : 'overview'));
+window.addEventListener('hashchange', () => {
+  const route = activeRoute();
+  page = route.page;
+  strategyNode = route.node;
+  render();
+});
 window.addEventListener('DOMContentLoaded', () => {
   $('loginSubmit').disabled = false;
   if (token) refresh();

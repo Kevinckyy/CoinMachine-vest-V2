@@ -96,6 +96,21 @@ def check_reservations(db, cmd, now, *, shared=False):
     if cmd["action"] not in WRITE:
         return
     start = entry_day_window(now)["start"]
+    claim = None
+    if cmd.get("reentry_claim"):
+        claim = record(command(db, cmd["reentry_claim"]))
+        require(claim["status"] == "succeeded" and claim["action"] == "profit.withdraw" and claim.get("strategy_payout")
+                and cmd["action"] == "order.open" and cmd["phase"] == "live" and cmd["source"].startswith("strategy-")
+                and all(claim[k] == cmd[k] for k in ("source","node_id","worker_id","account","account_ref","phase"))
+                and claim["updated_at"] <= now, "Live 再入场需要同账户同策略已核验的领取回执", 409)
+        opened = record(command(db,claim["strategy_payout"]["open_id"]))
+        require(opened.get("expected_risk",{}).get("card_id") == cmd.get("expected_risk",{}).get("card_id"),
+                "Live 再入场的账户卡片标识已变化",409)
+        consumed = db.execute("""SELECT 1 FROM commands WHERE node=? AND worker=? AND account=? AND id!=?
+            AND json_extract(body,'$.reentry_claim')=? AND (status='succeeded'
+            OR status='resolved' AND json_extract(result,'$.executed')=1) LIMIT 1""",
+            (cmd["node_id"],cmd["worker_id"],cmd["account"],cmd["id"],claim["id"])).fetchone()
+        require(not consumed, "此领取回执的再入场额度已使用",409)
     scope = "(node=? AND worker=? AND account=?)"
     args = [cmd["node_id"], cmd["worker_id"], cmd["account"]]
     if shared:
@@ -112,4 +127,6 @@ def check_reservations(db, cmd, now, *, shared=False):
             if previous["phase"] and cmd["phase"] and previous["phase"] != cmd["phase"]:
                 continue
             used = row["status"] == "succeeded" or (row["status"] == "resolved" and previous["result"]["executed"])
+            if claim and previous.get("reentry_claim") != claim["id"] and row["updated"] <= claim["created_at"]:
+                continue
             require(not used, "本账户在当前阶段和美东交易日已开仓", 409)

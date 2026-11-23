@@ -969,11 +969,15 @@
       core.validateJob(job, config);
       if (job.size_percent) job.quantity = await selectPositionSize(job);
       else await setInput('quantity', core.nqVestToInput(job.quantity, 'micro'));
-      if (job.stop_loss<job.quantity*0.25) {
+      if (job.stop_loss != null && job.stop_loss<job.quantity*0.25) {
         const reading = await read(config.accountName,config.accountCategory);
-        job.stop_loss = (await hooks.preflight(reading,job.quantity)).stop_loss;
+        const checked = await hooks.preflight(reading,job.quantity);
+        job.stop_loss = checked.stop_loss;
+        job.stop_omitted = checked.stop_omitted;
+        job.remaining_drawdown = checked.remaining_drawdown;
+        core.validateJob(job,config);
       }
-      await setInput('stopLoss', job.stop_loss);
+      await setInput('stopLoss', job.stop_loss ?? '');
       await setInput('takeProfit', job.take_profit ?? '');
       const beforeSubmit = () => {
         assertArmed();
@@ -1052,7 +1056,7 @@
         name: cmd.account,
         account_id: cmd.account,
         identity: config.identityText,
-        policy: {
+        policy: cmd.strategy_payout || {
           live_payout_recipient: 'main',
           live_payout_mode: 'amount',
           live_payout_amount: cmd.params.amount
@@ -1078,6 +1082,8 @@
         call: async (_, data) => {
           if (data.action === 'reserve') {
             before = data.snapshot;
+            if (cmd.strategy_payout && (Math.abs(before.equity-before.balance) > 0.005 ||
+                before.balance-cmd.strategy_payout.target_balance <= 0.005)) throw Error('Live 空仓余额或可领净利润已变化');
             return {
               claim: {
                 ...claim,
@@ -1100,6 +1106,7 @@
           if (data.action === 'verify') {
             after = data.snapshot;
             if (Math.abs(after.balance - (before.balance - preview.amount)) > 0.005) throw Error('扣款后余额与预期不符，请核验平台记录');
+            if (cmd.strategy_payout?.live_payout_mode === 'all' && Math.abs(after.balance-cmd.strategy_payout.target_balance) > 0.005) throw Error('领取全部净利润后的余额未回到阶段起始余额');
             return {
               verified: true
             };
@@ -1215,6 +1222,8 @@
           current = await openOrder({
             ...job,
             stop_loss:approved.stop_loss,
+            stop_omitted:approved.stop_omitted,
+            remaining_drawdown:approved.remaining_drawdown,
             type: 'open',
             ...(p.micro ? {
               quantity: core.nqInputToVest(p.micro, 'micro')

@@ -11,6 +11,7 @@ from .protocol import Problem, dump, ident, obj, require
 WEB = Path(__file__).resolve().parent.parent / "web"
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/reports.js": ("reports.js", "text/javascript; charset=utf-8"),
+          "/strategy.js": ("strategy.js", "text/javascript; charset=utf-8"),
           "/styles.css": ("styles.css", "text/css; charset=utf-8")}
 
 
@@ -113,6 +114,12 @@ def make_server(bind, port, app, token, plugin_token=None):
                     return app.deployment(ident(keys[1]),ident(keys[3]),"cancel",body)
                 if keys == ["state"] and method == "GET":
                     return app.state(query.get("node_id"))
+                if keys == ["strategy","defaults"] and method == "PUT":
+                    return app.save_defaults(body)
+                if len(keys) == 3 and keys[:2] == ["strategy","presets"] and method == "PUT":
+                    return app.preset(keys[2],body)
+                if len(keys) == 4 and keys[:2] == ["strategy","presets"] and keys[3] == "delete" and method == "POST":
+                    return app.preset(keys[2],body,remove=True)
                 if keys == ["analytics"] and method == "GET":
                     return app.analytics(query)
                 if keys == ["commands"] and method == "GET":

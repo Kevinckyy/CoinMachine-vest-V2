@@ -108,3 +108,11 @@ def stop_amount(equity, floor, buffer):
     if not floor or not floor["verified"] or equity is None:
         return None
     return float((decimal(equity)-decimal(floor["floor"])-decimal(buffer)).quantize(CENT,rounding=ROUND_FLOOR))
+
+
+def stop_decision(equity, floor, params):
+    remaining = stop_amount(equity, floor, 0)
+    threshold = params.get("omit_stop_below")
+    omit = threshold is not None and remaining is not None and 0 < remaining < threshold
+    amount = None if omit else stop_amount(equity, floor, params.get("stop_buffer",20))
+    return remaining, amount, omit

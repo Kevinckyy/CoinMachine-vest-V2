@@ -35,6 +35,7 @@ function publicBinding({
     release: BUILD,
     cards_version: 1,
     portfolio_version: 1,
+    strategy_version: 1,
     session_id,
     worker_id,
     mode,

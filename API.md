@@ -9,7 +9,7 @@
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | GET | `/healthz` | 无密钥健康检查，只返回角色和版本 |
-| GET | `/v1/state?node_id=cloud-01` | `nodes,workers,accounts,strategies,unknown_count,commands`。可省略节点取全网数据。一个节点范围内另返回 `strategy`，多节点时该字段为 `null` |
+| GET | `/v1/state?node_id=cloud-01` | `nodes,workers,accounts,strategies,strategy_settings,unknown_count,commands`。可省略节点取全网数据。一个节点范围内另返回 `strategy`，多节点时该字段为 `null` |
 | GET | `/v1/nodes/{node_id}/accounts` | 节点独立目录及持仓快照，返回 `accounts` |
 | POST | `/v1/nodes/{node_id}/accounts/refresh` | 全量拉取账户列表。正文 `{}`，返回新的 `generation`。在线浏览器读取活动卡片，离线浏览器重连后补读 |
 | POST | `/v1/nodes/{node_id}/accounts/read-all` | 全量读取账户信息。正文 `{}`，为该节点支持该指令的在线浏览器各创建一条指令，返回 `commands`（指令 ID）和 `skipped`（需升级的浏览器 ID）。重复点击复用同一会话仍在执行或待领取的中心指令 |
@@ -22,8 +22,29 @@
 | GET | `/v1/commands/{id}` | 获取状态、目标、参数、资金操作许可记录、结果、错误和时间 |
 | POST | `/v1/commands/{id}/cancel` | 请求取消尚未被插件领取的指令，正文为 `{}` |
 | POST | `/v1/commands/{id}/resolve` | 人工结清待核验指令，正文为 `{"executed":true,"note":"平台记录和核验依据"}` |
-| POST | `/v1/nodes/{node_id}/strategy/config` | 停止状态下更新该节点的 `batch_size,interval_seconds,side,size_percent,stop_buffer,take_profit` |
+| PUT | `/v1/strategy/defaults` | 用部分或完整配置更新全局默认参数。新登记节点获得一份副本 |
+| PUT | `/v1/strategy/presets/{id}` | 创建或更新命名预设，正文为 `{"name":"晚间","config":{"batch_size":3}}`。同名方案须使用原 ID |
+| POST | `/v1/strategy/presets/{id}/delete` | 删除预设，正文为 `{}` |
+| POST | `/v1/nodes/{node_id}/strategy/config` | 停止状态下更新该节点的部分或完整配置。应用预设时提交对应的 `config` |
 | POST | `/v1/nodes/{node_id}/strategy/start`、`/v1/nodes/{node_id}/strategy/stop` | 启停所选节点，正文为 `{}`。旧 `/v1/strategy/*` 兼容单节点，多节点须指定目标 |
+
+### 策略参数
+
+`state.strategy_settings` 返回 `defaults` 和 `presets`。每个预设含 `id,name,config`。节点策略独立保存 `config,batch,batch_side,planned,members,next_at,message`，其中 `planned` 为已选中且待到时派发的账户，`members` 为已派发指令 ID。运行中的队列和同批方向跨中心重启保留。
+
+| 字段 | 含义 |
+| --- | --- |
+| `batch_size,order_delay_min,order_delay_max,batch_delay_min,batch_delay_max` | 批量及批内、批间等待区间（秒）。旧客户端的 `interval_seconds` 仍可设置固定批间等待 |
+| `pool_strategy,same_stage_full_batch` | `random`、`same_stage` 或 `dynamic`。同阶段模式可指定不足整批时顺延 |
+| `live_priority,account_priority_order` | 启用阶段排序及三个阶段的完整排列，默认 `["live","2/2","1/2"]` |
+| `pool_limits_enabled,exam_pool_limit,live_pool_limit` | 开启池容量限制。上限为正整数或 `"infinity"` |
+| `dynamic_reserve_low,dynamic_reserve_high,dynamic_live_target,dynamic_exam_slots` | 动态候补下限和恢复线、Live 目标存量和每批补位考核名额。名额可为 `null` 以使用自动分配 |
+| `refresh_account_pool,live_default_locked` | 等待新增候选并在美东日切时刷新账户池，以及 Live 默认锁定。关闭自动刷新时，本轮运行中仍会纳入新发现的合格账户，现有账户无法组批时结束。启动前均先拉取完整活动清单 |
+| `side,size_percent,stop_buffer,take_profit` | 考核号方向、平台仓位百分档、USD 缓冲 M、可选 USD 止盈。Live 使用对应的 `live_` 前缀 |
+| `skip_stop_loss_on_low_drawdown,drawdown_stop_loss_threshold` | 考核号免止损开关与 USD 阈值，Live 使用对应的 `live_` 前缀。默认关闭，阈值初始为 200 |
+| `live_payout_recipient,live_payout_mode,live_payout_amount,live_payout_percent` | 主账户 `main` 收款。方式为 `all`、`amount`、`percent` |
+
+启用免止损的开仓指令包含 `params.omit_stop_below`。桥在交易页核验和最终许可时用 `equity − daily_floor.floor` 比较阈值，仅当余额大于零且严格低于阈值时返回 `stop_omitted=true,stop_loss=null`。等于阈值时仍扣除 M 计算止损。Live 策略和免止损指令需要节点上报 `workers[].strategy_version=1`。已核验的策略领取通过 `strategy_payout.open_id` 关联原开仓，再入场通过 `reentry_claim` 关联已扣款的领取指令。
 
 ### 筛选交易与出金
 

@@ -3,7 +3,7 @@ import json
 import os
 import time
 import uuid
-from . import cards, daily_floor, ledger, portfolio, reporting, updates
+from . import cards, daily_floor, ledger, portfolio, reporting, strategy_payout, updates
 
 from .protocol import (PHASES, PORTFOLIO_SCAN, PRIMARY, RUN_TTL, TERMINAL, WRITE, Problem, boolean, choice,
                        dump, ident, make_command, number, obj, request, require, string, validate_target)
@@ -46,10 +46,15 @@ def verify_financial_receipt(cmd, result):
             require(all(snap.get(k) == v for k, v in cmd["expected_position"].items()), "修改保护的持仓不符")
         for key, report in (("stop_loss", "stop_check"), ("take_profit", "take_profit_check")):
             if action == "order.open" or key in params:
-                expected = "verified" if params.get(key) is not None or key=="stop_loss" and action=="order.open" else "omitted"
+                omitted = key=="stop_loss" and action=="order.open" and proof.get("stop_omitted") is True
+                expected = "verified" if params.get(key) is not None or key=="stop_loss" and action=="order.open" and not omitted else "omitted"
                 require(isinstance(snap.get(report), dict) and snap[report].get("status") == expected,
                         "回执未核验原生止盈止损")
-                if action=="order.open" and key=="stop_loss" and "stop_buffer" in params:
+                if omitted:
+                    require(proof.get("stop_loss") is None and params.get("omit_stop_below") is not None and
+                            0 < proof["remaining_drawdown"] < params["omit_stop_below"] and snap.get("native_sl_absent") is True
+                            and snap.get("native_sl_price") is None, "原生止损应为空且须满足免止损阈值")
+                elif action=="order.open" and key=="stop_loss" and "stop_buffer" in params:
                     target_risk = proof["stop_loss"]
                     trigger = number(snap.get("native_sl_price"),"原生止损触发价",0.000001,1e12)
                     entry = number(snap.get("entry_price"),"成交均价",0.000001,1e12)
@@ -61,6 +66,9 @@ def verify_financial_receipt(cmd, result):
         require(snap.get("position_open") is False, "执行回执未确认空仓")
         if action == "profit.withdraw":
             require(ledger.verified_withdrawal(cmd, result, snap), "主账户收款对象、申请金额或扣款余额未核验")
+            policy = cmd.get("strategy_payout")
+            if policy and policy["live_payout_mode"] == "all":
+                require(abs(snap["balance"]-policy["target_balance"]) <= .005,"领取后的余额与 Live 阶段起始余额不符")
 
 
 class Bridge:
@@ -95,6 +103,8 @@ class Bridge:
         with self.db.tx() as db:
             if "portfolio_version" not in {r["name"] for r in db.execute("PRAGMA table_info(worker_build)")}:
                 db.execute("ALTER TABLE worker_build ADD COLUMN portfolio_version INTEGER NOT NULL DEFAULT 0")
+            if "strategy_version" not in {r["name"] for r in db.execute("PRAGMA table_info(worker_build)")}:
+                db.execute("ALTER TABLE worker_build ADD COLUMN strategy_version INTEGER NOT NULL DEFAULT 0")
             cols = {r["name"] for r in db.execute("PRAGMA table_info(accounts)")}
             for col in ("listed_session", "read_session", "tracked_position"):
                 if col not in cols:
@@ -135,7 +145,8 @@ class Bridge:
         with self.db.tx() as db:
             self._expire(db, self.clock())
             workers = []
-            for row in db.execute("""SELECT w.*,COALESCE(b.release,'') AS release,COALESCE(b.portfolio_version,0) AS portfolio_version,c.session AS card_session,
+            for row in db.execute("""SELECT w.*,COALESCE(b.release,'') AS release,COALESCE(b.portfolio_version,0) AS portfolio_version,
+                    COALESCE(b.strategy_version,0) AS strategy_version,c.session AS card_session,
                     c.generation AS card_generation,c.full_at AS cards_full_at FROM workers w
                     LEFT JOIN worker_build b ON b.worker_id=w.worker_id LEFT JOIN card_sync c ON c.worker=w.worker_id ORDER BY label"""):
                 scan = db.execute("""SELECT id,status,error, json_extract(result,'$.stage') AS stage,
@@ -192,6 +203,12 @@ class Bridge:
         if cmd["action"]=="order.open" and "expected_risk" in body:
             cmd["expected_risk"] = obj(body["expected_risk"])
             cmd["expected_floor"] = obj(body.get("expected_floor",{}))
+        if "reentry_claim" in body:
+            require(cmd["action"] == "order.open" and cmd["phase"] == "live" and cmd["source"].startswith("strategy-"), "Live 再入场指令无效")
+            cmd["reentry_claim"] = ident(body["reentry_claim"])
+        if "strategy_payout" in body:
+            require(cmd["action"] == "profit.withdraw" and cmd["phase"] == "live", "策略领取指令无效")
+            cmd["strategy_payout"] = strategy_payout.validate(obj(body["strategy_payout"]))
         if cmd["action"] in ("order.close", "position.protect"):
             expected = obj(body.get("expected_position"))
             require(expected.get("position_id") == cmd["params"]["position_id"] and expected.get("symbol") == "NQ-PERP",
@@ -259,10 +276,10 @@ class Bridge:
         build = body.get("release", "")
         if build != "":
             updates.revision(build)
-        db.execute("""INSERT INTO worker_build(worker_id,release,portfolio_version) VALUES(?,?,?) ON CONFLICT(worker_id) DO UPDATE
-                   SET release=excluded.release,portfolio_version=excluded.portfolio_version
-                   WHERE release!=excluded.release OR portfolio_version!=excluded.portfolio_version""",
-                   (wid,build,int(body.get("portfolio_version") == 1)))
+        db.execute("""INSERT INTO worker_build(worker_id,release,portfolio_version,strategy_version) VALUES(?,?,?,?) ON CONFLICT(worker_id) DO UPDATE
+                   SET release=excluded.release,portfolio_version=excluded.portfolio_version,strategy_version=excluded.strategy_version
+                   WHERE release!=excluded.release OR portfolio_version!=excluded.portfolio_version OR strategy_version!=excluded.strategy_version""",
+                   (wid,build,int(body.get("portfolio_version") == 1),int(body.get("strategy_version") == 1)))
         if not row or row["session_id"] != sid or row["error"] != error:
             message = error or ("浏览器已连接 · 执行模式" if mode == "execute" else "浏览器已连接 · 只读模式")
             reporting.log(db, self.node_id, now, "browser", message, "warning" if error else "info", worker=wid)
@@ -321,6 +338,11 @@ class Bridge:
         category = string(data.get("category") or row["category"], "账户类别", 40)
         phase = data.get("phase") or row["phase"]
         require(phase is None or phase in PHASES, "未知阶段")
+        if data.get("phase") and (phase != row["baseline_phase"] or row["initial_balance"] is None):
+            baseline = snap["balance"] if snap.get("position_open") is False and snap["balance"] > 0 else None
+            db.execute("UPDATE accounts SET baseline_phase=?,initial_balance=? WHERE worker_id=? AND name=?", (phase,baseline,wid,name))
+        if phase and (row["phase"] != phase or row["phase_started_at"] is None):
+            db.execute("UPDATE accounts SET phase_started_at=? WHERE worker_id=? AND name=?", (observed,wid,name))
         route = (self.node_id, wid, name)
         tracked = json.loads(row["tracked_position"]) if row["tracked_position"] else None
         if row["read_error"]:
@@ -422,6 +444,10 @@ class Bridge:
                 try:
                     validate_target(cmd, *target(db, cmd), now)
                     check_reservations(db, cmd, now)
+                    if "omit_stop_below" in cmd["params"] or cmd.get("strategy_payout") or cmd.get("reentry_claim"):
+                        require(body.get("strategy_version") == 1, "请重新加载 1.5.0 或更高版本插件", 409)
+                    if cmd.get("strategy_payout"):
+                        strategy_payout.check_origin(db,cmd,target(db,cmd)[1])
                     if cmd["action"] == PORTFOLIO_SCAN:
                         require(body.get("portfolio_version") == 1, "请重新加载支持全量读取账户信息的插件", 409)
                 except Problem as err:
@@ -463,16 +489,16 @@ class Bridge:
         floor_key = {k:(floor or {}).get(k) for k in ("start","floor","verified")}
         if cmd.get("expected_floor")!=floor_key:
             changed.append("daily_floor")
-        amount = daily_floor.stop_amount(risk["equity"],floor,cmd["params"].get("stop_buffer",20))
+        remaining, amount, omit = daily_floor.stop_decision(risk["equity"],floor,cmd["params"])
         qty = body.get("quantity") if body.get("stage")!="open" else obj(body.get("proof",{})).get("quantity")
         min_stop = number(qty,"实际 Vest 数量",0.000001,1e12)*0.25 if qty is not None else None
         if "stop_buffer" not in cmd["params"]:
             issue = "旧版固定止损指令需要重新决策"
-        elif amount is None:
+        elif remaining is None:
             issue = "等待核对美东 20:00 净值或平台当日爆仓线"
-        elif amount<=0:
+        elif not omit and amount<=0:
             issue = "净值至爆仓线的余量不足以保留止损缓冲"
-        elif min_stop is not None and amount<min_stop:
+        elif not omit and min_stop is not None and amount<min_stop:
             issue = "止损余量不足当前仓位的一个价格跳动"
             risk["size_minimum"] = {"size_percent":cmd["params"].get("size_percent"),"minimum":min_stop}
             db.execute("UPDATE accounts SET risk=? WHERE worker_id=? AND name=?",(dump(risk),wid,cmd["account"]))
@@ -482,7 +508,7 @@ class Bridge:
                    "observed_at":snap["observed_at"]})
             return {"approved":False,"reselect":True,"reason":reason,"risk":actual}
         db.execute("INSERT OR REPLACE INTO open_preflight VALUES(?,?,?)",(cmd["id"],sid,now))
-        return {"approved":True,"risk":actual,"stop_loss":amount,"daily_floor":floor}
+        return {"approved":True,"risk":actual,"stop_loss":amount,"daily_floor":floor,"stop_omitted":omit,"remaining_drawdown":remaining}
 
     def _intent(self, db, wid, sid, body, now):
         row = command(db, ident(body.get("id")))
@@ -503,10 +529,18 @@ class Bridge:
                 return {**checked,"authorize_click":False}
             proof = obj(body.get("proof"))
             qty = number(proof.get("quantity"),"实际 Vest 数量",0.000001,1e12)
-            require(proof.get("stop_loss")==checked["stop_loss"] and checked["stop_loss"]>=qty*0.25,
+            require("stop_loss" in proof and proof["stop_loss"]==checked["stop_loss"] and
+                    (checked["stop_omitted"] or checked["stop_loss"]>=qty*0.25),
                     "止损输入与可用净值或实际仓位不符",409)
             proof["daily_floor"] = checked["daily_floor"]
             proof["stop_buffer"] = cmd["params"]["stop_buffer"]
+            proof["stop_omitted"] = checked["stop_omitted"]
+            proof["remaining_drawdown"] = checked["remaining_drawdown"]
+            if cmd["phase"] == "live":
+                proof["initial_balance"] = target(db,cmd)[1]["initial_balance"]
+        if stage == "withdraw" and cmd.get("strategy_payout"):
+            strategy_payout.check_origin(db,cmd,target(db,cmd)[1])
+            strategy_payout.check_quote(cmd,obj(body.get("proof")),now)
         if stage == "protect" and row["action"] == "order.open":
             require("open" in intents, "尚未提交开仓", 409)
         else:

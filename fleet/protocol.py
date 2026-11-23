@@ -115,7 +115,7 @@ def parameters(action, raw, legacy=False):
         for key in p.keys() & {"stop_loss", "take_profit"}:
             positive(p[key], key)
     elif action == "order.open":
-        fields(p, ("side", "micro", "size_percent", "stop_buffer", "take_profit") + (("stop_loss",) if legacy else ()))
+        fields(p, ("side", "micro", "size_percent", "stop_buffer", "take_profit", "omit_stop_below") + (("stop_loss",) if legacy else ()))
         choice(p.get("side"), {"buy", "sell"}, "方向")
         require(("micro" in p) != ("size_percent" in p), "请指定 Micro 数量或仓位比例")
         if "micro" in p:
@@ -128,6 +128,8 @@ def parameters(action, raw, legacy=False):
             p["stop_buffer"] = number(p.get("stop_buffer",20),"爆仓线净值缓冲",0,1e9)
         if p.get("take_profit") is not None:
             positive(p["take_profit"], "止盈金额")
+        if "omit_stop_below" in p:
+            positive(p["omit_stop_below"], "免止损剩余回撤阈值")
     return p
 
 
