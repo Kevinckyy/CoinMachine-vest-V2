@@ -9,7 +9,7 @@
   const direction = (side, leg) => (side === 'buy') === (leg === 'tp') ? 1 : -1;
   const valid = check => ['verified','omitted'].includes(check.status);
 
-  function plan(position, target, key='sl', capped=false) {
+  function plan(position, target, key='sl', capped=false, minimumProfit=0) {
     const {label, amount}=legs.find(leg=>leg.key===key);
     const targetKey='target_'+amount, actualKey='actual_'+amount;
     if(target==null){
@@ -22,8 +22,12 @@
     }
     const sign=direction(side,key), ticks=(entry+sign*target/quantity)/NQ_PRICE_TICK;
     if(!Number.isFinite(ticks))throw Error('无法计算有效'+label+'触发价');
-    const nearestTick=capped && key==='sl' ? (sign===1?Math.floor(ticks+1e-9):Math.ceil(ticks-1e-9)) :
+    let nearestTick=capped && key==='sl' ? (sign===1?Math.floor(ticks+1e-9):Math.ceil(ticks-1e-9)) :
       sign===1?Math.ceil(ticks-0.5):Math.floor(ticks+0.5);
+    if (key==='tp' && minimumProfit>0) {
+      const bound=(entry+sign*minimumProfit/quantity)/NQ_PRICE_TICK;
+      nearestTick=sign===1 ? Math.max(nearestTick,Math.ceil(bound-1e-9)) : Math.min(nearestTick,Math.floor(bound+1e-9));
+    }
     const price=nearestTick*NQ_PRICE_TICK;
     if(!(price>0&&sign*(price-entry)>0))throw Error(label+'金额对应的触发价无效，请核对当前成交价和数量');
     const trigger=position[`native_${key}_price`];
@@ -45,7 +49,7 @@
       return current;
     };
     const checkLegs=current=>Object.fromEntries(selected.map(({key,setting,report})=>{
-      try{return [report,plan(current,job[setting],key,job.stop_buffer!=null)];}
+      try{return [report,plan(current,job[setting],key,job.stop_buffer!=null,job.min_take_profit)];}
       catch(error){return [report,{status:'failed',error:error.message}];}
     }));
     try {

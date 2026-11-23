@@ -10,6 +10,7 @@ services:
     volumes:
       - ../fleet:/app/fleet:ro
       - ../web:/app/web:ro
+      - ../extension/manifest.json:/app/extension/manifest.json:ro
       - center-data:/data
   caddy:
     image: caddy:2-alpine

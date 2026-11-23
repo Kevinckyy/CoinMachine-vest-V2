@@ -1,5 +1,5 @@
 """Daily equity floor at 20:00 New York, in account USD."""
-from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 import json
 
 from .protocol import number
@@ -7,7 +7,6 @@ from .trading_day import entry_day_window
 
 
 CENT = Decimal("0.01")
-RATE = Decimal("0.03")
 
 
 def decimal(value):
@@ -37,21 +36,18 @@ def capture(db, worker, account, at, allowance=None, reset=None, platform=None):
         reset = number(reset,"美东 20:00 账户价值",0.01,1e12)
     if platform is not None:
         platform = number(platform,"平台当日爆仓线",0,1e12)
-    if old and reset is None and platform is None and allowance==old["allowance"]:
+    if old and platform is None and reset is None and allowance == old["allowance"]:
         return
-    if old and reset is None and old["source"]!="estimate":
+    if reset is None and old:
         reset = old["reset_equity"]
     if allowance is None:
         allowance = old["allowance"] if old else None
-    if platform is None and old:
-        platform = old["platform_floor"]
-    if reset is not None:
-        calculated = cents(decimal(reset)*RATE)
-        source = "reset" if allowance is None or abs(calculated-allowance)<=0.011 else "conflict"
-        allowance = calculated if allowance is None else allowance
+    platform_at = old["platform_at"] if old else None
+    if platform is not None and (platform_at is None or at >= platform_at):
+        platform_at = at
     else:
-        source = "platform" if platform is not None else "estimate"
-    platform_at = (old["platform_at"] if old and old["platform_floor"]==platform else at) if platform is not None else None
+        platform = old["platform_floor"] if old else None
+    source = "platform" if platform is not None else "pending"
     db.execute("INSERT OR REPLACE INTO daily_floors VALUES(?,?,?,?,?,?,?,?)",
                (worker,account,start,reset,allowance,platform,platform_at,source))
 
@@ -72,7 +68,7 @@ def confirmed_debits(db, worker, account, start, end):
         receipts.append((decimal(data["amount"]),intent.get("time",data["verified_at"]),data["verified_at"]))
     # The native request time is displayed with up to one minute of rounding.
     # Match at most one native row to each verified receipt, even if amounts repeat.
-    debits = [(amount,submitted) for amount,submitted,verified in receipts if verified>=start]
+    debits = [(amount,verified) for amount,submitted,verified in receipts if verified>=start]
     for amount,created,executed in sorted(payouts,key=lambda payout:payout[1]):
         matches = [(abs(created-submitted),i) for i,(gross,submitted,verified) in enumerate(receipts)
                    if gross==amount and submitted-60<=created<=verified+1]
@@ -91,17 +87,11 @@ def view(db, worker, account, now):
         return None
     debits = confirmed_debits(db,worker,account,start,end)
     gross = sum((value for value,_ in debits),Decimal(0))
-    reset = row["reset_equity"]
-    if reset is None and row["allowance"] is not None and row["source"]=="estimate":
-        reset = cents(decimal(row["allowance"])/RATE)
-    floor = decimal(reset)*(1-RATE)-gross if reset is not None else None
-    if row["platform_floor"] is not None:
-        # An observed platform level includes debits already reflected at that point.
-        later = sum((value for value,submitted in debits if submitted>row["platform_at"]),Decimal(0))
-        floor = decimal(row["platform_floor"])-later
-    return {"start":start,"end":end,"reset_equity":reset,"daily_limit":row["allowance"],"gross_withdrawn":float(gross),
-            "floor":cents(floor) if floor is not None else None,"source":row["source"],
-            "verified":row["source"] in ("reset","platform") and floor is not None}
+    at = row["platform_at"]
+    verified = at is not None and row["platform_floor"] is not None and all(when <= at for _,when in debits)
+    return {"start":start,"end":end,"reset_equity":row["reset_equity"],"daily_limit":row["allowance"],"gross_withdrawn":float(gross),
+            "floor":row["platform_floor"] if verified else None,"observed_at":at,
+            "source":"platform" if verified else "pending","verified":verified}
 
 
 def stop_amount(equity, floor, buffer):
@@ -116,3 +106,10 @@ def stop_decision(equity, floor, params):
     omit = threshold is not None and remaining is not None and 0 < remaining < threshold
     amount = None if omit else stop_amount(equity, floor, params.get("stop_buffer",20))
     return remaining, amount, omit
+
+
+def take_profit(params, risk_amount):
+    if "reward_ratio" not in params:
+        return params.get("take_profit")
+    minimum = decimal(params.get("min_take_profit",0)).quantize(CENT,rounding=ROUND_CEILING)
+    return max(float(minimum), cents(decimal(risk_amount)*decimal(params["reward_ratio"])))

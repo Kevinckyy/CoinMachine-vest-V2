@@ -23,6 +23,13 @@ PRIMARY = {"default", "main", "primary", "master", "主账户", "主账号", "�
            "main account", "primary account", "master account"}
 
 
+def plugin_version_parts(value):
+    if not isinstance(value,str) or not re.fullmatch(r"[0-9]{1,5}(?:\.[0-9]{1,5}){0,3}",value):
+        return ()
+    parts = tuple(map(int,value.split(".")))
+    return parts+(0,)*(4-len(parts)) if max(parts)<=65535 else ()
+
+
 class Problem(Exception):
     def __init__(self, message, status=400):
         super().__init__(message)
@@ -115,7 +122,7 @@ def parameters(action, raw, legacy=False):
         for key in p.keys() & {"stop_loss", "take_profit"}:
             positive(p[key], key)
     elif action == "order.open":
-        fields(p, ("side", "micro", "size_percent", "stop_buffer", "take_profit", "omit_stop_below") + (("stop_loss",) if legacy else ()))
+        fields(p, ("side", "micro", "size_percent", "stop_buffer", "take_profit", "reward_ratio", "min_take_profit", "omit_stop_below") + (("stop_loss",) if legacy else ()))
         choice(p.get("side"), {"buy", "sell"}, "方向")
         require(("micro" in p) != ("size_percent" in p), "请指定 Micro 数量或仓位比例")
         if "micro" in p:
@@ -128,6 +135,12 @@ def parameters(action, raw, legacy=False):
             p["stop_buffer"] = number(p.get("stop_buffer",20),"爆仓线净值缓冲",0,1e9)
         if p.get("take_profit") is not None:
             positive(p["take_profit"], "止盈金额")
+        if "reward_ratio" in p:
+            require(p.get("take_profit") is None, "固定止盈金额和盈亏比不能同时设置")
+            positive(p["reward_ratio"],"盈亏比")
+            number(p.get("min_take_profit",0),"最低止盈金额",0,1e12)
+        else:
+            require("min_take_profit" not in p,"最低止盈金额仅适用于盈亏比模式")
         if "omit_stop_below" in p:
             positive(p["omit_stop_below"], "免止损剩余回撤阈值")
     return p
@@ -165,7 +178,15 @@ def validate_target(cmd, worker, account, now):
     if cmd["action"]=="order.open":
         from .cards import risk_error
         risk = account.get("risk") or {}
-        issue = risk_error(risk,complete=bool(account.get("risk_at") and now-account["risk_at"]<60))
+        lock = account.get("open_lock") or {}
+        if lock:
+            require(now >= lock["until"],"账户开仓锁定至美东 20:00 · "+lock["reason"],409)
+        recheck = lock and (account.get("risk_at") or 0) < lock["until"]
+        if recheck:
+            require(card_candidate and account["card_at"] >= lock["until"],"等待日切后的活动账户清单",409)
+            card = account["card"]
+            risk = {**card,"position_open":card.get("active_positions") != 0}
+        issue = risk_error(risk,complete=not recheck and bool(account.get("risk_at") and now-account["risk_at"]<60))
         require(not issue,issue,409)
         require(account["category"] in ("active","eval","funded","live"),"该账户状态不可开仓",409)
         return

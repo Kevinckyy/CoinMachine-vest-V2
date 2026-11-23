@@ -5,6 +5,7 @@ import random
 import threading
 import time
 import uuid
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -13,7 +14,7 @@ from .trading_day import entry_day_window
 
 from .protocol import (NODE_TTL, OBS_TTL, PENDING, PORTFOLIO_SCAN, RUN_TTL, TERMINAL, WORKER_TTL, WRITE, Problem, boolean,
                        bridge_url, choice, dump, fields, ident, make_command, number, obj, parameters,
-                       request, require, string, validate_target)
+                       plugin_version_parts, request, require, string, validate_target)
 from .storage import Database, check_reservations, command, find_command, finish, insert, record, summary
 
 
@@ -50,6 +51,8 @@ class Center:
     def __init__(self, path, clock=time.time, transport=remote):
         self.db = Database(path)
         self.clock, self.transport = clock, transport
+        manifest = Path(__file__).resolve().parents[1] / "extension" / "manifest.json"
+        self.plugin_version = json.loads(manifest.read_text(encoding="utf-8"))["version"] if manifest.is_file() else ""
         self.db.conn.executescript("""
             CREATE TABLE IF NOT EXISTS nodes(
                 id TEXT PRIMARY KEY, label TEXT NOT NULL, url TEXT NOT NULL UNIQUE, token TEXT NOT NULL,
@@ -79,10 +82,12 @@ class Center:
             self._migrate_strategies(db)
             db.execute("""UPDATE node_strategy SET data=json_set(json_remove(data,'$.config.stop_loss'),
                       '$.config.stop_buffer',20) WHERE json_extract(data,'$.config.stop_buffer') IS NULL""")
-            for row in db.execute("SELECT node,data FROM node_strategy WHERE json_extract(data,'$.config.order_delay_min') IS NULL").fetchall():
+            for row in db.execute("SELECT node,data FROM node_strategy").fetchall():
                 s = json.loads(row["data"])
-                s["config"] = strategy_config.migrate(s["config"])
-                db.execute("UPDATE node_strategy SET data=? WHERE node=?", (dump(s),row["node"]))
+                migrated = strategy_config.migrate(s["config"])
+                if migrated != s["config"]:
+                    s["config"] = migrated
+                    db.execute("UPDATE node_strategy SET data=? WHERE node=?", (dump(s),row["node"]))
             ledger.backfill(db)
 
     def _migrate_strategies(self, db):
@@ -138,10 +143,15 @@ class Center:
             refresh = db.execute("SELECT generation FROM directory_refresh WHERE node=?",(nid,)).fetchone()
             config = self._strategy(db,nid)["config"]
             nodes[nid] = {**node, "online": online, "release":snap.get("release",""), "agent_seen":agent["seen"] if agent else None,
+                          "open_policy_version":snap.get("open_policy_version",0),
                           "agent_release":agent["actual"] if agent else "", "update":updates.view(last) if last else None,
                           "card_generation":refresh[0] if refresh else 0}
             for w in snap["workers"]:
-                workers[nid, w["worker_id"]] = {**w, "node_id": nid, "online": online and now - w["last_seen"] < WORKER_TTL}
+                actual,target = plugin_version_parts(w.get("plugin_version")),plugin_version_parts(self.plugin_version)
+                status = "unknown" if not actual or not target else "current" if actual==target else "behind" if actual<target else "ahead"
+                workers[nid, w["worker_id"]] = {**w, "node_id": nid, "online": online and now - w["last_seen"] < WORKER_TTL,
+                                                "supports_open_policy":nodes[nid]["open_policy_version"]>=2 and actual>=(1,6,0,0),
+                                                "plugin_version":w.get("plugin_version",""),"version_status":status}
             for a in snap["accounts"]:
                 key = (nid, a["worker_id"], a["name"])
                 cfg = configs.get(key)
@@ -152,7 +162,7 @@ class Center:
                 live_locked = a["phase"] == "live" and config["live_default_locked"] and not (cfg and cfg["live_unlocked"])
                 accounts[key] = {**a, "node_id": nid, "alias": cfg["alias"] if cfg else "",
                                  "note": cfg["note"] if cfg else "", "enabled": bool(cfg["enabled"]) if cfg else True,
-                                 "live_default_locked":bool(live_locked),
+                                 "live_default_locked":bool(live_locked),"open_locked":bool(a.get("open_lock") and now < a["open_lock"]["until"]),
                                  "in_pool": bool(eligible and not live_locked and (cfg["enabled"] and cfg["in_pool"] if cfg else a.get("card"))),
                                  "account_ref": cfg["account_ref"] if cfg else "", "card_fresh":card_fresh,
                                  "fresh": card_fresh or bool(worker["online"] and a.get("read_session") == a.get("listed_session") == worker["session_id"]
@@ -173,7 +183,7 @@ class Center:
             for s in strategies:
                 for cmd in self._strategy_candidates(db,s,(nodes,workers,accounts),"buy"):
                     accounts[cmd["node_id"],cmd["worker_id"],cmd["account"]]["candidate"] = True
-            return dict(now=self.clock(), nodes=list(nodes.values()), workers=list(workers.values()),
+            return dict(now=self.clock(), plugin_version=self.plugin_version, nodes=list(nodes.values()), workers=list(workers.values()),
                         accounts=list(accounts.values()), strategies=strategies, strategy=strategies[0] if len(strategies)==1 else None,
                         strategy_settings=strategy_config.library(db), unknown_count=unknown, commands=[summary(r) for r in recent])
 
@@ -258,17 +268,23 @@ class Center:
         if req["action"] == PORTFOLIO_SCAN:
             require(worker.get("portfolio_version") == 1, "请更新节点桥并重新加载 1.4.0 或更高版本插件", 409)
         a = accounts.get((*route, req["account"]))
+        if a and a["phase"] in ("1/2","2/2") and req["action"]=="position.protect":
+            require("take_profit" not in req["params"],"考核账户不设止盈",409)
         if reentry or "omit_stop_below" in req["params"] or source.startswith("strategy-") and a and a["phase"]=="live":
             require(worker.get("strategy_version")==1,"Live 策略和免止损规则需要节点桥及 1.5.0 或更高版本插件",409)
         if req["action"]=="order.open" and a:
+            require(worker["supports_open_policy"],
+                    "开仓风控需要当前节点桥及 1.6.0 或更高版本插件",409)
+            require(a["phase"]=="live" or req["params"].get("take_profit") is None and "reward_ratio" not in req["params"],
+                    "考核账户开仓不设止盈",409)
             remaining,budget,omit = daily_floor.stop_decision((a.get("risk") or {}).get("equity"),a.get("daily_floor"),req["params"])
-            if budget is not None:
+            last_lock = a.get("open_lock") or {}
+            reread = last_lock and last_lock["until"] <= self.clock() and (a.get("risk_at") or 0) < last_lock["until"]
+            if budget is not None and not reread:
                 require(budget>0 and budget>=req["params"].get("micro",0)*2*0.25,"净值缓冲后的止损余量不足",409)
                 size = (a.get("risk") or {}).get("size_minimum")
                 if size and req["params"].get("size_percent") and size["size_percent"]==req["params"]["size_percent"] and self.clock()-(a["preflight_at"] or 0)<60:
                     require(budget>=size["minimum"],"止损余量不足当前仓位的一个价格跳动",409)
-            elif not omit and a.get("preflight_at") and self.clock()-a["preflight_at"]<60:
-                raise Problem("等待有效的当日爆仓线",409)
         require(req["action"] not in WRITE or a and a["enabled"], "账户已停用或不存在", 409)
         cmd = make_command(key, req, node, worker, a, self.clock(), source)
         if reentry:
@@ -281,14 +297,19 @@ class Center:
         req = request(body)
         with self.db.tx() as db:
             prior = find_command(db, ident(key))
+            inventory = None if prior else self._inventory(db,req["node_id"])
             if req["action"]=="order.open" and "stop_buffer" not in body.get("params",{}):
-                req["params"]["stop_buffer"] = (json.loads(prior["body"])["params"].get("stop_buffer",20) if prior else
-                                              self._strategy(db,req["node_id"])["config"]["stop_buffer"])
+                if prior:
+                    req["params"]["stop_buffer"] = json.loads(prior["body"])["params"].get("stop_buffer",20)
+                else:
+                    account = inventory[2].get((req["node_id"],req["worker_id"],req["account"]),{})
+                    key_name = "live_stop_buffer" if account.get("phase")=="live" else "stop_buffer"
+                    req["params"]["stop_buffer"] = self._strategy(db,req["node_id"])["config"][key_name]
             if prior:
                 old = json.loads(prior["body"])
                 require(old["source"] == "manual" and all(old[k] == v for k, v in req.items()), "该 ID 已用于其他指令", 409)
             else:
-                cmd = self._prepare(db, key, req, self._inventory(db, req["node_id"]))
+                cmd = self._prepare(db, key, req, inventory)
                 insert(db, cmd, "pending", self.clock())
             return record(command(db, key))
 
@@ -623,7 +644,20 @@ class Center:
             if nid != s["node_id"] or not a["in_pool"] or not a["fresh"] or a["phase"] not in account_pool.PHASES:
                 continue
             prefix = "live_" if a["phase"] == "live" else ""
-            params = {key:config[prefix+key] for key in ("size_percent","stop_buffer","take_profit")}
+            params = {key:config[prefix+key] for key in ("size_percent","stop_buffer")}
+            if a["phase"] == "2/2":
+                params["size_percent"] = config["phase2_size_percent"]
+            if a["phase"] == "live":
+                mode = config["live_take_profit_mode"]
+                if mode == "ratio":
+                    params.update(reward_ratio=config["live_reward_ratio"],min_take_profit=config["live_min_take_profit"])
+                elif mode == "entries":
+                    tier = "repeat" if self._opened_today(db,a) else "first"
+                    params.update(take_profit=config["live_"+tier+"_take_profit"],size_percent=config["live_"+tier+"_size_percent"])
+                else:
+                    params["take_profit"] = config["live_take_profit"]
+                if mode != "ratio" and params["take_profit"] is None:
+                    continue
             params["side"] = side
             if config[prefix+"skip_stop_loss_on_low_drawdown"]:
                 params["omit_stop_below"] = config[prefix+"drawdown_stop_loss_threshold"]
@@ -635,6 +669,19 @@ class Center:
                 yield self._prepare(db,uid(),req,inventory,"strategy-"+(s.get("run") or "preview"),reentry)
             except Problem:
                 continue
+
+    def _opened_today(self, db, account):
+        start = entry_day_window(self.clock())["start"]
+        ref = account["account_ref"] or account["name"]
+        # A retry or cancelled command consumes no tier. Platform position history has an actual opening time.
+        now = self.clock()
+        return bool(db.execute("""SELECT 1 FROM commands WHERE action='order.open'
+            AND COALESCE(json_extract(body,'$.account_ref'),account)=?
+            AND (status='succeeded' OR status='resolved' AND json_extract(result,'$.executed')=1)
+            AND COALESCE(json_extract(intents,'$.open.time'),created) BETWEEN ? AND ? LIMIT 1""",(ref,start,now)).fetchone() or db.execute(
+            """SELECT 1 FROM book b LEFT JOIN account_config c ON c.node=b.node AND c.worker=b.worker AND c.name=b.account
+            WHERE b.kind='position' AND COALESCE(NULLIF(c.account_ref,''),b.account)=? AND b.at>=?
+            AND json_extract(b.data,'$.opened_at') BETWEEN ? AND ? LIMIT 1""",(ref,start,start,now)).fetchone())
 
     def _refresh_strategy_directory(self, db, s, inventory, now):
         nid = s["node_id"]
@@ -668,7 +715,7 @@ class Center:
         accounts = {}
         conflicts = set()
         for a in inventory[2].values():
-            if not a["in_pool"] or a["phase"] not in account_pool.PHASES:
+            if not a["in_pool"] or a.get("open_locked") or a["phase"] not in account_pool.PHASES:
                 continue
             ref = a["account_ref"] or a["name"]
             if ref in accounts and accounts[ref]["phase"] != a["phase"]:

@@ -7,18 +7,22 @@ from .protocol import Problem, boolean, choice, dump, fields, number, positive, 
 
 DEFAULT_CONFIG = dict(strategy_id="random_entry", symbol="NQ-PERP", batch_size=2,
                       order_delay_min=2, order_delay_max=8, batch_delay_min=15, batch_delay_max=45,
-                      side="random", size_percent=25, stop_buffer=20, take_profit=None,
+                      side="random", size_percent=25, phase2_size_percent=25, stop_buffer=20,
                       skip_stop_loss_on_low_drawdown=False, drawdown_stop_loss_threshold=200,
                       live_priority=True, account_priority_order=list(DEFAULT_ACCOUNT_PRIORITY), refresh_account_pool=True,
                       live_default_locked=True, live_side="random", live_size_percent=25, live_stop_buffer=20,
-                      live_take_profit=None, live_skip_stop_loss_on_low_drawdown=False, live_drawdown_stop_loss_threshold=200,
+                      live_take_profit_mode="fixed", live_take_profit=None, live_reward_ratio=1, live_min_take_profit=0,
+                      live_first_take_profit=None, live_repeat_take_profit=None,
+                      live_first_size_percent=25, live_repeat_size_percent=25,
+                      live_skip_stop_loss_on_low_drawdown=False, live_drawdown_stop_loss_threshold=200,
                       live_payout_recipient="main", live_payout_mode="all",
                       live_payout_amount=1, live_payout_percent=100, **POOL_DEFAULTS)
 
 
 def settings(base, patch):
-    fields(patch, (*DEFAULT_CONFIG, "interval_seconds"))
-    config = {**base, **patch}
+    fields(patch, (*DEFAULT_CONFIG, "interval_seconds","take_profit"))
+    config = {**DEFAULT_CONFIG, **base, **patch}
+    config.pop("take_profit", None)  # Older clients sent an assessment take profit in every form.
     # Older API clients used one fixed interval for the batch cooldown.
     interval = config.pop("interval_seconds", None)
     if interval is not None:
@@ -32,13 +36,17 @@ def settings(base, patch):
         require(low <= high, "等待时间下限不能大于上限")
     for prefix in ("", "live_"):
         choice(config[prefix+"side"], {"buy","sell","random"}, "下单方向")
-        pct = config[prefix+"size_percent"]
-        require(type(pct) is int and pct in (25,50,75,100), "仓位大小应为 25%、50%、75% 或 100%")
         number(config[prefix+"stop_buffer"], "爆仓线上方净值缓冲 M", 0, 1e9)
         boolean(config[prefix+"skip_stop_loss_on_low_drawdown"])
         positive(config[prefix+"drawdown_stop_loss_threshold"], "剩余回撤阈值")
-        if config[prefix+"take_profit"] is not None:
-            positive(config[prefix+"take_profit"], "止盈金额")
+    for key in ("size_percent","phase2_size_percent","live_size_percent","live_first_size_percent","live_repeat_size_percent"):
+        require(type(config[key]) is int and config[key] in (25,50,75,100), "仓位大小应为 25%、50%、75% 或 100%")
+    choice(config["live_take_profit_mode"], {"fixed","ratio","entries"}, "Live 止盈模式")
+    positive(config["live_reward_ratio"], "Live 盈亏比")
+    number(config["live_min_take_profit"],"Live 最低止盈金额",0,1e12)
+    for key in ("live_take_profit","live_first_take_profit","live_repeat_take_profit"):
+        if config[key] is not None:
+            positive(config[key], "Live 止盈金额")
     for key in ("live_priority", "refresh_account_pool", "live_default_locked"):
         boolean(config[key])
     try:
@@ -56,14 +64,16 @@ def settings(base, patch):
 
 
 def migrate(config):
-    if "order_delay_min" in config:
-        return settings(DEFAULT_CONFIG, config)
-    old = {k:v for k,v in config.items() if k in DEFAULT_CONFIG or k == "interval_seconds"}
-    # Existing V2 nodes used one common direction, size, buffer and optional take profit.
-    for key in ("side", "size_percent", "take_profit", "stop_buffer"):
-        if key in old:
-            old["live_"+key] = old[key]
-    old.update(order_delay_min=0, order_delay_max=0, live_priority=False, live_default_locked=False)
+    old = dict(config)
+    if "order_delay_min" not in old:
+        old = {k:v for k,v in old.items() if k in DEFAULT_CONFIG or k in ("interval_seconds","take_profit")}
+        for key in ("side", "size_percent", "take_profit", "stop_buffer"):
+            if key in old:
+                old["live_"+key] = old[key]
+        old.update(order_delay_min=0, order_delay_max=0, live_priority=False, live_default_locked=False)
+    old.setdefault("phase2_size_percent",old.get("size_percent",25))
+    for tier in ("first","repeat"):
+        old.setdefault("live_"+tier+"_size_percent",old.get("live_size_percent",25))
     return settings(DEFAULT_CONFIG, old)
 
 
@@ -79,3 +89,8 @@ def initialize(db):
     db.execute("""CREATE TABLE IF NOT EXISTS strategy_presets(id TEXT PRIMARY KEY,
                name TEXT NOT NULL UNIQUE COLLATE NOCASE,config TEXT NOT NULL)""")
     db.execute("INSERT OR IGNORE INTO strategy_defaults VALUES(1,?)", (dump(DEFAULT_CONFIG),))
+    for table in ("strategy_defaults","strategy_presets"):
+        for row in db.execute(f"SELECT rowid AS pk,config FROM {table}").fetchall():
+            config = dump(migrate(json.loads(row["config"])))
+            if config != row["config"]:
+                db.execute(f"UPDATE {table} SET config=? WHERE rowid=?", (config,row["pk"]))

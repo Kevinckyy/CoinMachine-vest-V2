@@ -23,7 +23,7 @@
   function onFleetMessage(message, sender, reply) {
     if (sender.id !== chrome.runtime.id) return;
     if (message.type === 'fleet.identify') reply({
-      pageId
+      pageId, plugin_version: chrome.runtime.getManifest().version
     });
     if (message.type === 'fleet.revoke') {
       if (!session || message.session_id === session.session_id) invalidate();
@@ -60,18 +60,20 @@
     preflight: async (observation,quantity) => {
       guard(true);
       const value = await ipc('preflight',{id:job.id,observation,quantity});
-      if (!value.data.approved) throw Error(value.data.reason || '候选账户需重新决策');
+      if (!value.data.approved) throw Object.assign(Error(value.data.reason || '候选账户需重新决策'),{reselect:value.data.reselect});
       return value.data;
     },
-    intent: async (stage, proof, observation) => {
+    intent: async (stage, proof, observation, allowRefill = false) => {
       guard(true);
       const value = await ipc('intent', {
         id: job.id,
         stage,
-        proof, observation
+        proof, observation, allow_refill: allowRefill
       });
       guard(true);
-      if (value.data?.authorize_click !== true) throw Error('该操作未获许可或已提交');
+      if (stage === 'open' && allowRefill && value.data?.refill && !value.data.authorize_click) return value.data;
+      if (value.data?.authorize_click !== true) throw Object.assign(Error(value.data?.reason || '该操作未获许可或已提交'),{reselect:value.data?.reselect});
+      return value.data;
     }
   });
   async function observe(data, force = false, scanId) {

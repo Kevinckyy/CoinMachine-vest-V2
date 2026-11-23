@@ -18,6 +18,11 @@ assert.equal(VestBridgeCore.validateJob(stopJob,stopAccount),stopJob);
 assert.throws(()=>VestBridgeCore.validateJob({...stopJob,omit_stop_below:150},stopAccount),/stop_loss/);
 assert.throws(()=>VestBridgeCore.validateJob({...stopJob,stop_omitted:false},stopAccount),/stop_loss/);
 assert.equal(VestStopProtection.plan({native_sl_absent:true,native_sl_price:null},null).status,'omitted');
+for (const [side,trigger] of [['buy',20005.25],['sell',19994.75]]) {
+  const checked=VestStopProtection.plan({side,quantity:6,entry_price:20000,native_tp_price:trigger},30.1,'tp',true,30.1);
+  assert.equal(checked.status,'verified');
+  assert.ok(checked.actual_profit>=30.1);
+}
 
 for (const [side,quantity,trigger] of [['buy',2,19930],['sell',2,20070],['buy',6,19976.75],['sell',6,20023.25]]) {
   const position={side,quantity,entry_price:20000,native_sl_price:trigger};
@@ -191,6 +196,9 @@ try {
   },'extension account discovery');
   const data=await api('state'),worker=data.workers[0];
   assert.equal(worker.mode,'readonly');
+  assert.equal(worker.plugin_version,manifest.version);
+  assert.equal(worker.version_status,'current');
+  assert.equal((await popup.evaluate(identifyVestTab)).plugin_version,manifest.version);
   assert.deepEqual(data.accounts.map(a=>[a.name,a.card.equity,a.card.active_positions]),[['Alpha',1050,0],['Beta',2000,1]]);
   assert.equal(await vest.evaluate('location.pathname'),'/accounts');
   assert.equal(await vest.evaluate("Number(sessionStorage.getItem('opens'))"),0);
@@ -346,6 +354,13 @@ try {
   await checkFields({live_default_locked:true});
   assert.equal(await ui.evaluate("document.querySelector('[name=live_default_locked]').checked"),true);
   await openPolicyGroups();
+  assert.equal(await ui.evaluate("document.querySelector('[name=take_profit]')===null"),true);
+  await checkFields({size_percent:true,phase2_size_percent:true,live_take_profit:true,live_reward_ratio:false});
+  await setPolicy('live_take_profit_mode','ratio');
+  await checkFields({live_reward_ratio:true,live_min_take_profit:true,live_size_percent:true,live_take_profit:false});
+  await setPolicy('live_take_profit_mode','entries');
+  await checkFields({live_first_take_profit:true,live_repeat_take_profit:true,live_first_size_percent:true,live_repeat_size_percent:true,live_size_percent:false,live_min_take_profit:false});
+  await setPolicy('live_take_profit_mode','fixed');
   await checkFields({same_stage_full_batch:false,exam_pool_limit:false,live_pool_limit:false,dynamic_exam_slots:false,
     dynamic_live_target:false,dynamic_reserve_low:false,account_priority_order:true,drawdown_stop_loss_threshold:false,
     live_drawdown_stop_loss_threshold:false,live_payout_amount:false,live_payout_percent:false});
@@ -486,22 +501,26 @@ try {
   assert.deepEqual(missing.intents,{});
   assert.equal(await vest.evaluate("sessionStorage.getItem('opens')"),opensBeforeTimeout);
   await until(()=>vest.evaluate("location.pathname === '/accounts'"),'directory restored after the selector timeout');
-  await vest.evaluate("sessionStorage.setItem('tradeSelector','delayed');sessionStorage.setItem('tradeEquity','$1,040.00')");
+  await vest.evaluate("sessionStorage.setItem('tradeSelector','delayed');sessionStorage.setItem('tradeEquity','$1,040.00');sessionStorage.setItem('equityDuringFill','$1,038.00')");
   const staleId=randomUUID();
   await api('commands/'+staleId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Alpha',action:'order.open',params:{side:'buy',micro:1}});
   const stale=await until(async()=>{
     const c=await api('commands/'+staleId);
-    if (c.status!=='cancelled') throw Error(c.status+' '+c.error);
+    if (c.status!=='succeeded') throw Error(c.status+' '+c.error);
     return c;
   },'a late account selector and name allow the original order to reach risk preflight');
-  assert.equal(stale.result.reselect,true);
-  assert.ok(stale.result.changed.includes('equity'));
-  assert.deepEqual(stale.intents,{});
+  assert.equal(stale.intents.open.proof.stop_loss,48);
+  assert.equal(stale.result.observation.snapshot.stop_check.target_risk,48);
+  assert.equal(stale.result.observation.snapshot.take_profit_check.status,'omitted');
+  assert.equal(await vest.evaluate("sessionStorage.getItem('submittedOrders')"),'1');
   assert.equal(stale.params.stop_buffer,20);
   await until(async()=>{
     const s=await api('state?node_id=lab'), a=s.accounts.find(a=>a.name==='Alpha');
-    return s.workers[0].page==='/accounts' && a.risk.equity===1040 && a.daily_floor.verified;
+    return s.workers[0].page==='/accounts' && a.risk.equity===1038 && a.daily_floor.verified;
   },'corrected risk cached after return to account cards');
+  const accountCache = await popup.evaluate("chrome.storage.local.get('cardCache').then(s=>s.cardCache)");
+  assert.equal(accountCache.risks.Alpha.equity,1038);
+  assert.equal(accountCache.floors.Alpha.floor,970);
   await vest.evaluate("sessionStorage.removeItem('tradeSelector')");
   await ui.evaluate("document.querySelector('[data-value=nodes]').click();document.querySelector('[data-op=deployUpdate]').click()");
   await ui.evaluate(`(() => {const f=document.getElementById('dialogForm'); for(const box of f.querySelectorAll('[name=target]')) box.checked=box.value==='lab'; f.elements.revision.value=${JSON.stringify(second)}; f.requestSubmit();})()`);

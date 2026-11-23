@@ -543,14 +543,14 @@
             const label = core.normalized(el.textContent);
             const m = label.match(/^(8\s*pm ET balance|美东时间晚上\s*8\s*点余额|today['’]s floor|今日底线|今日底線)\s*[:：]\s*(\$?\s*[\d,]+(?:\.\d+)?)$/i);
             if (!m) continue;
-            if (!visible(el) && root!==tooltip) continue;
+            if (!visible(el)) continue;
             result[/^(?:8|美东)/.test(m[1])?'daily_reset_equity':'daily_floor'] = core.parseMoney(m[2]);
           }
         }
         return result;
       };
       let result = readLabels();
-      if ((!result.daily_reset_equity || result.daily_floor==null) && trigger && visible(trigger)) {
+      if (result.daily_floor==null && trigger && visible(trigger)) {
         const opts = {bubbles:true,pointerType:'mouse'};
         try {
           trigger.dispatchEvent(new PointerEvent('pointerover',opts));
@@ -560,7 +560,7 @@
             assertLive();
             if (observerIdentity().name!==name) throw Error('读取日损基准时账户已变化');
             result = readLabels();
-            if (result.daily_reset_equity || result.daily_floor!=null) break;
+            if (result.daily_floor!=null) break;
           }
         } finally {
           trigger.dispatchEvent(new PointerEvent('pointerout',{...opts,relatedTarget:document.body}));
@@ -976,7 +976,18 @@
       });
       return corrected;
     }
-    async function openOrder(job) {
+    async function currentOpenObservation() {
+      observerAssertPage();
+      const identity = observerIdentity();
+      if (identity.name !== config.accountName) throw Error('提交前交易账户已变化');
+      const reference = await dailyReference(identity.name);
+      const latest = observerValues(identity.name,true);
+      if (observerIdentity().signature !== identity.signature) throw Error('读取最新风控期间账户或阶段变化');
+      return {name:identity.name,category:identity.category,phase:identity.phase,
+        snapshot:{...latest.phase_snapshot,observed_at:latest.observed_at,equity:latest.equity,balance:latest.balance,
+          unrealized_pnl:latest.unrealized_pnl,capital_metrics:latest.capital_metrics,daily_unlimited:dailyUnlimited(),...reference}};
+    }
+    async function prepareOpenClick(job) {
       await prepare(assertArmed);
       if (readyCheck().position_open !== false) throw Error('开仓前需确认空仓');
       core.validateJob(job, config);
@@ -986,36 +997,56 @@
         const reading = await read(config.accountName,config.accountCategory);
         const checked = await hooks.preflight(reading,job.quantity);
         job.stop_loss = checked.stop_loss;
+        job.take_profit = checked.take_profit ?? job.take_profit;
         job.stop_omitted = checked.stop_omitted;
         job.remaining_drawdown = checked.remaining_drawdown;
         core.validateJob(job,config);
       }
-      await setInput('stopLoss', job.stop_loss ?? '');
-      await setInput('takeProfit', job.take_profit ?? '');
-      const beforeSubmit = () => {
-        assertArmed();
-        if (observerIdentity().category === 'passed' || (readAccountHealth()?.percent ?? 100) < 25) throw Error('账户当前不可开仓');
-        if (readyCheck().position_open !== false || !core.sameQuantity(core.nqInputToVest(numeric('quantity'), 'micro'), job.quantity)) throw Error('持仓状态或下单数量变化');
+      const verifiedForm = () => {
+        assertNoDialogs();
+        if (!core.sameQuantity(core.nqInputToVest(numeric('quantity'), 'micro'), job.quantity)) throw Error('下单数量变化');
         if (job.size_percent && Number(queryOne('[role="slider"]', mainForm(true), true).getAttribute('aria-valuenow')) !== job.size_percent) throw Error('提交前仓位比例已变化');
         for (const [fieldKey, value] of [['stopLoss', job.stop_loss], ['takeProfit', job.take_profit]]) {
           if (value == null ? field(fieldKey, true).value.trim() !== '' : !core.sameQuantity(numeric(fieldKey), value)) throw Error('提交前止盈止损金额已变化');
         }
         return field(job.side === 'buy' ? 'buy' : 'sell', true);
       };
-      beforeSubmit();
-      const reference = await dailyReference(config.accountName);
-      const latest = observerValues(config.accountName,true);
-      const latestId = observerIdentity();
-      await hooks.intent('open', {
-        symbol: job.symbol,
-        side: job.side,
-        quantity: job.quantity,
-        stop_loss: job.stop_loss,
-        take_profit: job.take_profit ?? null
-      }, {name:latestId.name,category:latestId.category,phase:latestId.phase,
-        snapshot:{...latest.phase_snapshot,observed_at:latest.observed_at,equity:latest.equity,balance:latest.balance,
-          unrealized_pnl:latest.unrealized_pnl,capital_metrics:latest.capital_metrics,daily_unlimited:dailyUnlimited(),...reference}});
-      click(beforeSubmit());
+      for (let attempt = 0; ; attempt++) {
+        assertArmed();
+        await setInput('stopLoss', job.stop_loss ?? '');
+        await setInput('takeProfit', job.take_profit ?? '');
+        const observation = await currentOpenObservation();
+        verifiedForm();
+        const decision = await hooks.intent('open', {
+          symbol: job.symbol, side: job.side, quantity: job.quantity,
+          stop_loss: job.stop_loss, take_profit: job.take_profit ?? null
+        }, observation, attempt < 2);
+        if (decision.refill) {
+          job.stop_loss = decision.stop_loss;
+          job.take_profit = decision.take_profit;
+          job.stop_omitted = decision.stop_omitted;
+          job.remaining_drawdown = decision.remaining_drawdown;
+          core.validateJob(job,config);
+          continue;
+        }
+        return verifiedForm;
+      }
+    }
+    async function openOrder(job) {
+      let verifiedForm;
+      try {
+        verifiedForm = await prepareOpenClick(job);
+      } catch (error) {
+        // An account can become ineligible while the site is sizing the order or rebuilding its form.
+        if (!error.reselect) {
+          try { await hooks.preflight(await currentOpenObservation(),job.quantity); }
+          catch (check) { if (check.reselect) throw check; }
+        }
+        throw error;
+      }
+      assertArmed();
+      if (readyCheck().position_open !== false || (readAccountHealth()?.percent ?? 0) < 25) throw Error('提交前持仓或健康度已变化');
+      click(verifiedForm());
       const filled = await awaitPosition(job, new Set());
       const missing = [[filled.stop_check,job.stop_loss,filled.native_sl_absent],
                        [filled.take_profit_check,job.take_profit,filled.native_tp_absent]]
@@ -1235,6 +1266,7 @@
           current = await openOrder({
             ...job,
             stop_loss:approved.stop_loss,
+            take_profit:approved.take_profit ?? p.take_profit,
             stop_omitted:approved.stop_omitted,
             remaining_drawdown:approved.remaining_drawdown,
             type: 'open',

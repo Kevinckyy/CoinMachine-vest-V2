@@ -23,7 +23,7 @@ async function refresh() {
     readonly: '只读',
     unbound: '未绑定'
   }[state.mode];
-  $('status').textContent = (state.diagnostic || '本机桥 · 127.0.0.1:8877') +
+  $('status').textContent = '插件 '+state.plugin_version+' · '+(state.diagnostic || '本机桥 · 127.0.0.1:8877') +
     (state.cacheCount == null ? '' : ' · 已缓存 '+state.cacheCount+' 个活动账户');
 }
 for (const [id, type, notice] of [

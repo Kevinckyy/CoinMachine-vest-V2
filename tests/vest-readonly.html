@@ -12,6 +12,14 @@
 </section>
 <button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active positions</button>
 <div id="positions"><p>No positions yet</p></div>
+<section data-testid="order-form">
+  <button data-testid="ordertype-tab-market" aria-selected="true">Market</button>
+  <button data-testid="size-unit-select" data-unit="micro">Micro</button><input data-testid="size-input">
+  <button data-testid="tpsl-unit-usd" aria-selected="true">USD</button>
+  <button data-testid="tpsl-limit-switch" aria-checked="false">Limit</button>
+  <input data-testid="tpsl-input-sl"><input data-testid="tpsl-input-tp">
+  <button data-testid="submit-long">Buy</button><button data-testid="submit-short">Sell</button>
+</section>
 <button data-testid="account-tab-positions-history" aria-selected="false" aria-controls="closed">Positions history</button>
 <button data-testid="account-tab-order-history" aria-selected="false" aria-controls="orders">Order history</button>
 <div id="closed" hidden></div><div id="orders" hidden></div>
@@ -19,6 +27,27 @@
 <div id="payouts" hidden></div>
 <script>
   const trigger = document.querySelector('button');
+  const form = document.querySelector('[data-testid="order-form"]');
+  form.hidden = !location.pathname.startsWith('/trade/');
+  const slInput = form.querySelector('[data-testid="tpsl-input-sl"]');
+  slInput.oninput = () => {
+    const equity = sessionStorage.getItem('equityDuringFill');
+    if (equity) {
+      document.querySelector('[data-testid="account-value"]').textContent = equity;
+      sessionStorage.setItem('tradeEquity',equity);
+      sessionStorage.removeItem('equityDuringFill');
+    }
+  };
+  form.querySelector('[data-testid="submit-long"]').onclick = () => {
+    const quantity = Number(form.querySelector('[data-testid="size-input"]').value)*2;
+    const entry = 20000;
+    const stop = entry-Number(slInput.value)/quantity;
+    sessionStorage.setItem('submittedOrders',String(Number(sessionStorage.getItem('submittedOrders'))+1));
+    document.getElementById('positions').innerHTML = '<table><tr><td><a href="/trade/NQ-PERP"><span data-testid="position-symbol-test">NQ</span></a></td>'+
+      '<td data-testid="position-side-test">Long 2x</td><td data-testid="position-entry-test">$'+entry+'</td>'+
+      '<td><p><span data-testid="position-value-test">$40000</span></p><p>'+quantity+' NQ</p></td>'+
+      '<td data-testid="td-tpsl"><span class="text-short">$'+stop+'</span></td></tr></table>';
+  };
   const lossHelp=document.getElementById('lossHelp'), labels=document.getElementById('lossLabels');
   lossHelp.onpointerover=()=>{labels.hidden=false;lossHelp.setAttribute('aria-describedby',labels.id);};
   lossHelp.onpointerout=()=>{labels.hidden=true;lossHelp.removeAttribute('aria-describedby');};

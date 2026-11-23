@@ -29,12 +29,12 @@ class FleetTest(unittest.TestCase):
         self.center = Center(self.root / "center", self.clock, self.transport)
         self.lose_delivery = False
         self.plugin_meta = dict(worker_id="browser", session_id="session-1", generation=1,
-                                mode="execute", label="Browser A", page="/trade/NQ-PERP", strategy_version=1)
+                                mode="execute", label="Browser A", page="/trade/NQ-PERP", strategy_version=1,plugin_version="1.6.0")
         self.addCleanup(self.close)
         for nid in self.nodes:
             self.center.configure_node(nid, dict(url="https://" + nid + ".example", label=nid, token=secrets.token_hex(20)))
             self.center.strategy("config",dict(batch_size=1,order_delay_min=0,order_delay_max=0,
-                                 batch_delay_min=60,batch_delay_max=60,live_default_locked=False),nid)
+                                 batch_delay_min=60,batch_delay_max=60,live_default_locked=False,live_take_profit=15),nid)
             self.report(nid, inventory=[dict(name="Shared", category="eval", phase="1/2"),
                                         dict(name="Only-" + nid, category="eval", phase="1/2"),
                                         dict(name="Main", category="default")])
@@ -355,16 +355,19 @@ class FleetTest(unittest.TestCase):
         obs = {**self.reading("Live"),"category":"funded","phase":"live"}
         self.card_report("east",[live])
         self.report("east",observation=obs)
-        self.center.strategy("config",dict(live_side="buy",live_payout_mode="percent",live_payout_percent=50),"east")
+        self.center.strategy("config",dict(live_side="buy",live_payout_mode="percent",live_payout_percent=50,
+                             live_take_profit_mode="entries",live_first_take_profit=15,live_first_size_percent=25,
+                             live_repeat_take_profit=30,live_repeat_size_percent=75),"east")
         self.start_cards([live])
         self.center.sync("east")
         opened = self.plugin("east","poll")["command"]
         checked = self.plugin("east","preflight",id=opened["id"],observation=obs)
         self.assertTrue(checked["approved"],checked)
-        self.plugin("east","intent",id=opened["id"],stage="open",observation=obs,proof=dict(quantity=2,stop_loss=10))
+        self.assertEqual((opened["params"]["size_percent"],checked["take_profit"]),(25,15))
+        self.plugin("east","intent",id=opened["id"],stage="open",observation=obs,proof=dict(quantity=2,stop_loss=10,take_profit=15))
         filled = {**obs["snapshot"],"position_open":True,"position_id":"live-position","symbol":"NQ-PERP","side":"buy",
                   "quantity":2,"entry_price":1000,"native_sl_price":995,"stop_check":{"status":"verified","target_risk":10},
-                  "take_profit_check":{"status":"omitted"}}
+                  "native_tp_price":1007.5,"take_profit_check":{"status":"verified","target_profit":15}}
         self.plugin("east","result",id=opened["id"],ok=True,result={"observation":{**obs,"snapshot":filled}})
         self.center.sync("east")
         self.time += 1
@@ -384,7 +387,7 @@ class FleetTest(unittest.TestCase):
         self.assertTrue(self.plugin("east","intent",id=claim["id"],stage="withdraw",proof=proof)["authorize_click"])
         self.assertFalse(self.plugin("east","intent",id=claim["id"],stage="withdraw",proof=proof)["authorize_click"])
         self.time += 1
-        after = {**obs,"snapshot":{**flat["snapshot"],"observed_at":self.time,"balance":1010,"equity":1010}}
+        after = {**obs,"snapshot":{**flat["snapshot"],"observed_at":self.time,"balance":1010,"equity":1010,"daily_floor":959.75}}
         res = self.plugin("east","result",id=claim["id"],ok=True,result=dict(observation=after,amount=10,expected_received=8,
                                recipient="main",balance_before=1020,balance_after=1010,verification="source_balance_debited"))
         self.assertEqual(res["status"],"succeeded")
@@ -394,7 +397,8 @@ class FleetTest(unittest.TestCase):
         records = self.center.state("east")["commands"]
         self.assertEqual(len(records),3)
         again, = [c for c in records if c.get("reentry_claim")]
-        self.assertEqual((again["reentry_claim"],again["params"]["side"],again["expected_floor"]["floor"]),(claim["id"],"buy",960))
+        self.assertEqual((again["reentry_claim"],again["params"]["side"],again["expected_floor"]["floor"]),(claim["id"],"buy",959.75))
+        self.assertEqual((again["params"]["size_percent"],again["params"]["take_profit"]),(75,30))
         self.assertEqual(self.center.state("east")["strategy"]["batch"],1)
         self.center.sync("east")
         self.assertEqual(self.plugin("east","poll")["command"]["id"],again["id"])
@@ -504,22 +508,125 @@ class FleetTest(unittest.TestCase):
         with self.assertRaisesRegex(Problem,"先完成"):
             self.plugin("east","intent",**intent)
         self.assertEqual(self.plugin("east","preflight",id=cmd["id"],observation=obs)["stop_loss"],140)
-        with self.assertRaisesRegex(Problem,"实际仓位"):
-            self.plugin("east","intent",**{**intent,"proof":{"quantity":2,"stop_loss":139}})
+        refill = self.plugin("east","intent",**{**intent,"allow_refill":True,"proof":{"quantity":2,"stop_loss":139}})
+        self.assertTrue(refill["refill"])
+        self.assertFalse(refill["authorize_click"])
         snap["equity"] = 9849
-        self.assertFalse(self.plugin("east","intent",**intent)["authorize_click"])
+        correction = self.plugin("east","intent",allow_refill=True,**intent)
+        self.assertEqual((correction["authorize_click"],correction["stop_loss"]),(False,139))
         self.assertEqual(self.nodes["east"].get(cmd["id"])["intents"],{})
         self.center.sync("east")
-        self.assertEqual(self.center.get("dynamic")["status"],"cancelled")
-        self.assertIn("equity",self.center.get("dynamic")["result"]["changed"])
-        self.center.submit("resized",self.req(action="order.open",params=params))
-        self.center.sync("east")
-        cmd = self.plugin("east","poll")["command"]
+        self.assertEqual(self.center.get("dynamic")["status"],"running")
+        self.assertIn("equity",correction["changed"])
         self.assertEqual(self.plugin("east","preflight",id=cmd["id"],observation=obs)["stop_loss"],139)
         intent.update(id=cmd["id"],proof={"quantity":6,"stop_loss":139})
         self.assertTrue(self.plugin("east","intent",**intent)["authorize_click"])
-        proof = self.nodes["east"].get("resized")["intents"]["open"]["proof"]
+        proof = self.nodes["east"].get("dynamic")["intents"]["open"]["proof"]
         self.assertEqual((proof["daily_floor"]["floor"],proof["stop_buffer"]),(9700,10))
+
+    def test_corrected_account_is_locked_until_new_york_cutoff_then_rechecked(self):
+        items = [self.card("Shared")]
+        self.card_report("east",items)
+        self.center.sync("east")
+        params = dict(side="buy",micro=1)
+        self.center.submit("risk-lock",self.req(action="order.open",params=params))
+        self.center.sync("east")
+        cmd = self.plugin("east","poll")["command"]
+        bad = self.reading("Shared")
+        bad["snapshot"]["account_health"] = 10
+        checked = self.plugin("east","preflight",id=cmd["id"],observation=bad)
+        end = checked["open_lock"]["until"]
+        self.assertTrue(checked["reselect"])
+        self.assertEqual(self.nodes["east"].get(cmd["id"])["intents"],{})
+        self.card_report("east",items)
+        self.nodes["east"].db.close()
+        self.nodes["east"] = Bridge(self.root/"east","east",self.clock)
+        self.plugin("east","heartbeat")
+        self.center.sync("east")
+        a = next(a for a in self.center.state("east")["accounts"] if a["name"]=="Shared")
+        self.assertTrue(a["open_locked"])
+        self.assertEqual(a["risk"]["health"],10)
+        with self.assertRaisesRegex(Problem,"锁定"):
+            self.center.submit("too-early",self.req(action="order.open",params=params))
+        self.observe("east","Shared")
+        self.center.sync("east")
+        with self.assertRaisesRegex(Problem,"锁定"):
+            self.center.submit("recovered-before-cutoff",self.req(action="order.open",params=params))
+        self.report("east",observation=bad)
+        self.time = end+1
+        self.card_report("east",items)
+        self.center.sync("east")
+        self.center.submit("new-day",self.req(action="order.open",params=params))
+        self.center.sync("east")
+        self.assertEqual(self.plugin("east","poll")["command"]["id"],"new-day")
+        seen = self.reading("Shared")
+        seen["snapshot"]["daily_floor"] = 956.25
+        check = self.plugin("east","preflight",id="new-day",observation=seen)
+        self.assertTrue(check["approved"])
+        self.assertEqual((check["stop_loss"],check["open_lock"]),(23.75,None))
+
+    def test_live_ratio_uses_current_floor_and_minimum_for_both_stop_modes(self):
+        card = self.card("Live",phase="live",category="funded")
+        self.card_report("east",[card])
+        obs = {**self.reading("Live"),"category":"funded","phase":"live"}
+        self.report("east",observation=obs)
+        self.center.sync("east")
+        params = dict(side="buy",micro=1,reward_ratio=2,min_take_profit=50,omit_stop_below=30)
+        self.center.submit("ratio",self.req(name="Live",action="order.open",params=params))
+        self.center.sync("east")
+        self.plugin("east","poll")
+        def check():
+            return self.plugin("east","preflight",id="ratio",observation=obs)
+        first = check()
+        self.assertEqual((first["stop_loss"],first["take_profit"]),(10,50))
+        obs["snapshot"]["daily_floor"] = 974
+        updated = check()
+        self.assertEqual((updated["stop_loss"],updated["take_profit"]),(None,52))
+        self.assertIn("daily_floor",updated["changed"])
+        obs["snapshot"].pop("daily_floor")
+        missing = check()
+        self.assertTrue(missing["reselect"])
+        self.assertIn("爆仓线",missing["open_lock"]["reason"])
+        self.assertFalse(self.nodes["east"].get("ratio")["intents"])
+
+    def test_phase_two_size_and_migrated_take_profit_defaults(self):
+        self.center.strategy("config",dict(size_percent=25,phase2_size_percent=75),"east")
+        self.start_cards([self.card("Second",phase="2/2")])
+        cmd, = self.center.state("east")["commands"]
+        self.assertEqual(cmd["params"]["size_percent"],75)
+        self.assertNotIn("take_profit",cmd["params"])
+        old = {**strategy_config.DEFAULT_CONFIG,"size_percent":50,"live_size_percent":100,"live_take_profit":30,"take_profit":14}
+        for k in ("phase2_size_percent","live_first_size_percent","live_repeat_size_percent","live_take_profit_mode"):
+            old.pop(k)
+        cfg = strategy_config.migrate(old)
+        self.assertEqual((cfg["phase2_size_percent"],cfg["live_first_size_percent"],cfg["live_repeat_size_percent"]),(50,100,100))
+        self.assertEqual((cfg["live_take_profit_mode"],cfg["live_take_profit"],cfg["live_reward_ratio"]),("fixed",30,1))
+        self.assertNotIn("take_profit",cfg)
+
+    def test_entry_tiers_only_use_confirmed_openings_of_that_account_and_day(self):
+        req = self.req(action="order.open",params=dict(side="buy",micro=1))
+        self.center.submit("unfilled",req)
+        self.center.cancel("unfilled")
+        with self.center.db.tx() as db:
+            a = self.center._inventory(db,"east")[2]["east","browser","Shared"]
+            self.assertFalse(self.center._opened_today(db,a))
+            for name in ("Other","Shared"):
+                ledger.save(db,("east","browser",name),"position","p-"+name,
+                            {"phase":"live","history":True,"opened_at":self.time-10,"closed_at":self.time})
+                self.assertEqual(self.center._opened_today(db,a),name=="Shared")
+            self.time = daily_floor.entry_day_window(self.time)["end"]
+            self.assertFalse(self.center._opened_today(db,a))
+
+    def test_plugin_version_reporting_and_old_clients(self):
+        for actual,status in (("1.5.1","behind"),("1.6.0","current"),("1.10.0","ahead"),("","unknown")):
+            self.plugin("east","heartbeat",plugin_version=actual)
+            self.center.sync("east")
+            state = self.center.state("east")
+            worker = state["workers"][0]
+            self.assertEqual((state["plugin_version"],worker["plugin_version"],worker["version_status"]),("1.6.0",actual,status))
+            self.assertEqual(worker["supports_open_policy"],status in ("current","ahead"))
+        with self.assertRaisesRegex(Problem,"插件版本号"):
+            self.plugin("east","heartbeat",plugin_version="invalid")
 
     def test_floor_reset_with_dst_gross_debits_and_duplicate_history(self):
         at = datetime.fromisoformat("2026-11-01T14:00:00+00:00").timestamp()
@@ -542,20 +649,21 @@ class FleetTest(unittest.TestCase):
             for _ in range(2):
                 payout("platform-a",40,at-605,at-590)
                 payout("external",15,at-150,at-120)
+            self.assertIsNone(level()["floor"])
             daily_floor.capture(db,*route[1:],at,300,10000,9605)
             self.assertEqual((level()["gross_withdrawn"],level()["floor"]),(95,9605))
             reset = day["end"]
             self.assertIsNone(level(reset))
             daily_floor.capture(db,*route[1:],reset,297,9900)
             payout("settled-later",40,at-401,reset+90)
-            self.assertEqual((level(reset+90)["gross_withdrawn"],level(reset+90)["floor"]),(0,9603))
+            self.assertEqual((level(reset+90)["gross_withdrawn"],level(reset+90)["floor"]),(0,None))
             spring = datetime.fromisoformat("2026-03-08T14:00:00+00:00").timestamp()
             daily_floor.capture(db,*route[1:],spring,platform=9700)
             self.assertEqual(level(spring)["end"]-level(spring)["start"],23*3600)
             daily_floor.capture(db,*route[1:],spring+10,allowance=299.99)
             self.assertEqual((level(spring)["source"],level(spring)["floor"]),("platform",9700))
             daily_floor.capture(db,*route[1:],spring+15,allowance=200,reset=10000)
-            self.assertFalse(level(spring)["verified"])
+            self.assertEqual((level(spring+15)["verified"],level(spring+15)["floor"]),(True,9700))
 
     def test_card_close_schedules_one_targeted_history_read(self):
         items = [self.card("Shared",active_positions=1)]

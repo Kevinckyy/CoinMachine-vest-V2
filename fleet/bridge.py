@@ -6,8 +6,9 @@ import uuid
 from . import cards, daily_floor, ledger, portfolio, reporting, strategy_payout, updates
 
 from .protocol import (PHASES, PORTFOLIO_SCAN, PRIMARY, RUN_TTL, TERMINAL, WRITE, Problem, boolean, choice,
-                       dump, ident, make_command, number, obj, request, require, string, validate_target)
+                       dump, ident, make_command, number, obj, plugin_version_parts, request, require, string, validate_target)
 from .storage import Database, check_reservations, command, find_command, finish, insert, record
+from .trading_day import entry_day_window
 
 
 def worker_view(row):
@@ -18,7 +19,7 @@ def account_view(row):
     if not row:
         return None
     return {**{k: row[k] for k in row.keys() if k != "tracked_position"}, "snapshot": json.loads(row["snapshot"]),
-            **{k:json.loads(row[k]) if row[k] else None for k in ("card","risk","portfolio")},
+            **{k:json.loads(row[k]) if row[k] else None for k in ("card","risk","portfolio","open_lock")},
             **{key: bool(row[key]) for key in ("present", "ambiguous", "excluded")}}
 
 
@@ -47,9 +48,16 @@ def verify_financial_receipt(cmd, result):
         for key, report in (("stop_loss", "stop_check"), ("take_profit", "take_profit_check")):
             if action == "order.open" or key in params:
                 omitted = key=="stop_loss" and action=="order.open" and proof.get("stop_omitted") is True
-                expected = "verified" if params.get(key) is not None or key=="stop_loss" and action=="order.open" and not omitted else "omitted"
+                target_amount = proof.get(key, params.get(key)) if action=="order.open" else params.get(key)
+                expected = "verified" if target_amount is not None or key=="stop_loss" and action=="order.open" and not omitted else "omitted"
                 require(isinstance(snap.get(report), dict) and snap[report].get("status") == expected,
                         "回执未核验原生止盈止损")
+                if action=="order.open" and key=="take_profit" and target_amount is not None:
+                    require(snap[report].get("target_profit")==target_amount, "回执止盈与开仓许可金额不符")
+                    if params.get("min_take_profit"):
+                        trigger = number(snap.get("native_tp_price"),"原生止盈触发价",0.000001,1e12)
+                        gross = (trigger-snap["entry_price"])*(1 if params["side"]=="buy" else -1)*proof["quantity"]
+                        require(gross+1e-6 >= params["min_take_profit"],"原生止盈低于设置的最低止盈金额")
                 if omitted:
                     require(proof.get("stop_loss") is None and params.get("omit_stop_below") is not None and
                             0 < proof["remaining_drawdown"] < params["omit_stop_below"] and snap.get("native_sl_absent") is True
@@ -105,6 +113,8 @@ class Bridge:
                 db.execute("ALTER TABLE worker_build ADD COLUMN portfolio_version INTEGER NOT NULL DEFAULT 0")
             if "strategy_version" not in {r["name"] for r in db.execute("PRAGMA table_info(worker_build)")}:
                 db.execute("ALTER TABLE worker_build ADD COLUMN strategy_version INTEGER NOT NULL DEFAULT 0")
+            if "plugin_version" not in {r["name"] for r in db.execute("PRAGMA table_info(worker_build)")}:
+                db.execute("ALTER TABLE worker_build ADD COLUMN plugin_version TEXT NOT NULL DEFAULT ''")
             cols = {r["name"] for r in db.execute("PRAGMA table_info(accounts)")}
             for col in ("listed_session", "read_session", "tracked_position"):
                 if col not in cols:
@@ -146,7 +156,7 @@ class Bridge:
             self._expire(db, self.clock())
             workers = []
             for row in db.execute("""SELECT w.*,COALESCE(b.release,'') AS release,COALESCE(b.portfolio_version,0) AS portfolio_version,
-                    COALESCE(b.strategy_version,0) AS strategy_version,c.session AS card_session,
+                    COALESCE(b.strategy_version,0) AS strategy_version,COALESCE(b.plugin_version,'') AS plugin_version,c.session AS card_session,
                     c.generation AS card_generation,c.full_at AS cards_full_at FROM workers w
                     LEFT JOIN worker_build b ON b.worker_id=w.worker_id LEFT JOIN card_sync c ON c.worker=w.worker_id ORDER BY label"""):
                 scan = db.execute("""SELECT id,status,error, json_extract(result,'$.stage') AS stage,
@@ -155,7 +165,7 @@ class Bridge:
                         FROM commands WHERE worker=? AND action=? ORDER BY created DESC,id DESC LIMIT 1""",
                                   (row["worker_id"], PORTFOLIO_SCAN)).fetchone()
                 workers.append({**worker_view(row), "portfolio_scan": dict(scan) if scan else None})
-            return {"version": 1, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
+            return {"version": 1, "open_policy_version":2, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
                     "launch_id": self.launch_id,
                     "ledger_seq": db.execute("SELECT COALESCE(MAX(seq),0) FROM book").fetchone()[0],
                     "log_seq": db.execute("SELECT COALESCE(MAX(id),0) FROM node_logs").fetchone()[0],
@@ -276,10 +286,12 @@ class Bridge:
         build = body.get("release", "")
         if build != "":
             updates.revision(build)
-        db.execute("""INSERT INTO worker_build(worker_id,release,portfolio_version,strategy_version) VALUES(?,?,?,?) ON CONFLICT(worker_id) DO UPDATE
-                   SET release=excluded.release,portfolio_version=excluded.portfolio_version,strategy_version=excluded.strategy_version
-                   WHERE release!=excluded.release OR portfolio_version!=excluded.portfolio_version OR strategy_version!=excluded.strategy_version""",
-                   (wid,build,int(body.get("portfolio_version") == 1),int(body.get("strategy_version") == 1)))
+        version = body.get("plugin_version","")
+        require(version=="" or plugin_version_parts(version),"插件版本号无效")
+        db.execute("""INSERT INTO worker_build(worker_id,release,portfolio_version,strategy_version,plugin_version) VALUES(?,?,?,?,?) ON CONFLICT(worker_id) DO UPDATE
+                   SET release=excluded.release,portfolio_version=excluded.portfolio_version,strategy_version=excluded.strategy_version,plugin_version=excluded.plugin_version
+                   WHERE release!=excluded.release OR portfolio_version!=excluded.portfolio_version OR strategy_version!=excluded.strategy_version OR plugin_version!=excluded.plugin_version""",
+                   (wid,build,int(body.get("portfolio_version") == 1),int(body.get("strategy_version") == 1),version))
         if not row or row["session_id"] != sid or row["error"] != error:
             message = error or ("浏览器已连接 · 执行模式" if mode == "execute" else "浏览器已连接 · 只读模式")
             reporting.log(db, self.node_id, now, "browser", message, "warning" if error else "info", worker=wid)
@@ -308,7 +320,7 @@ class Bridge:
                 read_session=CASE WHEN excluded.phase IS NOT NULL AND excluded.phase IS NOT accounts.phase THEN NULL ELSE accounts.read_session END,
                 phase=COALESCE(excluded.phase,accounts.phase)""", (wid, name, category, phase, dup, excluded, sid))
 
-    def _observe(self, db, wid, data, now):
+    def _observe(self, db, wid, data, now, *, preflight=False):
         data = obj(data)
         name = string(data.get("name"), "账户名")
         row = db.execute("SELECT * FROM accounts WHERE worker_id=? AND name=?", (wid, name)).fetchone()
@@ -362,10 +374,18 @@ class Bridge:
             tracked_position=?,excluded=MAX(excluded,?) WHERE worker_id=? AND name=?""",
             (dump(snap), category, phase, observed, dump(tracked) if tracked else None, category.lower() in PRIMARY, wid, name))
         risk = cards.from_trade(snap)
-        db.execute("UPDATE accounts SET risk=?,risk_at=? WHERE worker_id=? AND name=?",
-                   (dump(risk),observed,wid,name))
         daily_floor.capture(db,wid,name,observed,risk["daily_limit"],
                             snap.get("daily_reset_equity"),snap.get("daily_floor"))
+        if not preflight:
+            previous = json.loads(row["risk"] or "{}")
+            for field in cards.AMOUNTS:
+                if risk[field] is None and not (risk["daily_unlimited"] and field in ("daily_loss","daily_limit")):
+                    risk[field] = previous.get(field)
+            if "daily_unlimited" not in snap and "daily_unlimited" in previous:
+                risk["daily_unlimited"] = previous["daily_unlimited"]
+        db.execute("UPDATE accounts SET risk=?,risk_at=? WHERE worker_id=? AND name=?",
+                   (dump(risk),observed,wid,name))
+        return {"risk":risk,"daily_floor":daily_floor.view(db,wid,name,now)}
 
     def plugin(self, op, body):
         now = self.clock()
@@ -407,8 +427,7 @@ class Bridge:
                     return portfolio.observe(db, wid, sid, body["portfolio"], now)
                 if "inventory" in body:
                     self._inventory(db, wid, sid, body["inventory"])
-                if "observation" in body:
-                    self._observe(db, wid, body["observation"], now)
+                observed = self._observe(db, wid, body["observation"], now) if "observation" in body else None
                 if "history" in body:
                     history = obj(body["history"])
                     name = string(history.get("name"), "历史账户")
@@ -416,7 +435,7 @@ class Bridge:
                                        AND ambiguous=0 AND listed_session=? AND read_session=?""",
                                        (wid, name, sid, sid)).fetchone(), "历史与当前浏览器账户不匹配", 409)
                     ledger.native_rows(db, (self.node_id, wid, name), history)
-                return {"ok": True}
+                return {"ok": True, **(observed or {})}
             if op == "intent":
                 return self._intent(db, wid, sid, body, now)
             if op == "preflight":
@@ -444,6 +463,8 @@ class Bridge:
                 try:
                     validate_target(cmd, *target(db, cmd), now)
                     check_reservations(db, cmd, now)
+                    if cmd["action"]=="order.open":
+                        require(plugin_version_parts(body.get("plugin_version")) >= (1,6,0,0), "开仓前请重新加载 1.6.0 或更高版本插件",409)
                     if "omit_stop_below" in cmd["params"] or cmd.get("strategy_payout") or cmd.get("reentry_claim"):
                         require(body.get("strategy_version") == 1, "请重新加载 1.5.0 或更高版本插件", 409)
                     if cmd.get("strategy_payout"):
@@ -470,45 +491,74 @@ class Bridge:
         obs = obj(body.get("observation"))
         require(obs.get("name")==cmd["account"],"核对的账户不符",409)
         snap = obj(obs.get("snapshot"))
-        number(snap.get("observed_at"),"交易页核对时间",max(cmd["claimed_at"]-1,now-15),now+5)
+        day = entry_day_window(now)
+        number(snap.get("observed_at"),"交易页核对时间",max(cmd["claimed_at"]-1,now-15,day["start"]),min(now+5,day["end"]))
         risk = cards.from_trade(snap)
         _, account = target(db,cmd)
         expected = cmd.get("expected_risk",{})
         require(account and account["present"] and not account["ambiguous"],"账户已消失或名称不唯一",409)
         require(snap["observed_at"] >= (account["risk_at"] or 0),"过期的交易页风控读数",409)
         card_id = (account["card"] or {}).get("id")
+        if expected.get("card_id") != card_id:
+            reason = "候选账户卡片身份已更换"
+            result = {"reselect":True,"changed":["card_id"],"reason":reason}
+            finish(db,cmd["id"],"cancelled",now,reason,result)
+            return {**result,"approved":False}
         actual = {**risk,"phase":obs.get("phase"),"category":obs.get("category"),"card_id":card_id}
         current = {**(account["risk"] or {}),"phase":account["phase"],"category":account["category"],"card_id":card_id}
-        changed = sorted(k for k in actual if expected.get(k)!=actual[k] or current.get(k)!=expected.get(k))
+        changed = sorted(k for k in actual if current.get(k)!=actual[k])
+        old_floor = daily_floor.view(db,wid,cmd["account"],now)
         issue = cards.risk_error(risk, complete=True)
-        if not actual["phase"] or actual["category"] not in ("eval","funded","live"):
+        if account["excluded"] or not actual["phase"] or actual["category"] not in ("eval","funded","live"):
             issue = "交易页未确认可交易账户类别和阶段"
-        self._observe(db,wid,obs,now)
+        self._observe(db,wid,obs,now,preflight=True)
         db.execute("UPDATE accounts SET preflight_at=? WHERE worker_id=? AND name=?",(now,wid,cmd["account"]))
         floor = daily_floor.view(db,wid,cmd["account"],now)
-        floor_key = {k:(floor or {}).get(k) for k in ("start","floor","verified")}
-        if cmd.get("expected_floor")!=floor_key:
+        if (old_floor or {}).get("floor") != (floor or {}).get("floor"):
             changed.append("daily_floor")
         remaining, amount, omit = daily_floor.stop_decision(risk["equity"],floor,cmd["params"])
         qty = body.get("quantity") if body.get("stage")!="open" else obj(body.get("proof",{})).get("quantity")
+        if qty is None and "micro" in cmd["params"]:
+            qty = cmd["params"]["micro"]*2
         min_stop = number(qty,"实际 Vest 数量",0.000001,1e12)*0.25 if qty is not None else None
-        if "stop_buffer" not in cmd["params"]:
-            issue = "旧版固定止损指令需要重新决策"
-        elif remaining is None:
-            issue = "等待核对美东 20:00 净值或平台当日爆仓线"
+        if snap.get("daily_floor") is None or remaining is None:
+            issue = issue or "交易页未读到本交易日的爆仓线"
         elif not omit and amount<=0:
-            issue = "净值至爆仓线的余量不足以保留止损缓冲"
+            issue = issue or "净值至爆仓线的余量不足以保留止损缓冲"
         elif not omit and min_stop is not None and amount<min_stop:
-            issue = "止损余量不足当前仓位的一个价格跳动"
+            issue = issue or "止损余量不足当前仓位的一个价格跳动"
             risk["size_minimum"] = {"size_percent":cmd["params"].get("size_percent"),"minimum":min_stop}
             db.execute("UPDATE accounts SET risk=? WHERE worker_id=? AND name=?",(dump(risk),wid,cmd["account"]))
-        if changed or issue:
-            reason = issue or "交易页读数与候选快照不符"
-            finish(db,cmd["id"],"cancelled",now,reason,{"reselect":True,"changed":changed,"risk":actual,
-                   "observed_at":snap["observed_at"]})
-            return {"approved":False,"reselect":True,"reason":reason,"risk":actual}
+        lock = account.get("open_lock")
+        reason = ""
+        if lock and now < lock["until"]:
+            reason = lock["reason"]
+        elif issue:
+            lock = {"until":day["end"],"reason":issue,"card_id":card_id}
+            db.execute("UPDATE accounts SET open_lock=? WHERE worker_id=? AND name=?",(dump(lock),wid,cmd["account"]))
+            reason = issue
+        elif cmd["phase"] != actual["phase"]:
+            reason = "账户阶段已更新，重新选择适用的策略参数"
+        elif "stop_buffer" not in cmd["params"] or cmd["phase"] != "live" and (cmd["params"].get("take_profit") is not None or "reward_ratio" in cmd["params"]):
+            reason = "原指令保护参数不适用于当前账户，需重新决策"
+        if not reason and lock:
+            db.execute("UPDATE accounts SET open_lock=NULL WHERE worker_id=? AND name=?",(wid,cmd["account"]))
+            lock = None
+        profit = None
+        if not reason:
+            profit = daily_floor.take_profit(cmd["params"],remaining if omit else amount)
+            if profit is not None and profit<=0:
+                reason = "盈亏比计算的止盈金额不足一美分"
+        result = {"risk":actual,"changed":changed,"daily_floor":floor,"open_lock":lock,"observed_at":snap["observed_at"]}
+        if reason:
+            result.update(approved=False,reselect=True,reason=reason)
+            finish(db,cmd["id"],"cancelled",now,reason,result)
+            return result
+        if changed:
+            reporting.log(db,self.node_id,now,"preflight","交易页已更正缓存并通过开仓核对 · "+", ".join(changed),
+                          worker=wid,account=cmd["account"],command_id=cmd["id"])
         db.execute("INSERT OR REPLACE INTO open_preflight VALUES(?,?,?)",(cmd["id"],sid,now))
-        return {"approved":True,"risk":actual,"stop_loss":amount,"daily_floor":floor,"stop_omitted":omit,"remaining_drawdown":remaining}
+        return {**result,"approved":True,"stop_loss":amount,"take_profit":profit,"stop_omitted":omit,"remaining_drawdown":remaining}
 
     def _intent(self, db, wid, sid, body, now):
         row = command(db, ident(body.get("id")))
@@ -528,10 +578,13 @@ class Bridge:
             if not checked["approved"]:
                 return {**checked,"authorize_click":False}
             proof = obj(body.get("proof"))
-            qty = number(proof.get("quantity"),"实际 Vest 数量",0.000001,1e12)
-            require("stop_loss" in proof and proof["stop_loss"]==checked["stop_loss"] and
-                    (checked["stop_omitted"] or checked["stop_loss"]>=qty*0.25),
-                    "止损输入与可用净值或实际仓位不符",409)
+            number(proof.get("quantity"),"实际 Vest 数量",0.000001,1e12)
+            if "stop_loss" not in proof or proof["stop_loss"]!=checked["stop_loss"] or proof.get("take_profit")!=checked["take_profit"]:
+                if body.get("allow_refill") is True:
+                    return {**checked,"authorize_click":False,"refill":True}
+                reason = "最新保护金额与表单不同，重新核对后再下单"
+                finish(db,cmd["id"],"cancelled",now,reason,{**checked,"approved":False,"reselect":True})
+                return {**checked,"approved":False,"authorize_click":False,"reselect":True,"reason":reason}
             proof["daily_floor"] = checked["daily_floor"]
             proof["stop_buffer"] = cmd["params"]["stop_buffer"]
             proof["stop_omitted"] = checked["stop_omitted"]
@@ -552,7 +605,7 @@ class Bridge:
         db.execute("UPDATE commands SET intents=?,updated=? WHERE id=?", (dump(intents), now, row["id"]))
         reporting.log(db, self.node_id, now, "intent", "签发单次操作许可 · " + stage, worker=wid,
                       account=cmd["account"], command_id=cmd["id"])
-        return {"authorize_click": True}
+        return {**(checked if stage=="open" else {}),"authorize_click": True}
 
     def _result(self, db, body, now):
         row = command(db, ident(body.get("id")))

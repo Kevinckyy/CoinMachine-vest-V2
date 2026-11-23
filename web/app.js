@@ -264,6 +264,9 @@ function positionCount(a) {
   if (a.card && (a.card_at || 0) >= (a.observed_at || 0)) return a.card.active_positions;
   return a.snapshot.position_open === true ? 1 : a.snapshot.position_open === false ? 0 : null;
 }
+function openLockDetail(a) {
+  return a.open_locked ? '<small>'+esc(a.open_lock.reason)+' · '+time(a.open_lock.until)+' 后重新核验</small>' : '';
+}
 function positions(accounts) {
   const rows = accounts.filter(a => a.present && positionCount(a)>0).map(a => {
     const s = a.snapshot;
@@ -293,7 +296,10 @@ function overview() {
 function nodesView() {
   const version = sha => sha ? '<code title="' + esc(sha) + '">' + esc(sha.slice(0,12)) + '</code>' : '—';
   const rows = state.nodes.map(n => `<tr><td class="cell"><strong>${esc(n.label)}</strong><small>${esc(n.id)}</small></td><td>${tag(n.online ? '在线' : '离线', n.online ? 'good' : '')}<small class="record-note"> ${esc([n.error,n.history_error,n.log_error].filter(Boolean).join(' · '))}</small></td><td class="num">${esc(n.url)}</td><td class="num">${time(n.last_seen)}</td><td><div class="actions">${btn('nodeAccounts', '账户', 'link', n.id)}${btn('nodeStrategy', '策略', 'link', n.id)}${btn('nodeLogs', '日志', 'link', n.id)}${btn('editNode', '编辑', 'link', n.id)}</div></td></tr>`);
-  const workers = state.workers.map(w => `<tr><td class="cell"><strong>${esc(w.label)}</strong><small>${esc(nodeLabel(w.node_id))}</small></td><td>${tag(w.online ? '在线' : '离线', w.online ? 'good' : '')}</td><td>${tag(w.mode === 'execute' ? '执行' : '只读', w.mode === 'execute' ? 'info' : '')}</td><td>${esc(w.page) || '—'}<small> ${esc(w.error)}</small></td><td>${version(w.release)}</td><td class="num">${time(w.last_seen)}</td><td>${btn('workerCmd', '下达指令', 'link', JSON.stringify([w.node_id, w.worker_id]))}</td></tr>`);
+  const workers = state.workers.map(w => {
+    const comparison = {current:'与中心一致',behind:'待更新',ahead:'高于中心版本',unknown:'待确认'}[w.version_status] || '待确认';
+    return `<tr><td class="cell"><strong>${esc(w.label)}</strong><small>${esc(nodeLabel(w.node_id))}</small></td><td>${tag(w.online ? '在线' : '离线', w.online ? 'good' : '')}</td><td>${tag(w.mode === 'execute' ? '执行' : '只读', w.mode === 'execute' ? 'info' : '')}</td><td>${esc(w.page) || '—'}<small> ${esc(w.error)}</small></td><td class="cell">${esc(w.plugin_version || '未上报')} · ${comparison}<small>中心版本 ${esc(state.plugin_version || '未知')}${w.release ? ' · '+version(w.release) : ''}</small></td><td class="num">${time(w.last_seen)}</td><td>${btn('workerCmd', '下达指令', 'link', JSON.stringify([w.node_id, w.worker_id]))}</td></tr>`;
+  });
   const releases = state.nodes.map(n => {
     const job = n.update;
     const agent = n.agent_seen ? '上次联系 ' + time(n.agent_seen) : '等待首次接入';
@@ -319,8 +325,8 @@ function renderAccounts() {
       <td>${tag(status,a.fresh && a.enabled ? 'good':'')} <small>${esc(a.phase || '')}</small></td>
       <td>${pnl}</td><td>${positionCount(a) ?? '—'}</td>
       <td>${risk.daily_unlimited ? '无限额' : money(risk.daily_loss)+' / '+money(risk.daily_limit)}</td><td>${money(risk.drawdown)} / ${money(risk.drawdown_limit)}</td>
-      <td>${money(risk.equity)}</td><td class="cell">${money(a.daily_floor?.floor)}<small>${esc(({reset:'20:00 净值已核验',platform:'平台底线已核验',estimate:'按日损额度估算',conflict:'日损基准待核对'})[a.daily_floor?.source] || '')}</small></td>
-      <td>${risk.health == null ? '—' : esc(risk.health)+'%'}</td><td>${a.candidate ? '可候选' : a.in_pool ? '入池待选' : '—'}</td>
+      <td>${money(risk.equity)}</td><td class="cell">${money(a.daily_floor?.floor)}<small>${a.daily_floor?.source === 'platform' ? '页面已读取' : '等待页面读取'}</small></td>
+      <td>${risk.health == null ? '—' : esc(risk.health)+'%'}</td><td class="cell">${a.open_locked ? '开仓风控锁定' : a.candidate ? '可候选' : a.in_pool ? '入池待选' : '—'}${openLockDetail(a)}</td>
       <td class="cell">${time(Math.max(a.card_at || 0,a.observed_at || 0,a.portfolio?.observed_at || 0))}${a.portfolio ? '<small>详情 '+time(a.portfolio.observed_at)+(a.portfolio.missing.length ? ' · 字段不全' : '')+'</small>' : ''}</td><td><div class="actions">${btn('account','管理','link',key)}${btn('accountCmd','指令','link',key)}</div></td></tr>`;
   });
   const node = state.nodes.find(n=>n.id===selectedNode);
@@ -448,10 +454,10 @@ function commandForm(initial = []) {
     const a = state.accounts.find(a => a.node_id === f.node.value && a.worker_id === f.worker.value && a.name === f.account?.value);
     let body = '';
     const amount = (k, label, v = '', required = false, step = 'any') => input(k, label, v, 'number', 'min="0.000001" step="' + step + '" ' + (required ? 'required' : ''));
-    if (action === 'order.open') body = grid(select('side', '市价方向', option('buy', '做多') + option('sell', '做空')) + input('micro', 'Micro 合约数', 1, 'number', 'min="1" step="1" required') + stopBufferInput(state.strategies.find(s => s.node_id===f.node.value)?.config.stop_buffer ?? 20) + amount('take_profit', '止盈金额 · USDC（可选）'));
+    if (action === 'order.open') body = grid(select('side', '市价方向', option('buy', '做多') + option('sell', '做空')) + input('micro', 'Micro 合约数', 1, 'number', 'min="1" step="1" required') + stopBufferInput(state.strategies.find(s => s.node_id===f.node.value)?.config[a?.phase==='live' ? 'live_stop_buffer' : 'stop_buffer'] ?? 20) + (a?.phase==='live' ? amount('take_profit', '止盈金额 · USDC（可选）') : ''));
     if (['order.close', 'position.protect'].includes(action)) {
       body = input('position_id', '目标持仓 ID', a?.snapshot.position_id || '', 'text', 'required readonly placeholder="请先刷新该账户的持仓"');
-      if (action === 'position.protect') body += '<p class="form-note">填写需要修改的保护金额，留空的项目保留原值。</p>' + grid(amount('stop_loss', '止损金额 · USDC') + amount('take_profit', '止盈金额 · USDC'));
+      if (action === 'position.protect') body += '<p class="form-note">填写需要修改的保护金额，留空的项目保留原值。</p>' + grid(amount('stop_loss', '止损金额 · USDC') + (a?.phase==='live' ? amount('take_profit', '止盈金额 · USDC') : ''));
     }
     if (action === 'profit.withdraw') body = amount('amount', '领取金额 · USDC', '', true) + '<p class="form-note">由当前 Live 账户领取利润，收款对象为平台主账户。</p>';
     if (action === 'page.navigate') body = select('destination', '目标页面', option('accounts', '活动账户') + option('trade', 'NQ 交易页') + option('portfolio', '持仓 / Portfolio'));

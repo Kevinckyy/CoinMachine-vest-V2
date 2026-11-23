@@ -52,9 +52,9 @@ function strategyDetail(node) {
   const accounts = state.accounts.filter(a => a.node_id === node.id && a.present);
   const pool = accounts.filter(a => a.in_pool);
   const queue = (s.planned || []).map(item => item.ref);
-  const olderWorkers = state.workers.filter(w => w.node_id === node.id && w.online && w.mode === 'execute' && w.strategy_version !== 1);
+  const olderWorkers = state.workers.filter(w => w.node_id === node.id && w.online && w.mode === 'execute' && !w.supports_open_policy);
   const versionNote = olderWorkers.length ? '<p class="form-note">'+esc(olderWorkers.map(w => w.label).join('、'))+
-    ' 需要更新节点桥并加载 1.5.0 或更高版本插件，才能执行 Live 策略和免止损规则。</p>' : '';
+    ' 需要更新节点桥并加载 1.6.0 或更高版本插件，才能执行页面爆仓线与止盈核验。</p>' : '';
   const controls = '<div class="buttons">'+strategyControls(node,s)+'</div>';
   const summary = '<div class="panel-body"><div class="row"><h3>'+esc(poolNames[c.pool_strategy])+'</h3>'+strategyStatus(node,s)+'</div>'+
     '<div class="summary"><div><small>批次</small><strong>'+s.batch+'</strong></div><div><small>每批账户</small><strong>'+c.batch_size+'</strong></div>'+
@@ -63,10 +63,10 @@ function strategyDetail(node) {
     '<p class="strategy-line">'+esc(s.message)+'</p>'+(queue.length ? '<p>等待下单 · '+queue.map(esc).join('、')+'</p>' : '')+versionNote+'</div>';
   function accountRow(a) {
     const risk = a.risk || {};
-    const status = a.candidate ? '可候选' : a.in_pool ? '入池待选' : a.live_default_locked ? 'Live 默认锁定' :
+    const status = a.open_locked ? '开仓风控锁定' : a.candidate ? '可候选' : a.in_pool ? '入池待选' : a.live_default_locked ? 'Live 默认锁定' :
       a.ambiguous ? '同名待确认' : a.excluded ? '主账户' : !a.enabled ? '已停用' : '未入池';
     return '<tr><td class="cell"><strong>'+esc(a.alias || a.name)+'</strong><small>'+esc((a.alias ? a.name+' · ' : '')+workerLabel(node.id,a.worker_id))+'</small></td>'+
-      '<td>'+esc(stageNames[a.phase] || '待确认')+'</td><td>'+tag(status,a.candidate ? 'good' : '')+'</td>'+
+      '<td>'+esc(stageNames[a.phase] || '待确认')+'</td><td class="cell">'+tag(status,a.open_locked ? 'warn' : a.candidate ? 'good' : '')+openLockDetail(a)+'</td>'+
       '<td>'+money(risk.equity)+'</td><td>'+(risk.health == null ? '—' : esc(risk.health)+'%')+'</td>'+
       '<td>'+money(risk.daily_loss)+' / '+money(risk.daily_limit)+'</td><td>'+money(risk.drawdown)+' / '+money(risk.drawdown_limit)+'</td>'+
       '<td>'+money(a.daily_floor?.floor)+'</td><td>'+(positionCount(a) ?? '—')+'</td><td>'+btn('account','管理','link',addressKey(a))+'</td></tr>';
@@ -107,8 +107,10 @@ function strategyFields(c) {
   const orders = [['live','2/2','1/2'],['live','1/2','2/2'],['2/2','live','1/2'],['2/2','1/2','live'],['1/2','live','2/2'],['1/2','2/2','live']];
   const limit = (key,label) => input(key,label,c[key] === 'infinity' ? '∞' : c[key],'text',
     'required pattern="(?:∞|infinity|[1-9][0-9]{0,5}|1000000)" title="填写 1 到 1000000 的整数，或填 ∞ 表示不限"');
-  const phase = prefix => choices(prefix+'side','方向',dir)+choices(prefix+'size_percent','仓位比例',{25:'25%',50:'50%',75:'75%',100:'100%'})+
-    numeric(prefix+'stop_buffer','爆仓线上方缓冲 M · USD',0,'any')+numeric(prefix+'take_profit','止盈 · USD（可留空）',.000001,'any','',true)+
+  const size = (key,label) => choices(key,label,{25:'25%',50:'50%',75:'75%',100:'100%'});
+  const phase = prefix => choices(prefix+'side','方向',dir)+(prefix ? size('live_size_percent','仓位比例') :
+    size('size_percent','考核 1/2 仓位比例')+size('phase2_size_percent','考核 2/2 仓位比例'))+
+    numeric(prefix+'stop_buffer','爆仓线上方缓冲 M · USD',0,'any')+
     flag(prefix+'skip_stop_loss_on_low_drawdown','剩余额度低于阈值时免设止损')+numeric(prefix+'drawdown_stop_loss_threshold','免止损阈值 · USD',.000001,'any');
   return group('账户池与阶段优先级',choices('pool_strategy','选池方式',poolNames)+numeric('batch_size','每批账户数',1,'1',100)+
       flag('same_stage_full_batch','同阶段账户不足一批时顺延')+flag('pool_limits_enabled','启用账户池上限')+
@@ -123,7 +125,13 @@ function strategyFields(c) {
       numeric('batch_delay_min','批间最短等待 · 秒',0,'any',86400)+numeric('batch_delay_max','批间最长等待 · 秒',0,'any',86400))+
     group('考核号下单与风控',phase(''))+
     group('Live 下单与风控','<div class="full">'+flag('live_default_locked','Live 默认锁定')+
-      '<p class="form-note">开启后，可在「管理账户」中为指定 Live 账户勾选「加入自动策略池」以单独解锁。</p></div>'+phase('live_'),true)+
+      '<p class="form-note">开启后，可在「管理账户」中为指定 Live 账户勾选「加入自动策略池」以单独解锁。</p></div>'+phase('live_')+
+      choices('live_take_profit_mode','止盈模式',{fixed:'固定止盈额',ratio:'固定盈亏比',entries:'当日首次与后续开仓'})+
+      numeric('live_take_profit','固定止盈额 · USD',.000001,'any','',true)+numeric('live_reward_ratio','盈亏比（收益 / 风险）',.000001,'any')+
+      numeric('live_min_take_profit','最低止盈金额 · USD',0,'any')+
+      numeric('live_first_take_profit','当日首次止盈额 · USD',.000001,'any','',true)+size('live_first_size_percent','当日首次仓位比例')+
+      numeric('live_repeat_take_profit','当日后续止盈额 · USD',.000001,'any','',true)+size('live_repeat_size_percent','当日后续仓位比例')+
+      '<p id="liveProfitNote" class="full form-note"></p>',true)+
     group('Live 利润领取',choices('live_payout_recipient','收款账户',{main:'平台主账户'})+
       choices('live_payout_mode','领取方式',{all:'全部净利润',amount:'固定金额',percent:'按净利润比例'})+
       numeric('live_payout_amount','固定领取金额 · USDC',.000001,'.000001')+numeric('live_payout_percent','领取比例 · %',.000001,'any',100))+
@@ -132,6 +140,7 @@ function strategyFields(c) {
 
 function updateStrategyFields() {
   const fields = $('dialogForm').elements;
+  const profit = fields.live_take_profit_mode.value;
   const dynamic = fields.pool_strategy.value === 'dynamic';
   const limits = fields.pool_limits_enabled.checked;
   const liveCap = fields.live_pool_limit.value;
@@ -142,6 +151,10 @@ function updateStrategyFields() {
   // Outside dynamic allocation, a single Live account can reenter within the same batch.
   const orderDelay = !dynamic || multiple;
   const available = {
+    live_size_percent: profit !== 'entries', live_take_profit: profit === 'fixed',
+    live_reward_ratio: profit === 'ratio', live_min_take_profit: profit === 'ratio',
+    live_first_take_profit: profit === 'entries', live_first_size_percent: profit === 'entries',
+    live_repeat_take_profit: profit === 'entries', live_repeat_size_percent: profit === 'entries',
     same_stage_full_batch: fields.pool_strategy.value === 'same_stage',
     exam_pool_limit: limits, live_pool_limit: limits,
     dynamic_reserve_low: dynamic && finiteLive, dynamic_reserve_high: dynamic && finiteLive,
@@ -161,6 +174,8 @@ function updateStrategyFields() {
   fields.dynamic_exam_slots.max = multiple ? String(batch - 1) : '';
   fields.dynamic_reserve_high.min = String(Math.max(2,(fields.dynamic_reserve_low.valueAsNumber || 1) + 1));
   $('stopThresholdNote').hidden = !available.drawdown_stop_loss_threshold && !available.live_drawdown_stop_loss_threshold;
+  $('liveProfitNote').textContent = profit === 'ratio' ? '止盈取最低止盈额与风险金额乘盈亏比中的较大值。免设止损时，风险金额取净值至页面爆仓线的距离。' :
+    profit === 'entries' ? '每个账户按美东 20:00 日切。已确认成交后使用后续档；未填止盈额的档位跳过开仓。' : '未填固定止盈额时，此模式下的 Live 账户跳过自动开仓。';
 }
 
 function formSettings(container, base) {

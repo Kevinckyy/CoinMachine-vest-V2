@@ -40,7 +40,9 @@
 | `pool_limits_enabled,exam_pool_limit,live_pool_limit` | 开启池容量限制。上限为正整数或 `"infinity"` |
 | `dynamic_reserve_low,dynamic_reserve_high,dynamic_live_target,dynamic_exam_slots` | 动态候补下限和恢复线、Live 目标存量和每批补位考核名额。名额可为 `null` 以使用自动分配 |
 | `refresh_account_pool,live_default_locked` | 等待新增候选并在美东日切时刷新账户池，以及 Live 默认锁定。关闭自动刷新时，本轮运行中仍会纳入新发现的合格账户，现有账户无法组批时结束。启动前均先拉取完整活动清单 |
-| `side,size_percent,stop_buffer,take_profit` | 考核号方向、平台仓位百分档、USD 缓冲 M、可选 USD 止盈。Live 使用对应的 `live_` 前缀 |
+| `side,size_percent,phase2_size_percent,stop_buffer` | 考核方向、1/2 与 2/2 各自的仓位百分档、USD 缓冲 M。考核开仓清空止盈 |
+| `live_take_profit_mode` | `fixed` 使用 `live_take_profit`，`ratio` 使用 `live_reward_ratio,live_min_take_profit`。这两种模式使用 `live_size_percent` |
+| `live_first_take_profit,live_first_size_percent,live_repeat_take_profit,live_repeat_size_percent` | `entries` 模式按单个账户本交易日确认成交情况选取首次或后续档。每个档位的金额和仓位独立 |
 | `skip_stop_loss_on_low_drawdown,drawdown_stop_loss_threshold` | 考核号免止损开关与 USD 阈值，Live 使用对应的 `live_` 前缀。默认关闭，阈值初始为 200 |
 | `live_payout_recipient,live_payout_mode,live_payout_amount,live_payout_percent` | 主账户 `main` 收款。方式为 `all`、`amount`、`percent` |
 
@@ -98,9 +100,11 @@ Content-Type: application/json
 | `position.protect` | 必填 | `{"position_id":"页面持仓ID","stop_loss":100,"take_profit":250}` | 已核验的实际保护状态，至少指定一项金额 |
 | `profit.withdraw` | 必填 | `{"amount":50}` | 核验后的源账户余额、申请金额、预计到账额与主账户收款对象 |
 
-开仓方向为 `buy` 或 `sell`。`micro` 是正整数，也可用 `size_percent` 指定 25、50、75 或 100 百分档，两者选一。`stop_buffer` 是账户爆仓线上方要保留的 USD 净值，可为零，省略则使用该节点策略配置（初始 20）。填入平台的止损金额等于最新净值减去当日有效爆仓线，再减去缓冲，精确到美分。`take_profit` 为可选的单笔 USDC 金额。平仓和保护修改会固定派发时的持仓 ID、方向、数量、品种和均价。领取金额须为正数，最多六位小数。
+开仓方向为 `buy` 或 `sell`。`micro` 是正整数，也可用 `size_percent` 指定 25、50、75 或 100 百分档。两者选一。`stop_buffer` 为净值缓冲 M，省略时使用该节点对应阶段的设置（初始 20 USD）。止损金额等于实读净值减去实读爆仓线，再减去缓冲，精确到美分。Live 开仓可传固定金额 `take_profit` 或 `reward_ratio` 配合 `min_take_profit`。盈亏比的风险基数是本单止损金额，免止损时使用净值至爆仓线的距离。平仓和修改保护会核对持仓 ID、方向、数量、品种和均价。
 
-账户目录中的 `card,card_at` 对应活动卡片，`risk,risk_at` 保留风控读数及上次交易页实读时间。`in_pool` 表示允许策略选用，`candidate` 表示当前会话、空仓、额度和风控条件允许进入下单前核验。`daily_floor` 含美东 20:00 交易日的 `start,end,reset_equity,daily_limit,gross_withdrawn,floor,source,verified`。`source` 可为 `reset`、`platform`、`estimate` 或 `conflict`。开仓前需要 `verified=true`。插件当前会话的 `card_session,card_generation,cards_full_at` 可用于检查全量刷新进度。
+目录中的 `card,card_at` 对应活动卡片，`risk,risk_at` 保留风控读数及上次交易页实读时间。`in_pool` 表示允许策略选用，`candidate` 表示当前可以进入下单前核验。`open_locked` 表示当前日内开仓锁，`open_lock.reason,until` 给出原因和到期时间。`daily_floor.floor` 是平台实读值，`observed_at` 是其读取时间，`source` 为 `platform` 或 `pending`。每次开仓核验都需要本次交易页的 `snapshot.daily_floor`。日切或已确认提现后的底线等待读取。插件当前会话的 `card_session,card_generation,cards_full_at` 可用于检查全量刷新进度。
+
+`GET /v1/state` 的 `plugin_version` 为中心所附插件版本。每个 worker 的 `plugin_version` 为浏览器上报版本，`version_status` 为 `current,behind,ahead,unknown` 之一。节点 `GET /v1/status` 也返回各 worker 的版本，受管安装的 Git 提交保存在 `release`。开仓需要节点 `open_policy_version=2` 和插件 1.6.0 或更高版本。
 
 全量读取的 `result.stage` 依次为 `list`、`cache`、`portfolio`、`done`。清单确认前失败会停在对应步骤。每个账户保存完整名称、卡片 ID、状态及读数或错误。金额单位为 USD，`daily_loss/daily_limit` 和 `drawdown/drawdown_limit` 为当前值和上限，`equity` 为账户价值，`health` 为百分数。缺失值为 `null` 并列入 `missing`。页面明确显示无日损上限时记录 `daily_unlimited=true`。部分读取时指令状态为 `failed`，已读结果仍可查询。节点目录中的 `accounts[].portfolio` 保存每户最近一次详情，`workers[].portfolio_scan` 提供最近一次进度，包括插件本地发起的读取。
 
@@ -114,7 +118,7 @@ Content-Type: application/json
 | `queued` / `running` | 桥已持久化 / 插件已独占领取 |
 | `succeeded` | 已收到执行结果。资金操作还需通过对应回执核验 |
 | `failed` | 参数、页面条件、权限或执行前置检查失败 |
-| `expired` / `cancelled` | 指令已过期、被取消，或在开仓许可前发现读数差异。风控重选时 `result.reselect=true`、`intents={}` |
+| `expired` / `cancelled` | 指令已过期、被取消，或实读后需要重新选池。重选时 `result.reselect=true`、`intents={}` |
 | `unknown` | 资金操作结果不确定，需检查 `intents`、`error` 和平台记录 |
 | `resolved` | 已人工记录核验结论，`result.executed` 和 `result.note` 保留依据 |
 
@@ -134,12 +138,12 @@ Content-Type: application/json
 | 中心 | `GET /v1/commands/{id}` | 查询桥上的权威执行状态 |
 | 中心 | `PUT /v1/commands/{id}/cancel` | 携带原始执行请求，原子取消；先收到取消时也持久化取消记录 |
 | 中心 | `POST /v1/commands/{id}/resolve` | 核验指定 `instance_id` 的未知结果 |
-| 插件 | `POST /v1/plugin/heartbeat` | 上报浏览器、页面、只读或执行模式和当前会话 |
+| 插件 | `POST /v1/plugin/heartbeat` | 上报浏览器、`plugin_version`、页面、只读或执行模式和当前会话 |
 | 插件 | `POST /v1/plugin/read-all` | 通过已绑定会话为本浏览器创建只读全量读取任务，返回 `id` |
 | 插件 | `POST /v1/plugin/report` | 上报账户页 `cards:{generation,full,observed_at,items}`、单账户 `observation` 或 `history:{name,items}`。全量读取时清单须带 `scan_id`，详情按户上报 `portfolio:{id,name,card_id,values}` 或 `error`。旧插件可继续上报菜单 `inventory` |
-| 插件 | `POST /v1/plugin/preflight` | 在 NQ 交易页上报目标 `id,observation`。通过时返回 `approved,stop_loss,daily_floor`；需重选时原指令终止 |
+| 插件 | `POST /v1/plugin/preflight` | 上报目标 `id,observation`，以交易页读数更正缓存。合格时返回 `approved,stop_loss,take_profit,daily_floor,changed` 继续原指令。日内风控锁通过 `open_lock` 返回 |
 | 插件 | `POST /v1/plugin/poll` | 原子领取一条指令，空闲返回 `{"command":null}`。支持全量读取的插件上报 `portfolio_version:1`，本地清单写入成功后发送 `cached_scan` 指令 ID，按 `scan.stage` 和 `scan.target` 执行 |
-| 插件 | `POST /v1/plugin/intent` | 在实际资金操作前登记 `id,stage,proof` 并取得单次点击许可。开仓再次附上 `observation`，并用 `proof.quantity,proof.stop_loss` 核对实仓数量和表单金额 |
+| 插件 | `POST /v1/plugin/intent` | 开仓携带 `id,stage,proof,observation`，用 `proof.quantity,stop_loss,take_profit` 核对表单。传入 `allow_refill=true` 后，金额变化时返回 `refill=true,authorize_click=false` 和最新金额。填妥后用同一指令再次核验，仅 `authorize_click=true` 允许一次点击 |
 | 插件 | `POST /v1/plugin/result` | 按原会话和指令 ID 上报 `ok,result,error`，可重传回执 |
 
 中心发送的执行请求包含管理接口的目标和参数，另有 `id,instance_id,session_id,phase,source,created_at,expires_at`。资金指令带 `account_ref`，平仓和保护修改还带 `expected_position`。插件上报时携带 `worker_id,session_id,generation,mode,label`；同一浏览器配置文件的授权轮次单调递增，旧轮次无法领取或授权点击。回执使用实际领取指令的会话。

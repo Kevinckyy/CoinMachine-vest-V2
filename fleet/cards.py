@@ -19,7 +19,7 @@ def schema(db):
     """)
     cols = {r[1] for r in db.execute("PRAGMA table_info(accounts)")}
     for name, spec in (("card","TEXT"), ("card_at","REAL"), ("risk","TEXT"), ("risk_at","REAL"), ("portfolio","TEXT"), ("preflight_at","REAL"), ("history_due_at","REAL"),
-                       ("initial_balance","REAL"), ("baseline_phase","TEXT"), ("phase_started_at","REAL")):
+                       ("initial_balance","REAL"), ("baseline_phase","TEXT"), ("phase_started_at","REAL"), ("open_lock","TEXT")):
         if name not in cols:
             db.execute(f"ALTER TABLE accounts ADD COLUMN {name} {spec}")
 
@@ -95,18 +95,23 @@ def update(db, wid, sid, data, now):
             db.execute("UPDATE accounts SET present=0,card=NULL,card_at=NULL,risk=NULL,risk_at=NULL,portfolio=NULL,read_session=NULL,initial_balance=NULL,baseline_phase=NULL WHERE worker_id=? AND name=?",(wid,name))
     for name,item in items.items():
         row = previous.get(name)
+        lock = json.loads(row["open_lock"]) if row and row["open_lock"] else None
+        if lock and lock.get("card_id") and item["id"] and lock["card_id"] != item["id"]:
+            db.execute("UPDATE accounts SET open_lock=NULL WHERE worker_id=? AND name=?", (wid,name))
         prior = json.loads(row["card"]) if row and row["card"] else {}
         old_phase = prior.get("phase") if prior else row["phase"] if row else None
         same = bool(row and row["present"] and not row["ambiguous"] and name not in duplicate and (not prior.get("id") or prior["id"]==item["id"]) and
                     (not item["phase"] or not old_phase or item["phase"]==old_phase))
         category = item["category"]
-        if same and (category=="active" or row["risk_at"] and category==prior.get("category")):
+        due = lock and observed >= lock["until"] and (row["risk_at"] or 0) < lock["until"]
+        if same and not due and (category=="active" or row["risk_at"] and category==prior.get("category")):
             category = row["category"]
-        phase = row["phase"] if same and row["phase"] and (not item["phase"] or row["risk_at"] and item["phase"]==old_phase) else item["phase"]
+        phase = row["phase"] if same and row["phase"] and (not item["phase"] or not due and row["risk_at"] and item["phase"]==old_phase) else item["phase"]
         risk = json.loads(row["risk"]) if same and row["risk"] else {}
-        for key in AMOUNTS:
-            if item[key] != prior.get(key) or key not in risk:
-                risk[key] = item[key]
+        if not same or observed >= (row["risk_at"] or 0):
+            for key in AMOUNTS:
+                if key not in risk or item[key] is not None and item[key] != prior.get(key):
+                    risk[key] = item[key]
         count = item["active_positions"]
         was_open = risk.get("position_open") is True or (prior.get("active_positions") or 0)>0
         if not same or observed >= (row["observed_at"] or 0):
@@ -135,6 +140,8 @@ def update(db, wid, sid, data, now):
     db.execute("""INSERT INTO card_sync VALUES(?,?,?,?,?) ON CONFLICT(worker) DO UPDATE SET
                 session=excluded.session,generation=excluded.generation,full_at=excluded.full_at,seen=excluded.seen""",
                (wid,sid,gen,observed if full else sync["full_at"],observed))
-    rows = db.execute("SELECT name,risk,portfolio FROM accounts WHERE worker_id=? AND present=1",(wid,)).fetchall()
+    rows = db.execute("SELECT name,risk,portfolio,open_lock FROM accounts WHERE worker_id=? AND present=1",(wid,)).fetchall()
     return {"count":len(items),"generation":gen,"risks":{r["name"]:json.loads(r["risk"]) for r in rows},
+            "floors":{r["name"]:daily_floor.view(db,wid,r["name"],now) for r in rows},
+            "open_locks":{r["name"]:json.loads(r["open_lock"]) for r in rows if r["open_lock"]},
             "portfolios":{r["name"]:json.loads(r["portfolio"]) for r in rows if r["portfolio"]}}

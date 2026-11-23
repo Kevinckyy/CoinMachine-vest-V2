@@ -33,6 +33,7 @@ function publicBinding({
 }) {
   return {
     release: BUILD,
+    plugin_version: chrome.runtime.getManifest().version,
     cards_version: 1,
     portfolio_version: 1,
     strategy_version: 1,
@@ -136,6 +137,7 @@ async function setBinding(message) {
     const saved = await chrome.storage.session.get(['diagnostic', 'receiptError']);
     const {cardCache} = await chrome.storage.local.get('cardCache');
     return {
+      plugin_version: chrome.runtime.getManifest().version,
       label: cfg.label || '',
       paired: !!cfg.token,
       mode: previous?.mode || 'unbound',
@@ -463,7 +465,7 @@ async function reportCards(owner,cfg,payload) {
   const data = await post('report',payload,cfg);
   try {
     await chrome.storage.local.set({cardCache:{worker_id:owner.worker_id,items:cards.items,risks:data.risks,
-      portfolios:data.portfolios || {},observed_at:cards.observed_at}});
+      portfolios:data.portfolios || {},floors:data.floors || {},open_locks:data.open_locks || {},observed_at:cards.observed_at}});
     if (cards.scan_id) await chrome.storage.session.set({cachedScan:{sid:owner.session_id,id:cards.scan_id}});
   } catch (err) {
     if (cards.scan_id) {
@@ -529,7 +531,9 @@ async function handle(message, sender) {
       const {cardCache} = await chrome.storage.local.get('cardCache');
       if ((await binding())?.session_id===owner.session_id && cardCache?.worker_id===owner.worker_id) {
         const name = (payload.observation || payload.portfolio).name;
-        cardCache.risks[name] = data.risk;
+        (cardCache.risks ??= {})[name] = data.risk;
+        if ('daily_floor' in data) (cardCache.floors ??= {})[name] = data.daily_floor;
+        if ('open_lock' in data) (cardCache.open_locks ??= {})[name] = data.open_lock;
         if (data.portfolio) (cardCache.portfolios ??= {})[name] = data.portfolio;
         await chrome.storage.local.set({cardCache});
       }
