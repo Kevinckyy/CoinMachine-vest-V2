@@ -91,6 +91,42 @@ async function post(op, payload, cfg) {
   });
   return data;
 }
+async function identifyPage(tabId, target = {frameId: 0}) {
+  try {
+    const page = await chrome.tabs.sendMessage(tabId, {type: 'fleet.identify'}, target);
+    return page?.pageId ? page : null;
+  } catch (err) {
+    if (/receiving end does not exist/i.test(err.message)) return null;
+    throw err;
+  }
+}
+async function pageForBinding(tabId) {
+  const existing = await identifyPage(tabId);
+  if (existing) return existing;
+  if (!chrome.scripting?.executeScript) throw Error('请在扩展管理页重新加载 Vest Fleet，再绑定当前页面');
+
+  // Tabs opened before an extension load may have no content script for this version.
+  try {
+    const [frame] = await chrome.scripting.executeScript({
+      target: {tabId, frameIds: [0]}, injectImmediately: true, func: () => location.origin
+    });
+    if (frame?.result !== VEST) throw Error('标签页已离开 Vest，请在目标账户页面重新绑定');
+    if (!frame.documentId) throw Error('请刷新当前 Vest 页面，再点击绑定');
+    const files = chrome.runtime.getManifest().content_scripts.find(group => group.matches.includes(VEST + '/*')).js;
+    const [attached] = await chrome.scripting.executeScript({
+      target: {tabId, documentIds: [frame.documentId]}, injectImmediately: true, files
+    });
+    const page = await identifyPage(tabId, {documentId: frame.documentId});
+    if (page && page.pageId === attached?.result) return page;
+  } catch (err) {
+    if (/cannot access|host permission|not allowed to access/i.test(err.message))
+      throw Error('请在扩展的网站访问权限中允许 next.vestmarkets.com，再点击绑定');
+    if (/no (?:tab|document|frame) with|frame .*removed|tab was closed/i.test(err.message))
+      throw Error('绑定期间页面已切换，请在目标 Vest 标签页重新绑定');
+    throw err;
+  }
+  throw Error('当前 Vest 页的插件脚本尚未就绪，请刷新页面后重新绑定');
+}
 async function setBinding(message) {
   let cfg = await settings();
   const previous = await binding();
@@ -137,20 +173,21 @@ async function setBinding(message) {
     };
   }
   if (message.type !== 'ui.bind') throw Error('未知设置');
-  await chrome.storage.session.remove('manualView');
   if (!['readonly', 'execute'].includes(message.mode)) throw Error('模式无效');
   const [tab] = await chrome.tabs.query({
     active: true,
     currentWindow: true
   });
   if (!tab?.url || new URL(tab.url).origin !== VEST) throw Error('请在已登录的 Vest 标签页打开插件');
-  const page = await chrome.tabs.sendMessage(tab.id, {
-    type: 'fleet.identify'
-  });
-  if (!page?.pageId) throw Error('请刷新 Vest 页面后重新绑定');
   const token = message.token || cfg.token;
   const label = String(message.label || '').trim();
   if (!token || token.length < 24 || !label || label.length > 80) throw Error('请填写浏览器名称和插件密钥');
+  const page = await pageForBinding(tab.id);
+  const current = await chrome.tabs.get(tab.id);
+  if (!current.active || !current.url || new URL(current.url).origin !== VEST ||
+      (await identifyPage(tab.id))?.pageId !== page.pageId)
+    throw Error('绑定期间标签页已切换，请在目标 Vest 标签页重新绑定');
+  await chrome.storage.session.remove('manualView');
   cfg = {
     ...cfg,
     token,
@@ -160,7 +197,7 @@ async function setBinding(message) {
   try {
     await post('heartbeat', {
       ...publicBinding(next),
-      page: new URL(tab.url).pathname
+      page: new URL(current.url).pathname
     }, cfg);
     await chrome.storage.session.set({
       diagnostic: '已连接本机桥'
@@ -180,9 +217,7 @@ async function context(message, sender) {
   let owner = current;
   const cfg = await settings();
   if (current.pageId !== message.pageId) {
-    const page = await chrome.tabs.sendMessage(sender.tab.id, {
-      type: 'fleet.identify'
-    });
+    const page = await identifyPage(sender.tab.id);
     if (page?.pageId !== message.pageId) throw Error('旧页面已退出');
     const {cardRoute} = await chrome.storage.session.get('cardRoute');
     if (cardRoute?.sid === current.session_id && cardRoute.from === current.pageId &&

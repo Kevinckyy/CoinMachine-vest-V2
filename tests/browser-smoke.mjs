@@ -145,9 +145,29 @@ try {
     responseHeaders:[{name:'Content-Type',value:'text/html; charset=utf-8'}],body:p.resourceType==='Document'?fixture.toString('base64'):''}));
   await vest.send('Page.navigate',{url:'https://next.vestmarkets.com/trade/NQ-PERP'});
   await until(()=>vest.evaluate("!!document.querySelector('[data-testid=account-selector-trigger]')"),'synthetic Vest page');
-  const popup=await tab();
-  await popup.send('Page.navigate',{url:'chrome-extension://'+eid+'/popup.html'});
-  await until(()=>popup.evaluate("!!document.querySelector('#readonly')?.onclick && document.getElementById('mode').textContent==='未绑定'"),'installed extension popup');
+  async function openUnboundPopup() {
+    const target=await tab();
+    await target.send('Page.navigate',{url:'chrome-extension://'+eid+'/popup.html'});
+    await until(()=>target.evaluate("!!document.querySelector('#readonly')?.onclick && document.getElementById('mode').textContent==='未绑定'"),'installed extension popup');
+    return target;
+  }
+  const identifyVestTab = `chrome.tabs.query({url:'https://next.vestmarkets.com/*'}).then(([tab])=>
+    chrome.tabs.sendMessage(tab.id,{type:'fleet.identify'},{frameId:0}))`;
+  const originalPopup=await openUnboundPopup();
+  await until(async()=>(await originalPopup.evaluate(identifyVestTab))?.pageId,'original Vest receiver');
+  const documentTime=await vest.evaluate('performance.timeOrigin');
+  const targets=async()=>await (await fetch(debug+'/json/list')).json();
+  const oldWorker=(await targets()).find(t=>t.type==='service_worker' && t.url==='chrome-extension://'+eid+'/background.js');
+  assert.ok(oldWorker);
+  await originalPopup.evaluate("setTimeout(()=>chrome.runtime.reload(),50); true");
+  await until(async()=>!(await targets()).some(t=>t.id===oldWorker.id),'old extension worker unloaded');
+  const popup=await openUnboundPopup();
+  assert.equal(await vest.evaluate('performance.timeOrigin'),documentTime);
+  await assert.rejects(popup.evaluate(identifyVestTab),/Receiving end does not exist/);
+  await browserCdp.send('Target.activateTarget',{targetId:ui.targetId});
+  const wrongTab=await popup.evaluate("chrome.runtime.sendMessage({type:'ui.bind',mode:'readonly',label:'本地浏览器'})");
+  assert.equal(wrongTab.ok,false);
+  assert.match(wrongTab.error,/Vest 标签页/);
   await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
   await popup.evaluate(`document.getElementById('label').value='本地浏览器';document.getElementById('token').value=${JSON.stringify(pluginToken)};document.getElementById('readonly').click()`);
   await until(async()=>{
@@ -165,6 +185,15 @@ try {
   assert.deepEqual(data.accounts.map(a=>[a.name,a.card.equity,a.card.active_positions]),[['Alpha',1050,0],['Beta',2000,1]]);
   assert.equal(await vest.evaluate('location.pathname'),'/accounts');
   assert.equal(await vest.evaluate("Number(sessionStorage.getItem('opens'))"),0);
+  const existingPage=await popup.evaluate(identifyVestTab);
+  const attachedId=await popup.evaluate(`(async()=>{
+    const [tab]=await chrome.tabs.query({url:'https://next.vestmarkets.com/*'});
+    const [frame]=await chrome.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},
+      files:chrome.runtime.getManifest().content_scripts[0].js});
+    return frame.result;
+  })()`);
+  assert.equal(attachedId,existingPage.pageId);
+  assert.equal((await popup.evaluate(identifyVestTab)).pageId,existingPage.pageId);
   assert.equal(data.accounts[1].card.pnl,111.50);
   assert.equal(data.accounts[1].card.drawdown_limit,300);
   assert.equal(data.accounts[1].card.daily_limit,145.96);
@@ -333,7 +362,7 @@ try {
   }
   await ui.send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   assert.equal(await ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
-  console.log('PASS: active card cache, startup refresh, new purchase, authoritative replacement, daily floor tooltip, zero-intent preflight rejection, history, analytics, two isolated nodes, navigation and center-issued extension upgrade');
+  console.log('PASS: rebind after extension reload, single receiver, active card cache, startup refresh, new purchase, daily floor tooltip, zero-intent preflight rejection, history, analytics, two isolated nodes, navigation and center-issued extension upgrade');
 } finally {
   if(browserCdp) await browserCdp.send('Browser.close').catch(()=>{});
   for(const ws of sockets)ws.close();

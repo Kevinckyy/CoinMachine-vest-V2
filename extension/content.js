@@ -1,6 +1,9 @@
 (() => {
   'use strict';
 
+  // Both the manifest and a manual bind can attach this bundle to the same document.
+  const prior = globalThis.vestFleetPage;
+  if (prior && chrome.runtime.onMessage.hasListener(prior.listener)) return prior.pageId;
   const pageId = crypto.randomUUID();
   let session = null,
     cycleSession = null,
@@ -17,7 +20,7 @@
     lastContact = 0;
     nextCards = 0;
   }
-  chrome.runtime.onMessage.addListener((message, sender, reply) => {
+  function onFleetMessage(message, sender, reply) {
     if (sender.id !== chrome.runtime.id) return;
     if (message.type === 'fleet.identify') reply({
       pageId
@@ -28,7 +31,7 @@
         ok: true
       });
     }
-  });
+  }
   async function ipc(type, data = {}, owner = cycleSession) {
     const response = await chrome.runtime.sendMessage({
       type,
@@ -155,7 +158,6 @@
       heartbeatBusy = false;
     }
   }, 5000);
-  cycle();
   // A confirmed purchase can appear in another Vest tab in this browser profile.
   let announced = null;
   const ready = /^(?:Your (?:\d+ )?Funded Accounts? (?:is|are) ready to trade|Your new account is ready\. You can start trading now|您的新账户已准备就绪，现在可以开始交易|您的\s*(?:\d+\s*个\s*)?Funded Account\s*已可交易|账户购买成功|Account purchased successfully)[.!。]?$/i;
@@ -172,14 +174,22 @@
       chrome.runtime.sendMessage({type:'purchase.ready'}).catch(()=>{});
     }
   }
-  new MutationObserver(changes => {
+  const purchases = new MutationObserver(changes => {
     if (!chrome.runtime.id) return;
     if (announced && (!announced.isConnected || !ready.test(VestBridgeCore.normalized(announced.textContent)))) announced=null;
     for (const change of changes) {
       if (change.type==='characterData') checkPurchase(change.target);
       else for (const node of change.addedNodes) checkPurchase(node);
     }
-  })
-    .observe(document.body,{childList:true,subtree:true,characterData:true});
-  checkPurchase(document.body);
+  });
+  function start() {
+    purchases.observe(document,{childList:true,subtree:true,characterData:true});
+    if (document.body) checkPurchase(document.body);
+    cycle();
+  }
+  chrome.runtime.onMessage.addListener(onFleetMessage);
+  globalThis.vestFleetPage = {pageId, listener: onFleetMessage};
+  if (document.readyState==='loading') document.addEventListener('DOMContentLoaded',start,{once:true});
+  else start();
+  return pageId;
 })();

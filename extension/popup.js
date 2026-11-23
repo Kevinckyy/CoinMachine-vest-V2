@@ -2,11 +2,15 @@
 
 const $ = id => document.getElementById(id);
 async function send(type, extra = {}) {
-  const response = await chrome.runtime.sendMessage({
-    type,
-    ...extra
-  });
-  if (!response.ok) throw Error(response.error);
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage({type, ...extra});
+  } catch (err) {
+    if (/receiving end does not exist|extension context invalidated/i.test(err.message))
+      throw Error('插件后台未连接，请关闭弹窗再打开。若仍未连接，请在扩展管理页重新加载 Vest Fleet。');
+    throw err;
+  }
+  if (!response?.ok) throw Error(response?.error || '插件后台尚未就绪，请重新打开弹窗');
   return response.value;
 }
 async function refresh() {
