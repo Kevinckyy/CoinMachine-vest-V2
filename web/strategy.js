@@ -3,6 +3,99 @@
 const stageNames = {'1/2':'考核 1/2','2/2':'考核 2/2',live:'Live'};
 const poolNames = {random:'全随机选择',same_stage:'每批同阶段',dynamic:'动态分配'};
 const strategyFor = id => state.strategies.find(s => s.node_id === id);
+const poolChanges = new Set();
+const unfinishedStatuses = ['pending','sending','queued','running','unknown'];
+const recentCommandLimit = 100;
+
+async function nodePoolCommands(view, nodeId) {
+  const commands = new Map(view.commands.filter(c => c.node_id === nodeId).map(c => [c.id,c]));
+  // The dashboard returns at most 100 recent commands across all nodes.
+  if (view.commands.length >= recentCommandLimit) {
+    await Promise.all(unfinishedStatuses.map(async status => {
+      let offset = 0;
+      while (true) {
+        const result = await api('commands?' + new URLSearchParams({node_id:nodeId,status,offset}));
+        for (const c of result.items) commands.set(c.id,c);
+        offset += result.items.length;
+        if (!result.items.length || offset >= result.total) break;
+      }
+    }));
+    const s = view.strategies.find(s => s.node_id === nodeId);
+    const missing = [];
+    const previous = state?.poolHistory?.nodeId === nodeId ? state.poolHistory.commands : null;
+    for (const id of s?.members || []) {
+      if (commands.has(id)) continue;
+      const cached = previous?.get(id);
+      if (cached?.status === 'succeeded') commands.set(id,cached);
+      else missing.push(id);
+    }
+    for (let i = 0; i < missing.length; i += 8) {
+      const records = await Promise.all(missing.slice(i,i+8).map(id => api('commands/'+encodeURIComponent(id))));
+      for (const c of records) commands.set(c.id,c);
+    }
+  }
+  return commands;
+}
+
+function executingPoolAccounts(view, nodeId, commands) {
+  const s = view.strategies.find(s => s.node_id === nodeId);
+  const members = new Set(s?.members || []);
+  const accounts = new Map(), executing = new Set();
+  for (const a of view.accounts) {
+    if (a.node_id !== nodeId) continue;
+    accounts.set(addressKey(a),a);
+    if (a.present && positionCount(a) > 0) executing.add(a.account_ref || a.name);
+  }
+  for (const c of commands) {
+    if (c.node_id !== nodeId || !c.account) continue;
+    const a = accounts.get(JSON.stringify([nodeId,c.worker_id,c.account]));
+    const active = unfinishedStatuses.includes(c.status) && (!READ.includes(c.action) || (s?.run && c.source === 'strategy-'+s.run));
+    // A filled batch member still belongs to the strategy until flat confirmation and Live settlement.
+    const settling = members.has(c.id) && c.status === 'succeeded' &&
+      (!a || positionCount(a) !== 0 || Math.max(a.card_at || 0,a.observed_at || 0) <= c.updated_at ||
+       c.phase === 'live' && s.enabled && s.policy_version === 2 && !s.draining && !s.claims?.[c.id]?.done);
+    if (active || settling) executing.add(c.account_ref || a?.account_ref || c.account);
+  }
+  return executing;
+}
+
+async function verifyPoolExit(a) {
+  const path = 'state?' + new URLSearchParams({node_id:a.node_id});
+  let view = await api(path);
+  const commands = await nodePoolCommands(view,a.node_id);
+  if (view.commands.length >= recentCommandLimit) {
+    // Refresh the account and current batch after any paginated command lookups.
+    view = await api(path);
+    for (const c of view.commands) commands.set(c.id,c);
+  }
+  const current = view.accounts.find(item => addressKey(item) === addressKey(a));
+  if (!current?.present) throw Error('账户列表已变化，请刷新后重试');
+  if (!current.in_pool) return false;
+  if (executingPoolAccounts(view,a.node_id,commands.values()).has(current.account_ref || current.name)) {
+    throw Error(current.name+' 正在执行，暂不能出池');
+  }
+  return true;
+}
+
+function canJoinPool(a) {
+  return a.present && a.enabled && !a.excluded && !a.ambiguous && ['active','eval','funded','live'].includes(a.category);
+}
+
+async function setPoolMembership(key, inPool) {
+  const a = state.accounts.find(account => addressKey(account) === key);
+  if (!a?.present || a.in_pool === inPool || (inPool && !canJoinPool(a)) || poolChanges.has(key)) return;
+  poolChanges.add(key);
+  strategyView();
+  try {
+    if (!inPool && !await verifyPoolExit(a)) return;
+    await api('accounts/config','POST',{node_id:a.node_id,worker_id:a.worker_id,account:a.name,in_pool:inPool});
+    notify(a.name + (inPool ? ' 已入池' : ' 已出池'));
+  } finally {
+    await refresh();
+    poolChanges.delete(key);
+    if (state && page === 'strategy' && strategyNode === a.node_id) strategyView();
+  }
+}
 
 function strategyToolbar() {
   if (strategyNode) return btn('page','返回全部节点','','strategy') + btn('nodeLogs','运行日志','',strategyNode);
@@ -51,6 +144,9 @@ function strategyDetail(node) {
   const s = strategyFor(node.id), c = s.config;
   const accounts = state.accounts.filter(a => a.node_id === node.id && a.present);
   const pool = accounts.filter(a => a.in_pool);
+  const history = state.poolHistory?.nodeId === node.id ? state.poolHistory.commands : null;
+  const checkingHistory = !history && state.commands.length >= recentCommandLimit;
+  const executing = executingPoolAccounts(state,node.id,history ? history.values() : state.commands);
   const queue = (s.planned || []).map(item => item.ref);
   const olderWorkers = state.workers.filter(w => w.node_id === node.id && w.online && w.mode === 'execute' && !w.supports_open_policy);
   const versionNote = olderWorkers.length ? '<p class="form-note">'+esc(olderWorkers.map(w => w.label).join('、'))+
@@ -63,30 +159,41 @@ function strategyDetail(node) {
     '<p class="strategy-line">'+esc(s.message)+'</p>'+(queue.length ? '<p>等待下单 · '+queue.map(esc).join('、')+'</p>' : '')+versionNote+'</div>';
   function accountRow(a) {
     const risk = a.risk || {};
-    const status = a.open_locked ? '开仓风控锁定' : a.candidate ? '可候选' : a.in_pool ? '入池待选' : a.live_default_locked ? 'Live 默认锁定' :
+    const key = addressKey(a), label = a.in_pool ? '出池' : '入池';
+    const active = a.in_pool && executing.has(a.account_ref || a.name);
+    let unavailable = '';
+    if (poolChanges.has(key)) unavailable = '正在保存';
+    else if (active) unavailable = '账户正在执行，暂不能出池';
+    else if (a.in_pool && checkingHistory) unavailable = '正在核对执行状态';
+    else if (!a.in_pool && !canJoinPool(a)) unavailable = '当前账户状态无法入池';
+    const poolButton = '<button type="button" class="link" data-op="'+(a.in_pool ? 'leavePool' : 'joinPool')+'" data-value="'+esc(key)+'"'+
+      (unavailable ? ' disabled title="'+esc(unavailable)+'"' : '')+'>'+label+'</button>';
+    const status = active ? '执行中' : a.open_locked ? '开仓风控锁定' : a.candidate ? '可候选' : a.in_pool ? '入池待选' : a.live_default_locked ? 'Live 默认锁定' :
       a.ambiguous ? '同名待确认' : a.excluded ? '主账户' : !a.enabled ? '已停用' : '未入池';
     return '<tr><td class="cell"><strong>'+esc(a.alias || a.name)+'</strong><small>'+esc((a.alias ? a.name+' · ' : '')+workerLabel(node.id,a.worker_id))+'</small></td>'+
-      '<td>'+esc(stageNames[a.phase] || '待确认')+'</td><td class="cell">'+tag(status,a.open_locked ? 'warn' : a.candidate ? 'good' : '')+openLockDetail(a)+'</td>'+
+      '<td>'+esc(stageNames[a.phase] || '待确认')+'</td><td class="cell">'+tag(status,active ? 'info' : a.open_locked ? 'warn' : a.candidate ? 'good' : '')+openLockDetail(a)+'</td>'+
       '<td>'+money(risk.equity)+'</td><td>'+(risk.health == null ? '—' : esc(risk.health)+'%')+'</td>'+
       '<td>'+money(risk.daily_loss)+' / '+money(risk.daily_limit)+'</td><td>'+money(risk.drawdown)+' / '+money(risk.drawdown_limit)+'</td>'+
-      '<td>'+money(a.daily_floor?.floor)+'</td><td>'+(positionCount(a) ?? '—')+'</td><td>'+btn('account','管理','link',addressKey(a))+'</td></tr>';
+      '<td>'+money(a.daily_floor?.floor)+'</td><td>'+(positionCount(a) ?? '—')+'</td><td><div class="actions">'+
+      btn('account','管理','link',key)+poolButton+'</div></td></tr>';
   }
   const headers = ['账户 / 浏览器','阶段','候选状态','净值','健康度','日损 / 上限','回撤 / 上限','当日爆仓线','活动持仓',''];
   const outside = accounts.filter(a => !a.in_pool);
   const ids = [...s.members, ...Object.values(s.claims || {}).flatMap(p => [p.read,p.withdraw].filter(Boolean))];
   const records = ids.map(id => {
-    const cmd = state.commands.find(c => c.id === id);
+    const cmd = history?.get(id) || state.commands.find(c => c.id === id);
     return '<div class="batch-command">'+(cmd ? esc(cmd.account)+' · '+esc(actionTitles[cmd.action])+' '+badge(cmd) : esc(id))+
       btn('detail','查看指令','link',id)+'</div>';
   });
-  return panel('策略状态',summary,controls)+panel('账户池',pool.length ? table(headers,pool.map(accountRow)) :
+  return panel('策略状态',summary,controls)+panel('活动持仓',positions(accounts))+panel('账户池',pool.length ? table(headers,pool.map(accountRow)) :
     empty('当前账户池为空'),btn('nodeAccounts','管理全部账户','link',node.id))+
-    panel('活动持仓',positions(accounts))+(outside.length ? panel('池外账户',table(headers,outside.map(accountRow))) : '')+
+    (outside.length ? panel('池外账户',table(headers,outside.map(accountRow))) : '')+
     panel('本批指令',records.length ? '<div class="panel-body">'+records.join('')+'</div>' : empty('当前没有批次指令'));
 }
 
 function strategyView() {
   const node = state.nodes.find(n => n.id === strategyNode);
+  if (node && state.commands.length >= recentCommandLimit && state.poolHistory?.nodeId !== node.id && !busy) refresh();
   const content = strategyNode ? node ? strategyDetail(node) : empty('找不到这个节点') :
     state.nodes.length ? '<div class="strategy-cards">'+state.nodes.map(strategyCard).join('')+'</div>' :
       panel('服务器',empty('尚未登记服务器','',btn('addNode','添加服务器','link')));

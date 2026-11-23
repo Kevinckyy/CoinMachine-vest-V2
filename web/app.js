@@ -176,6 +176,10 @@ async function refresh() {
   const requestToken = token;
   try {
     const latest = await api('state');
+    const nodeId = page === 'strategy' && strategyNode;
+    if (nodeId && latest.commands.length >= recentCommandLimit && latest.nodes.some(n => n.id === nodeId)) {
+      latest.poolHistory = {nodeId,commands:await nodePoolCommands(latest,nodeId)};
+    }
     if (token !== requestToken) return;
     state = latest;
     if (!state.nodes.some(n => n.id === selectedNode)) selectNode(state.nodes[0]?.id || '');
@@ -406,11 +410,25 @@ function nodeForm(id) {
     notify('服务器配置已保存');
   });
 }
-function accountForm(key) {
+async function accountForm(key) {
   const a = state.accounts.find(a => addressKey(a) === key);
   if (!a) throw Error('账户已变化，请刷新');
+  const view = state;
+  let executing = false;
+  if (a.in_pool) {
+    let commands = view.commands;
+    if (view.commands.length >= recentCommandLimit) {
+      commands = view.poolHistory?.nodeId === a.node_id ? view.poolHistory.commands : await nodePoolCommands(view,a.node_id);
+    }
+    executing = executingPoolAccounts(view,a.node_id,commands.values()).has(a.account_ref || a.name);
+  }
+  const pool = check('in_pool', '加入自动策略池', a.in_pool, a.excluded || executing) +
+    (executing ? '<p class="full form-note">账户正在执行，暂不能出池。</p>' : '');
   const s = a.snapshot;
-  dialog('管理账户', `<p><strong>${esc(a.name)}</strong> · ${routeLabel(a)}</p><p class="form-note">余额 ${money(s.balance)} USDC · 最近读数 ${time(a.observed_at)}</p>` + (a.read_error ? '<p class="error">' + esc(a.read_error) + '</p>' : '') + grid(input('alias', '账户别名', a.alias, 'text', 'maxlength="80"') + input('account_ref', '交易账户标识', a.account_ref, 'text', 'maxlength="160" placeholder="默认使用完整账户名"') + '<p class="full form-note">同一实际账户在各节点使用相同标识，共享指令和每日开仓额度。不同登录下的同名账户可分别指定标识。</p>' + `<label class="full">备注<textarea name="note" maxlength="500">${esc(a.note)}</textarea></label>` + check('enabled', '允许执行资金指令', a.enabled && !a.excluded, a.excluded) + check('in_pool', '加入自动策略池', a.in_pool, a.excluded)), '保存', async data => {
+  dialog('管理账户', `<p><strong>${esc(a.name)}</strong> · ${routeLabel(a)}</p><p class="form-note">余额 ${money(s.balance)} USDC · 最近读数 ${time(a.observed_at)}</p>` + (a.read_error ? '<p class="error">' + esc(a.read_error) + '</p>' : '') + grid(input('alias', '账户别名', a.alias, 'text', 'maxlength="80"') + input('account_ref', '交易账户标识', a.account_ref, 'text', 'maxlength="160" placeholder="默认使用完整账户名"') + '<p class="full form-note">同一实际账户在各节点使用相同标识，共享指令和每日开仓额度。不同登录下的同名账户可分别指定标识。</p>' + `<label class="full">备注<textarea name="note" maxlength="500">${esc(a.note)}</textarea></label>` + check('enabled', '允许执行资金指令', a.enabled && !a.excluded, a.excluded) + pool), '保存', async data => {
+    const inPool = data.has('in_pool');
+    let changePool = !executing && inPool !== a.in_pool;
+    if (changePool && !inPool) changePool = await verifyPoolExit(a);
     await api('accounts/config', 'POST', {
       node_id: a.node_id,
       worker_id: a.worker_id,
@@ -419,7 +437,7 @@ function accountForm(key) {
       account_ref: data.get('account_ref'),
       note: data.get('note'),
       enabled: data.has('enabled'),
-      in_pool: data.has('in_pool')
+      ...(changePool ? {in_pool:inPool} : {})
     });
     notify('账户设置已保存');
   });
@@ -540,6 +558,8 @@ const operations = {
     await refresh();
   },
   account: accountForm,
+  joinPool: key => setPoolMembership(key,true),
+  leavePool: key => setPoolMembership(key,false),
   send: () => commandForm(),
   workerCmd: value => commandForm(JSON.parse(value)),
   accountCmd: value => commandForm(JSON.parse(value)),
