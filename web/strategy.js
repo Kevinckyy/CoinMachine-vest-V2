@@ -105,38 +105,74 @@ function strategyFields(c) {
   const flag = (key,label) => check(key,label,c[key]);
   const group = (title,fields,open=false) => '<details class="parameter-group"'+(open ? ' open' : '')+'><summary>'+title+'</summary>'+grid(fields)+'</details>';
   const orders = [['live','2/2','1/2'],['live','1/2','2/2'],['2/2','live','1/2'],['2/2','1/2','live'],['1/2','live','2/2'],['1/2','2/2','live']];
-  const limit = (key,label) => input(key,label,c[key] === 'infinity' ? '∞' : c[key],'text','required pattern="(?:∞|infinity|[1-9][0-9]*)"');
+  const limit = (key,label) => input(key,label,c[key] === 'infinity' ? '∞' : c[key],'text',
+    'required pattern="(?:∞|infinity|[1-9][0-9]{0,5}|1000000)" title="填写 1 到 1000000 的整数，或填 ∞ 表示不限"');
   const phase = prefix => choices(prefix+'side','方向',dir)+choices(prefix+'size_percent','仓位比例',{25:'25%',50:'50%',75:'75%',100:'100%'})+
     numeric(prefix+'stop_buffer','爆仓线上方缓冲 M · USD',0,'any')+numeric(prefix+'take_profit','止盈 · USD（可留空）',.000001,'any','',true)+
     flag(prefix+'skip_stop_loss_on_low_drawdown','剩余额度低于阈值时免设止损')+numeric(prefix+'drawdown_stop_loss_threshold','免止损阈值 · USD',.000001,'any');
-  return group('批次与等待',numeric('batch_size','每批账户数',1,'1',100)+choices('pool_strategy','选池方式',poolNames)+
-    numeric('order_delay_min','批内最短等待 · 秒',0,'any',86400)+numeric('order_delay_max','批内最长等待 · 秒',0,'any',86400)+
-    numeric('batch_delay_min','批间最短等待 · 秒',0,'any',86400)+numeric('batch_delay_max','批间最长等待 · 秒',0,'any',86400),true)+
-    group('账户池与阶段优先级',flag('live_priority','启用阶段优先级')+select('account_priority_order','阶段顺序',orders.map(order=>
-      option(order.join(','),order.map(p=>stageNames[p]).join(' → '),order.join(',') === c.account_priority_order.join(','))).join(''))+
-      flag('refresh_account_pool','等待新增候选并在美东 20:00 日切刷新')+flag('live_default_locked','默认锁定新 Live 账户')+
+  return group('账户池与阶段优先级',choices('pool_strategy','选池方式',poolNames)+numeric('batch_size','每批账户数',1,'1',100)+
       flag('same_stage_full_batch','同阶段账户不足一批时顺延')+flag('pool_limits_enabled','启用账户池上限')+
       limit('exam_pool_limit','考核号上限（∞ 为不限）')+limit('live_pool_limit','Live 上限（∞ 为不限）')+
-      numeric('dynamic_reserve_low','动态候补下限',1)+numeric('dynamic_reserve_high','动态候补恢复线',2)+
-      numeric('dynamic_live_target','动态 Live 目标存量',1)+numeric('dynamic_exam_slots','补位考核名额（留空自动）',1,'1','',true))+
-    group('考核号下单与风控',phase(''),true)+group('Live 下单与风控',phase('live_'))+
+      numeric('dynamic_reserve_low','动态候补下限',1,'1',1000000)+numeric('dynamic_reserve_high','动态候补恢复线',2,'1',1000000)+
+      numeric('dynamic_live_target','动态 Live 目标存量',1,'1',1000000)+numeric('dynamic_exam_slots','补位考核名额（留空自动）',1,'1','',true)+
+      flag('live_priority','启用阶段优先级')+select('account_priority_order','阶段顺序',orders.map(order=>
+        option(order.join(','),order.map(p=>stageNames[p]).join(' → '),order.join(',') === c.account_priority_order.join(','))).join(''))+
+      flag('refresh_account_pool','等待新增候选并在美东 20:00 日切刷新'),true)+
+    group('批内与批间等待',
+      numeric('order_delay_min','批内最短等待 · 秒',0,'any',86400)+numeric('order_delay_max','批内最长等待 · 秒',0,'any',86400)+
+      numeric('batch_delay_min','批间最短等待 · 秒',0,'any',86400)+numeric('batch_delay_max','批间最长等待 · 秒',0,'any',86400))+
+    group('考核号下单与风控',phase(''))+
+    group('Live 下单与风控','<div class="full">'+flag('live_default_locked','Live 默认锁定')+
+      '<p class="form-note">开启后，可在「管理账户」中为指定 Live 账户勾选「加入自动策略池」以单独解锁。</p></div>'+phase('live_'),true)+
     group('Live 利润领取',choices('live_payout_recipient','收款账户',{main:'平台主账户'})+
       choices('live_payout_mode','领取方式',{all:'全部净利润',amount:'固定金额',percent:'按净利润比例'})+
       numeric('live_payout_amount','固定领取金额 · USDC',.000001,'.000001')+numeric('live_payout_percent','领取比例 · %',.000001,'any',100))+
-    '<p class="form-note">免止损比较净值与当日爆仓线的差额。等于阈值时仍会设置止损，金额为该差额减去 M。</p>';
+    '<p id="stopThresholdNote" class="form-note">免止损比较净值与当日爆仓线的差额。等于阈值时仍会设置止损，金额为该差额减去 M。</p>';
 }
 
-function formSettings(data, base) {
+function updateStrategyFields() {
+  const fields = $('dialogForm').elements;
+  const dynamic = fields.pool_strategy.value === 'dynamic';
+  const limits = fields.pool_limits_enabled.checked;
+  const liveCap = fields.live_pool_limit.value;
+  const unlimitedLive = !limits || ['∞','infinity'].includes(liveCap);
+  const finiteLive = limits && /^[1-9][0-9]*$/.test(liveCap) && Number(liveCap) <= 1000000;
+  const batch = fields.batch_size.valueAsNumber;
+  const multiple = Number.isInteger(batch) && batch >= 2;
+  // Outside dynamic allocation, a single Live account can reenter within the same batch.
+  const orderDelay = !dynamic || multiple;
+  const available = {
+    same_stage_full_batch: fields.pool_strategy.value === 'same_stage',
+    exam_pool_limit: limits, live_pool_limit: limits,
+    dynamic_reserve_low: dynamic && finiteLive, dynamic_reserve_high: dynamic && finiteLive,
+    dynamic_live_target: dynamic && unlimitedLive, dynamic_exam_slots: dynamic && multiple,
+    order_delay_min: orderDelay, order_delay_max: orderDelay,
+    account_priority_order: fields.live_priority.checked,
+    drawdown_stop_loss_threshold: fields.skip_stop_loss_on_low_drawdown.checked,
+    live_drawdown_stop_loss_threshold: fields.live_skip_stop_loss_on_low_drawdown.checked,
+    live_payout_amount: fields.live_payout_mode.value === 'amount',
+    live_payout_percent: fields.live_payout_mode.value === 'percent'
+  };
+  for (const [key,active] of Object.entries(available)) {
+    const field = fields.namedItem(key);
+    field.closest('label').hidden = !active;
+    field.disabled = !active;
+  }
+  fields.dynamic_exam_slots.max = multiple ? String(batch - 1) : '';
+  fields.dynamic_reserve_high.min = String(Math.max(2,(fields.dynamic_reserve_low.valueAsNumber || 1) + 1));
+  $('stopThresholdNote').hidden = !available.drawdown_stop_loss_threshold && !available.live_drawdown_stop_loss_threshold;
+}
+
+function formSettings(container, base) {
   const config = {...base};
-  for (const [key,prior] of Object.entries(base)) {
-    if (typeof prior === 'boolean') config[key] = data.has(key);
-    else if (!data.has(key)) continue;
-    else if (key === 'account_priority_order') config[key] = data.get(key).split(',');
+  for (const field of container.querySelectorAll('[name]:enabled')) {
+    const {name:key, value} = field;
+    if (field.type === 'checkbox') config[key] = field.checked;
+    else if (key === 'account_priority_order') config[key] = value.split(',');
     else if (key.endsWith('_pool_limit')) {
-      const v = data.get(key).trim();
-      config[key] = ['∞','infinity'].includes(v) ? 'infinity' : Number(v);
-    } else if (typeof prior === 'number' || prior === null) config[key] = data.get(key) === '' ? null : Number(data.get(key));
-    else config[key] = data.get(key);
+      config[key] = ['∞','infinity'].includes(value) ? 'infinity' : Number(value);
+    } else if (typeof base[key] === 'number' || base[key] === null) config[key] = value === '' ? null : Number(value);
+    else config[key] = value;
   }
   return config;
 }
@@ -157,15 +193,19 @@ function strategyEditor(mode,id) {
   const title = mode === 'defaults' ? '默认参数' : mode === 'preset' ? preset ? '编辑参数预设' : '新建参数预设' : nodeLabel(id)+' · 参数设置';
   dialog(title,note+name+loader+'<div id="policyFields">'+strategyFields(base)+'</div>',
     mode === 'node' ? '保存到此节点' : mode === 'defaults' ? '保存默认参数' : '保存预设',async data => {
-      const config = formSettings(data,base);
+      const config = formSettings($('policyFields'),base);
       if (mode === 'defaults') await api('strategy/defaults','PUT',config);
       else if (mode === 'preset') await api('strategy/presets/'+encodeURIComponent(target),'PUT',{name:data.get('presetName').trim(),config});
       else await api(strategyPath(id,'config'),'POST',config);
       notify(mode === 'node' ? nodeLabel(id)+' 的策略参数已保存' : mode === 'preset' ? '参数预设已保存' : '默认参数已保存');
     });
+  const controls = $('policyFields');
+  controls.oninput = controls.onchange = updateStrategyFields;
+  updateStrategyFields();
   if (mode === 'node') $('presetSource').onchange = e => {
     base = e.target.value === '' ? strategyFor(id).config : e.target.value === '@default' ? lib.defaults : lib.presets.find(p=>p.id===e.target.value).config;
-    $('policyFields').innerHTML = strategyFields(base);
+    controls.innerHTML = strategyFields(base);
+    updateStrategyFields();
   };
 }
 

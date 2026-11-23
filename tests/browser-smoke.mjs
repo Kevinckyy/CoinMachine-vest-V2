@@ -322,18 +322,104 @@ try {
   await ui.evaluate("document.querySelector('[data-value=strategy]').click()");
   assert.equal(await ui.evaluate("document.querySelectorAll('.strategy-card').length"),2);
   assert.deepEqual(await ui.evaluate("Array.from(document.querySelectorAll('[data-node=lab] dd'),n=>n.textContent)"),['1','0','1']);
-  await ui.evaluate("document.querySelector('[data-op=strategyDefaults]').click();document.querySelector('[name=batch_size]').value='4';document.getElementById('dialogForm').requestSubmit()");
+  const openPolicyGroups = () => ui.evaluate("document.querySelectorAll('#policyFields details').forEach(group=>group.open=true)");
+  const setPolicy = (name,value) => ui.evaluate(`(() => {
+    const field = document.getElementById('dialogForm').elements.namedItem(${JSON.stringify(name)});
+    if (field.disabled) throw Error('Disabled field: '+field.name);
+    if (field.type==='checkbox') {
+      if (field.checked!==${JSON.stringify(value)}) field.click();
+    } else {
+      field.value=${JSON.stringify(value)};
+      field.dispatchEvent(new Event(field.matches('select') ? 'change' : 'input',{bubbles:true}));
+    }
+    return field.type==='checkbox' ? field.checked : field.value;
+  })()`);
+  async function checkFields(expected) {
+    const states = await ui.evaluate(`Object.fromEntries(${JSON.stringify(Object.keys(expected))}.map(name=>{
+      const field=document.getElementById('dialogForm').elements.namedItem(name);
+      return [name,[field.getClientRects().length>0,!field.disabled]];
+    }))`);
+    for (const [name,active] of Object.entries(expected)) assert.deepEqual(states[name],[active,active],name);
+  }
+  const savePolicy = () => ui.evaluate("document.getElementById('dialogForm').requestSubmit()");
+  await ui.evaluate("document.querySelector('[data-op=strategyDefaults]').click()");
+  await checkFields({live_default_locked:true});
+  assert.equal(await ui.evaluate("document.querySelector('[name=live_default_locked]').checked"),true);
+  await openPolicyGroups();
+  await checkFields({same_stage_full_batch:false,exam_pool_limit:false,live_pool_limit:false,dynamic_exam_slots:false,
+    dynamic_live_target:false,dynamic_reserve_low:false,account_priority_order:true,drawdown_stop_loss_threshold:false,
+    live_drawdown_stop_loss_threshold:false,live_payout_amount:false,live_payout_percent:false});
+  await setPolicy('pool_strategy','same_stage');
+  await checkFields({same_stage_full_batch:true,dynamic_live_target:false});
+  await setPolicy('pool_strategy','dynamic');
+  await checkFields({same_stage_full_batch:false,dynamic_live_target:true,dynamic_exam_slots:true,dynamic_reserve_high:false});
+  await setPolicy('pool_limits_enabled',true);
+  await checkFields({exam_pool_limit:true,live_pool_limit:true,dynamic_live_target:false,dynamic_reserve_low:true,dynamic_reserve_high:true});
+  await setPolicy('live_pool_limit','∞');
+  await checkFields({dynamic_live_target:true,dynamic_reserve_low:false,dynamic_reserve_high:false});
+  await setPolicy('batch_size',1);
+  await checkFields({dynamic_exam_slots:false,order_delay_min:false,batch_delay_min:true});
+  await setPolicy('batch_size',4);
+  assert.equal(await ui.evaluate("document.querySelector('[name=dynamic_exam_slots]').max"),'3');
+  await setPolicy('live_priority',false);
+  await checkFields({account_priority_order:false});
+  await setPolicy('skip_stop_loss_on_low_drawdown',true);
+  await checkFields({drawdown_stop_loss_threshold:true,live_drawdown_stop_loss_threshold:false});
+  await setPolicy('skip_stop_loss_on_low_drawdown',false);
+  await setPolicy('live_skip_stop_loss_on_low_drawdown',true);
+  await checkFields({drawdown_stop_loss_threshold:false,live_drawdown_stop_loss_threshold:true,live_default_locked:true});
+  await setPolicy('live_payout_mode','amount');
+  await checkFields({live_payout_amount:true,live_payout_percent:false});
+  await setPolicy('live_payout_amount',7);
+  await setPolicy('live_payout_mode','percent');
+  await checkFields({live_payout_percent:true,live_payout_amount:false});
+  await setPolicy('live_payout_mode','amount');
+  assert.equal(await ui.evaluate("document.querySelector('[name=live_payout_amount]').value"),'7');
+  await setPolicy('live_payout_amount','');
+  await setPolicy('live_payout_mode','all');
+  assert.equal(await ui.evaluate("document.getElementById('dialogForm').checkValidity()"),true);
+  await savePolicy();
   await until(async()=>(await api('state')).strategy_settings.defaults.batch_size===4,'center defaults');
-  await until(()=>ui.evaluate("!document.getElementById('dialog').open"),'default settings saved');
-  await ui.evaluate("document.querySelector('[data-op=strategyPresets]').click();document.querySelector('[data-op=editPreset]').click();document.querySelector('[name=presetName]').value='晚间';document.querySelector('[name=batch_size]').value='3';document.querySelector('[name=stop_buffer]').value='0';document.querySelector('[name=live_size_percent]').value='75';document.getElementById('dialogForm').requestSubmit()");
+  const savedDefaults=(await api('state')).strategy_settings.defaults;
+  assert.equal(savedDefaults.live_payout_amount,1);
+  assert.equal(savedDefaults.same_stage_full_batch,true);
+  assert.equal(savedDefaults.live_pool_limit,'infinity');
+  await until(()=>ui.evaluate("!document.getElementById('dialog').open && state.strategy_settings.defaults.batch_size===4"),'default settings saved');
+  await ui.evaluate("document.querySelector('[data-op=strategyPresets]').click();document.querySelector('[data-op=editPreset]').click();document.querySelector('[name=presetName]').value='晚间'");
+  await openPolicyGroups();
+  await checkFields({dynamic_live_target:true,live_payout_amount:false,live_drawdown_stop_loss_threshold:true});
+  await setPolicy('live_pool_limit','10');
+  await setPolicy('batch_size',3);
+  await setPolicy('stop_buffer',0);
+  await setPolicy('live_size_percent',75);
+  await setPolicy('live_payout_mode','percent');
+  await setPolicy('live_payout_percent',35);
+  assert.equal(await setPolicy('live_default_locked',false),false);
+  await savePolicy();
   await until(async()=>(await api('state')).strategy_settings.presets.some(p=>p.name==='晚间'),'preset saved');
   await until(()=>ui.evaluate("!document.getElementById('dialog').open && state.strategy_settings.presets.length===1"),'preset available for node');
-  await ui.evaluate("document.querySelector('[data-node=spare] [data-op=strategyConfig]').click();const src=document.getElementById('presetSource');src.value=src.options[2].value;src.dispatchEvent(new Event('change'));document.getElementById('dialogForm').requestSubmit()");
+  await ui.evaluate("document.querySelector('[data-node=spare] [data-op=strategyConfig]').click();const src=document.getElementById('presetSource');src.value=src.options[2].value;src.dispatchEvent(new Event('change'))");
+  await openPolicyGroups();
+  await checkFields({dynamic_live_target:false,dynamic_reserve_high:true,live_payout_percent:true,live_payout_amount:false,live_default_locked:true});
+  await savePolicy();
   await until(async()=>(await api('state?node_id=spare')).strategy.config.batch_size===3,'node-only preset application');
   assert.equal((await api('state?node_id=lab')).strategy.config.batch_size,2);
   assert.equal((await api('state?node_id=spare')).strategy.config.live_size_percent,75);
   assert.equal((await api('state?node_id=spare')).strategy.config.stop_buffer,0);
+  assert.equal((await api('state?node_id=spare')).strategy.config.live_default_locked,false);
+  assert.equal((await api('state?node_id=spare')).strategy.config.live_payout_percent,35);
   await until(()=>ui.evaluate("!document.getElementById('dialog').open"),'settings saved');
+  for (const locked of [false,true]) {
+    await ui.evaluate("document.querySelector('[data-node=lab] [data-op=strategyConfig]').click()");
+    await checkFields({live_default_locked:true});
+    assert.equal(await setPolicy('live_default_locked',locked),locked);
+    await savePolicy();
+    await until(async()=>{
+      const s=await api('state?node_id=lab'), live=s.accounts.find(a=>a.name==='Beta');
+      return s.strategy.config.live_default_locked===locked && live.live_default_locked===locked && live.in_pool===!locked;
+    },'Live default lock changes pool membership');
+    await until(()=>ui.evaluate("!document.getElementById('dialog').open && state.strategies.find(s=>s.node_id==='lab').config.live_default_locked==="+locked),'saved node lock visible');
+  }
   await api('nodes/offline','PUT',{label:'离线模拟节点',url:'http://127.0.0.1:'+await port(),token:token()});
   assert.equal((await api('state?node_id=offline')).strategy.config.batch_size,4);
   await ui.evaluate("document.querySelector('[data-node=spare] [data-op=start]').click();document.getElementById('dialogForm').requestSubmit()");
