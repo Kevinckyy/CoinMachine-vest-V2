@@ -26,10 +26,17 @@ async function refresh() {
   $('status').textContent = (state.diagnostic || '本机桥 · 127.0.0.1:8877') +
     (state.cacheCount == null ? '' : ' · 已缓存 '+state.cacheCount+' 个活动账户');
 }
-$('refreshCards').onclick = async () => {
-  try { await send('ui.refresh'); $('status').textContent='已请求全量刷新'; }
-  catch (err) { $('status').textContent=err.message; }
-};
+for (const [id, type, notice] of [
+  ['refreshCards','ui.refresh','已请求全量拉取账户列表'],
+  ['readAll','ui.readAll','已请求全量读取账户信息，可在中心查看逐户读取进度']
+]) {
+  $(id).onclick = async () => {
+    $(id).disabled = true;
+    try { await send(type); $('status').textContent=notice; }
+    catch (err) { $('status').textContent=err.message; }
+    finally { $(id).disabled=false; }
+  };
+}
 for (const id of ['readonly', 'execute', 'disconnect']) {
   $(id).onclick = async () => {
     const buttons = [...document.querySelectorAll('button')];

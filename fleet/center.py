@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from . import daily_floor, ledger, reporting, updates
 
-from .protocol import (NODE_TTL, OBS_TTL, PENDING, RUN_TTL, TERMINAL, WORKER_TTL, WRITE, Problem, boolean,
+from .protocol import (NODE_TTL, OBS_TTL, PENDING, PORTFOLIO_SCAN, RUN_TTL, TERMINAL, WORKER_TTL, WRITE, Problem, boolean,
                        bridge_url, choice, dump, fields, ident, make_command, number, obj, parameters,
                        request, require, string, validate_target)
 from .storage import Database, check_reservations, command, find_command, finish, insert, record, summary
@@ -244,6 +244,8 @@ class Center:
         require(not updates.active(db,route[0]), "节点正在等待或执行软件更新", 409)
         require(not node["agent_release"] or node["agent_release"] == node["release"], "等待同步节点桥的新版本", 409)
         require(not node["release"] or worker.get("release") == node["release"], "浏览器尚未加载当前节点版本", 409)
+        if req["action"] == PORTFOLIO_SCAN:
+            require(worker.get("portfolio_version") == 1, "请更新节点桥并重新加载 1.4.0 或更高版本插件", 409)
         a = accounts.get((*route, req["account"]))
         if req["action"]=="order.open" and a:
             budget = daily_floor.stop_amount((a.get("risk") or {}).get("equity"),a.get("daily_floor"),req["params"]["stop_buffer"])
@@ -485,8 +487,34 @@ class Center:
     def refresh_accounts(self, nid):
         with self.db.tx() as db:
             generation = self._request_cards(db,nid)
-            reporting.log(db,nid,self.clock(),"account","已请求手动全量刷新活动账户")
+            reporting.log(db,nid,self.clock(),"account","已请求全量拉取账户列表")
             return {"generation":generation}
+
+    def read_accounts(self, nid):
+        with self.db.tx() as db:
+            inventory = self._inventory(db, nid)
+            require(nid in inventory[0], "找不到该节点", 404)
+            ids, skipped = [], []
+            for worker in inventory[1].values():
+                if not worker["online"]:
+                    continue
+                wid = worker["worker_id"]
+                if worker.get("portfolio_version") != 1:
+                    skipped.append(wid)
+                    continue
+                prior = db.execute("""SELECT id FROM commands WHERE node=? AND worker=? AND action=?
+                                   AND status IN ('pending','sending','queued','running')
+                                   AND json_extract(body,'$.session_id')=? ORDER BY created LIMIT 1""",
+                                   (nid, wid, PORTFOLIO_SCAN, worker["session_id"])).fetchone()
+                if prior:
+                    ids.append(prior["id"])
+                    continue
+                req = request(dict(node_id=nid, worker_id=wid, action=PORTFOLIO_SCAN))
+                cmd = self._prepare(db, str(uuid.uuid4()), req, inventory)
+                insert(db, cmd, "pending", self.clock())
+                ids.append(cmd["id"])
+            require(ids, "请更新节点桥并重新加载 1.4.0 或更高版本插件" if skipped else "此节点尚无在线浏览器", 409)
+            return {"commands": ids, "skipped": skipped}
 
     def strategy(self, op, body, node_id=None):
         with self.db.tx() as db:
@@ -505,7 +533,7 @@ class Center:
                     require(command(db, key)["status"] not in PENDING | {"unknown"}, "上一批仍有未结束的指令", 409)
                 self._request_cards(db,node_id)
                 s.update(enabled=True, draining=False, run=uid(), batch=0, members=[], replace=0,
-                         next_at=self.clock(), message="等待浏览器全量刷新活动账户")
+                         next_at=self.clock(), message="等待浏览器全量拉取账户列表")
             elif op == "config":
                 require(not s["enabled"], "请先停止策略再修改参数", 409)
                 fields(body, DEFAULT_CONFIG)
@@ -599,7 +627,7 @@ class Center:
             self._request_cards(db,s["node_id"])
         if not node["card_generation"] or not online or any(w.get("card_generation")!=node["card_generation"] or
                 w["mode"]=="execute" and w.get("card_session")!=w["session_id"] for w in online):
-            s["message"] = "等待浏览器全量刷新活动账户"
+            s["message"] = "等待浏览器全量拉取账户列表"
             self._save_strategy(db,s)
             return
         # The legacy random-entry policy draws one direction for the entire batch.

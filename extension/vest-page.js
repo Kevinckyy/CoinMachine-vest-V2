@@ -443,8 +443,8 @@
         category: core.accountCategory(labels) || (phase === 'live' ? 'funded' : phase ? 'eval' : null)
       };
     }
-    function readAccountHealth() {
-      const indicators = [...document.querySelectorAll('[data-testid="account-health"]')].filter(el => visible(el) && !el.closest('[role="dialog"],[role="alertdialog"],[role="menu"],[aria-busy="true"],[data-loading="true"]'));
+    function readAccountHealth(scope = document) {
+      const indicators = [...scope.querySelectorAll('[data-testid="account-health"]')].filter(el => visible(el) && !el.closest('[role="dialog"],[role="alertdialog"],[role="menu"],[aria-busy="true"],[data-loading="true"]'));
       const readings = indicators.map(el => core.parseCapitalMetric(elementText(el)));
       const first = readings[0];
       return first?.percent != null && first.percent <= 100 && readings.every(item => item?.percent === first.percent) ? first : null;
@@ -504,8 +504,8 @@
         } : null];
       }));
     }
-    function dailyUnlimited() {
-      return [...document.querySelectorAll('div.sticky.top-14 p,[data-testid="capital-indicator-daily-loss"]')].some(el =>
+    function dailyUnlimited(scope = document) {
+      return [...scope.querySelectorAll('div.sticky.top-14 p,[data-testid="capital-indicator-daily-loss"]')].some(el =>
         visible(el) && /^(?:(?:max\.? daily loss|最大日亏损)\s*[:：]\s*)?(?:no daily loss limit|unlimited|无每日亏损上限|无日损限制|不限)$/i.test(core.normalized(el.innerText)));
     }
     async function dailyReference(name) {
@@ -635,10 +635,10 @@
     function observerSelectorOpen() {
       return observerItems().length > 0 || queryOne('[data-testid="account-selector-trigger"]')?.getAttribute('aria-expanded') === 'true';
     }
-    async function observerOpenSelector(guard = () => {}, outerDeadline = Infinity) {
+    async function observerOpenSelector(guard = () => {}, outerDeadline = Infinity, assertPage = observerAssertPage) {
       guard();
       const pause = ms => delay(Math.min(ms, Math.max(0, outerDeadline - Date.now())));
-      observerAssertPage();
+      assertPage();
       if (observerItems().length) return observerItems();
       const trigger = observerTrigger();
       trigger.focus();
@@ -670,7 +670,7 @@
       const deadline = Number.isFinite(outerDeadline) ? outerDeadline : Date.now() + 4500;
       while (Date.now() < deadline) {
         guard();
-        observerAssertPage();
+        assertPage();
         const items = observerItems();
         if (items.length) return items;
         await pause(150);
@@ -766,10 +766,10 @@
       pending.code = 'OBSERVATION_PENDING';
       throw pending;
     }
-    async function observerSelect(account, guard = () => {}, outerDeadline = Infinity) {
+    async function observerSelect(account, guard = () => {}, outerDeadline = Infinity, assertPage = observerAssertPage) {
       const guardPage = () => {
         guard();
-        observerAssertPage();
+        assertPage();
       };
       const attempts = Number.isFinite(outerDeadline) ? 1 : 2;
       let currentName;
@@ -777,15 +777,15 @@
         guardPage();
         // The first click can finish just as the retry starts. Keep the original target.
         if (attempt && observerIdentity(true)?.name === account.name && !observerSelectorOpen()) return;
-        const items = await observerOpenSelector(guardPage, outerDeadline);
+        const items = await observerOpenSelector(guardPage, outerDeadline, assertPage);
         guardPage();
         const byName = new Map();
         for (const item of items) byName.set(item.name, byName.has(item.name) ? null : item);
-        if (!byName.has(account.name)) throw Object.assign(new Error(account.name + ' 已从交易账户列表消失'), {
+        if (!byName.has(account.name)) throw Object.assign(new Error(account.name + ' 已从账户选择器消失'), {
           code: 'ACCOUNT_MISSING_FROM_SELECTOR'
         });
         const selected = byName.get(account.name);
-        if (!selected) throw new Error(account.name + ' 在交易列表中出现同名项，无法确认账户身份');
+        if (!selected) throw new Error(account.name + ' 在账户选择器中出现同名项，无法确认账户身份');
         account.category = selected.category;
         account.identity = selected.category + ':' + account.name;
         if (observerIdentity(true)?.name !== account.name) selected.element.click();
@@ -808,6 +808,71 @@
         if (attempt + 1 < attempts) await observerCloseSelector(guardPage);
       }
       throw new Error(currentName === account.name ? `${account.name} 已显示，但账户菜单未关闭，切换无法确认` : `无法确认已切换到 ${account.name}，页面当前为 ${currentName || '未识别账户'}`);
+    }
+    function portfolioLimit(root, metric) {
+      const indicator = queryOne('[data-testid="capital-indicator-'+metric+'"]',root);
+      if (indicator) return core.parseCapitalMetric(elementText(indicator));
+      // Multi-step evaluations render the two amounts beside each limit's SVG gauge.
+      const gauge = queryOne('section[aria-labelledby="evaluation-limits-title"] [data-testid="multi-step-'+metric+'-gauge-progress"]',root);
+      const group = gauge?.closest('svg')?.parentElement;
+      return group ? core.parseCapitalMetric(elementText(queryOne('p[aria-label]',group))) : null;
+    }
+    async function readPortfolio(name, phase) {
+      const assertPage = () => {
+        assertLive();
+        if (location.origin !== 'https://next.vestmarkets.com' || location.pathname.replace(/\/$/,'') !== '/portfolio')
+          throw Error('全量读取账户详情需要 Portfolio 页面');
+        assertNoDialogs();
+      };
+      const rootSelector = '[data-testid="portfolio-root"]';
+      const readyBy = Date.now() + 10000;
+      while (true) {
+        assertPage();
+        if (queryOne(rootSelector) && observerIdentity(true)) break;
+        if (Date.now() >= readyBy) throw Error('Portfolio 或账户选择器未加载，请检查登录状态和桌面布局');
+        await delay(200);
+      }
+      try {
+        await observerSelect({name},assertLive,Date.now()+6000,assertPage);
+      } finally {
+        if (observerSelectorOpen()) await observerCloseSelector(assertPage);
+      }
+      await delay(900);
+      const deadline = Date.now()+5000;
+      const busy = '[aria-busy="true"],[data-loading="true"],[data-slot="skeleton"],.animate-pulse';
+      const fieldSelector = ['account-value','account-health','capital-indicator-daily-loss','capital-indicator-drawdown']
+        .map(key=>'[data-testid="'+key+'"]').join(',');
+      let previous, stable;
+      do {
+        assertPage();
+        const identity = observerIdentity();
+        if (identity.name !== name || phase && identity.phase && phase !== identity.phase)
+          throw Error('Portfolio 当前账户或阶段与清单不符');
+        const root = queryOne(rootSelector,document,true);
+        const loading = [...root.querySelectorAll(fieldSelector)].some(el => visible(el) &&
+          (el.closest(busy) || [...el.querySelectorAll(busy)].some(visible)));
+        stable = null;
+        if (!loading && !observerSelectorOpen()) {
+          const read = id => elementText(queryOne('[data-testid="'+id+'"]',root));
+          const daily = portfolioLimit(root,'daily-loss');
+          const drawdown = portfolioLimit(root,'drawdown');
+          const fields = {equity:core.parseMoney(read('account-value')),health:readAccountHealth(root)?.percent ?? null,
+            daily_loss:daily?.current ?? null,daily_limit:daily?.limit ?? null,
+            drawdown:drawdown?.current ?? null,drawdown_limit:drawdown?.limit ?? null};
+          const unlimited = dailyUnlimited(root);
+          const missing = Object.keys(fields).filter(k=>fields[k]===null && !(unlimited && k.startsWith('daily_')));
+          const signature = JSON.stringify([identity.signature,missing,unlimited]);
+          if (previous === signature && Object.values(fields).some(Number.isFinite)) {
+            stable = {...fields,daily_unlimited:unlimited,observed_at:Date.now()/1000};
+            if (!missing.length) return stable;
+          }
+          previous = signature;
+        } else previous = null;
+        await delay(250);
+      } while (Date.now() < deadline);
+      assertPage();
+      if (stable && observerIdentity().name === name) return stable;
+      throw Error('Portfolio 详情尚未加载或账户读数未稳定');
     }
     async function list() {
       try {
@@ -1173,6 +1238,7 @@
     return {
       list,
       read,
+      readPortfolio,
       history,
       payoutHistory,
       execute

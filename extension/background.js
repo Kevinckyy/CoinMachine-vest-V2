@@ -34,6 +34,7 @@ function publicBinding({
   return {
     release: BUILD,
     cards_version: 1,
+    portfolio_version: 1,
     session_id,
     worker_id,
     mode,
@@ -146,6 +147,12 @@ async function setBinding(message) {
     if (!previous) throw Error('请先绑定浏览器');
     await chrome.storage.local.set({cardRequest:crypto.randomUUID()});
     return {ok:true};
+  }
+  if (message.type === 'ui.readAll') {
+    if (!previous || !cfg.token) throw Error('请先绑定浏览器');
+    const tab = await chrome.tabs.get(previous.tabId);
+    if (!tab.url || new URL(tab.url).origin !== VEST) throw Error('绑定的标签页已离开 Vest');
+    return post('read-all',{...publicBinding(previous),page:new URL(tab.url).pathname,id:crypto.randomUUID()},cfg);
   }
   if (message.type === 'ui.disconnect') {
     await chrome.storage.local.remove('updateResume');
@@ -400,7 +407,7 @@ async function startRoute(owner,url,path,work) {
 async function pollWork(owner,cfg,meta,url) {
   if ((await binding())?.session_id !== owner.session_id) throw Error('绑定已变化');
   await drain(cfg);
-  const saved = await chrome.storage.session.get(['cardRoute','cardVisit','returnCards']);
+  const saved = await chrome.storage.session.get(['cardRoute','cardVisit','returnCards','cachedScan']);
   const route = saved.cardRoute;
   let data;
   if (route) {
@@ -415,14 +422,17 @@ async function pollWork(owner,cfg,meta,url) {
   if (!data) {
     const {manualView} = await chrome.storage.session.get('manualView');
     const manual = owner.mode==='readonly' && manualView?.tabId===owner.tabId && onPath(url,manualView.path);
-    data = await post('poll',{...meta,manual_view:manual},cfg);
+    data = await post('poll',{...meta,manual_view:manual,cached_scan:saved.cachedScan?.sid===owner.session_id ? saved.cachedScan.id : null},cfg);
   }
   if (data.update_release) return data;
   const cmd = data.command;
   if (cmd?.action === 'page.navigate') return data;
   if (cmd) {
-    const path = cmd.action === 'accounts.list' ? DESTINATIONS.accounts : DESTINATIONS.trade;
-    if (!data.arrived && (!onPath(url,path) || cmd.action === 'accounts.list')) {
+    const scan = cmd.action === 'accounts.read_all';
+    const directory = cmd.action === 'accounts.list' || scan && data.scan?.stage === 'list';
+    const path = directory ? DESTINATIONS.accounts : scan ? DESTINATIONS.portfolio : DESTINATIONS.trade;
+    if (scan) await chrome.storage.session.set({returnCards:owner.session_id});
+    if (!data.arrived && (directory || !onPath(url,path))) {
       return startRoute(owner,url,path,{...data,arrived:true,owner:publicBinding(owner)});
     }
     await chrome.storage.session.set({['lease.'+cmd.id]:{...owner,action:cmd.action}});
@@ -443,6 +453,26 @@ async function pollWork(owner,cfg,meta,url) {
     if (!onPath(url,DESTINATIONS.accounts))
       return startRoute(owner,url,DESTINATIONS.accounts,{arrived:true,card_generation:generation});
   }
+  return data;
+}
+async function reportCards(owner,cfg,payload) {
+  const bound = await binding();
+  if (bound?.session_id !== owner.session_id || bound.pageId !== owner.pageId) throw Error('提交清单的页面已更换');
+  const cards = payload.cards;
+  const data = await post('report',payload,cfg);
+  try {
+    await chrome.storage.local.set({cardCache:{worker_id:owner.worker_id,items:cards.items,risks:data.risks,
+      portfolios:data.portfolios || {},observed_at:cards.observed_at}});
+    if (cards.scan_id) await chrome.storage.session.set({cachedScan:{sid:owner.session_id,id:cards.scan_id}});
+  } catch (err) {
+    if (cards.scan_id) {
+      await post('result',{...publicBinding(owner),id:cards.scan_id,ok:false,result:{},error:'无法写入本次账户列表缓存'},cfg);
+    }
+    throw err;
+  }
+  if (cards.scan_id) await chrome.storage.session.remove('lease.'+cards.scan_id);
+  if (cards.full && cards.purchase_request && (await chrome.storage.local.get('cardRequest')).cardRequest===cards.purchase_request)
+    await chrome.storage.local.remove('cardRequest');
   return data;
 }
 async function handle(message, sender) {
@@ -489,25 +519,23 @@ async function handle(message, sender) {
     ...message.data,
     ...meta
   };
-  const data = op === 'poll' ? await exclusive(() => pollWork(owner,cfg,meta,sender.url)) : await post(op,payload,cfg);
-  if (op === 'report' && payload.cards) {
-    const {cards} = payload;
-    await exclusive(async () => {
-      if ((await binding())?.session_id!==owner.session_id) return;
-      await chrome.storage.local.set({cardCache:{worker_id:owner.worker_id,items:cards.items,risks:data.risks,observed_at:cards.observed_at}});
-      if (cards.full && cards.purchase_request && (await chrome.storage.local.get('cardRequest')).cardRequest===cards.purchase_request)
-        await chrome.storage.local.remove('cardRequest');
-    });
-  }
-  if (data.risk && payload.observation) {
+  let data;
+  if (op === 'poll') data = await exclusive(() => pollWork(owner,cfg,meta,sender.url));
+  else if (op === 'report' && payload.cards) data = await exclusive(() => reportCards(owner,cfg,payload));
+  else data = await post(op,payload,cfg);
+  if (data.risk && (payload.observation || payload.portfolio)) {
     await exclusive(async () => {
       const {cardCache} = await chrome.storage.local.get('cardCache');
       if ((await binding())?.session_id===owner.session_id && cardCache?.worker_id===owner.worker_id) {
-        cardCache.risks[payload.observation.name] = data.risk;
+        const name = (payload.observation || payload.portfolio).name;
+        cardCache.risks[name] = data.risk;
+        if (data.portfolio) (cardCache.portfolios ??= {})[name] = data.portfolio;
         await chrome.storage.local.set({cardCache});
       }
     });
   }
+  if (payload.portfolio && data.status !== 'running')
+    await chrome.storage.session.remove('lease.'+payload.portfolio.id);
   if (op === 'intent' && data.authorize_click === true) {
     await exclusive(() => reserveClick(owner, message.data.id, message.data.stage));
   }

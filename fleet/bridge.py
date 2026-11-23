@@ -3,10 +3,10 @@ import json
 import os
 import time
 import uuid
-from . import cards, daily_floor, ledger, reporting, updates
+from . import cards, daily_floor, ledger, portfolio, reporting, updates
 
-from .protocol import (PHASES, PRIMARY, RUN_TTL, TERMINAL, WRITE, Problem, boolean, choice,
-                       dump, ident, number, obj, request, require, string, validate_target)
+from .protocol import (PHASES, PORTFOLIO_SCAN, PRIMARY, RUN_TTL, TERMINAL, WRITE, Problem, boolean, choice,
+                       dump, ident, make_command, number, obj, request, require, string, validate_target)
 from .storage import Database, check_reservations, command, find_command, finish, insert, record
 
 
@@ -18,7 +18,7 @@ def account_view(row):
     if not row:
         return None
     return {**{k: row[k] for k in row.keys() if k != "tracked_position"}, "snapshot": json.loads(row["snapshot"]),
-            **{k:json.loads(row[k]) if row[k] else None for k in ("card","risk")},
+            **{k:json.loads(row[k]) if row[k] else None for k in ("card","risk","portfolio")},
             **{key: bool(row[key]) for key in ("present", "ambiguous", "excluded")}}
 
 
@@ -73,7 +73,8 @@ class Bridge:
             updates.revision(self.release)
         self.db.conn.executescript("""
             CREATE TABLE IF NOT EXISTS identity(node_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS worker_build(worker_id TEXT PRIMARY KEY,release TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS worker_build(worker_id TEXT PRIMARY KEY,release TEXT NOT NULL,
+                portfolio_version INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS update_gate(slot INTEGER PRIMARY KEY CHECK(slot=1),owner TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workers(
                 worker_id TEXT PRIMARY KEY, label TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -92,6 +93,8 @@ class Bridge:
         daily_floor.schema(self.db.conn)
         reporting.log_schema(self.db.conn)
         with self.db.tx() as db:
+            if "portfolio_version" not in {r["name"] for r in db.execute("PRAGMA table_info(worker_build)")}:
+                db.execute("ALTER TABLE worker_build ADD COLUMN portfolio_version INTEGER NOT NULL DEFAULT 0")
             cols = {r["name"] for r in db.execute("PRAGMA table_info(accounts)")}
             for col in ("listed_session", "read_session", "tracked_position"):
                 if col not in cols:
@@ -120,6 +123,9 @@ class Bridge:
         for row in db.execute("SELECT * FROM commands WHERE status IN ('queued','running')").fetchall():
             if row["status"] == "queued" and now >= json.loads(row["body"])["expires_at"]:
                 finish(db, row["id"], "expired", now, "插件未在有效期内领取")
+            elif row["status"] == "running" and row["action"] == PORTFOLIO_SCAN:
+                if now >= row["updated"] + RUN_TTL:
+                    finish(db, row["id"], "failed", now, "全量读取超时，已保留逐户结果", portfolio.progress(row))
             elif row["status"] == "running" and now >= row["claimed"] + RUN_TTL:
                 uncertain = bool(json.loads(row["intents"]))
                 finish(db, row["id"], "unknown" if uncertain else "failed", now,
@@ -128,14 +134,22 @@ class Bridge:
     def status(self):
         with self.db.tx() as db:
             self._expire(db, self.clock())
+            workers = []
+            for row in db.execute("""SELECT w.*,COALESCE(b.release,'') AS release,COALESCE(b.portfolio_version,0) AS portfolio_version,c.session AS card_session,
+                    c.generation AS card_generation,c.full_at AS cards_full_at FROM workers w
+                    LEFT JOIN worker_build b ON b.worker_id=w.worker_id LEFT JOIN card_sync c ON c.worker=w.worker_id ORDER BY label"""):
+                scan = db.execute("""SELECT id,status,error, json_extract(result,'$.stage') AS stage,
+                        json_extract(result,'$.total') AS total,json_extract(result,'$.read') AS read,
+                        json_extract(result,'$.partial') AS partial,json_extract(result,'$.failed') AS failed
+                        FROM commands WHERE worker=? AND action=? ORDER BY created DESC,id DESC LIMIT 1""",
+                                  (row["worker_id"], PORTFOLIO_SCAN)).fetchone()
+                workers.append({**worker_view(row), "portfolio_scan": dict(scan) if scan else None})
             return {"version": 1, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
                     "launch_id": self.launch_id,
                     "ledger_seq": db.execute("SELECT COALESCE(MAX(seq),0) FROM book").fetchone()[0],
                     "log_seq": db.execute("SELECT COALESCE(MAX(id),0) FROM node_logs").fetchone()[0],
                     "card_generation":db.execute("SELECT generation FROM card_request").fetchone()[0],
-                    "workers": [worker_view(r) for r in db.execute("""SELECT w.*,COALESCE(b.release,'') AS release,
-                                c.session AS card_session,c.generation AS card_generation,c.full_at AS cards_full_at FROM workers w
-                                LEFT JOIN worker_build b ON b.worker_id=w.worker_id LEFT JOIN card_sync c ON c.worker=w.worker_id ORDER BY label""")],
+                    "workers": workers,
                     "accounts": [{**account_view(r),"daily_floor":daily_floor.view(db,r["worker_id"],r["name"],self.clock())}
                                  for r in db.execute("SELECT * FROM accounts ORDER BY worker_id,name")]}
 
@@ -237,13 +251,18 @@ class Bridge:
         if not row or generation > row["generation"]:
             for job in db.execute("SELECT * FROM commands WHERE worker=? AND status='queued'", (wid,)).fetchall():
                 finish(db, job["id"], "cancelled", now, "浏览器会话已更换")
+            for job in db.execute("SELECT * FROM commands WHERE worker=? AND status='running' AND action=?",
+                                  (wid, PORTFOLIO_SCAN)).fetchall():
+                finish(db, job["id"], "cancelled", now, "浏览器会话已更换", portfolio.progress(job))
         page = string(body.get("page", ""), "页面路径", 200, True)
         error = string(body.get("error", ""), "插件状态", 500, True)
         build = body.get("release", "")
         if build != "":
             updates.revision(build)
-        db.execute("""INSERT INTO worker_build VALUES(?,?) ON CONFLICT(worker_id) DO UPDATE
-                   SET release=excluded.release WHERE release!=excluded.release""", (wid,build))
+        db.execute("""INSERT INTO worker_build(worker_id,release,portfolio_version) VALUES(?,?,?) ON CONFLICT(worker_id) DO UPDATE
+                   SET release=excluded.release,portfolio_version=excluded.portfolio_version
+                   WHERE release!=excluded.release OR portfolio_version!=excluded.portfolio_version""",
+                   (wid,build,int(body.get("portfolio_version") == 1)))
         if not row or row["session_id"] != sid or row["error"] != error:
             message = error or ("浏览器已连接 · 执行模式" if mode == "execute" else "浏览器已连接 · 只读模式")
             reporting.log(db, self.node_id, now, "browser", message, "warning" if error else "info", worker=wid)
@@ -336,10 +355,34 @@ class Bridge:
             wid, sid = self._touch(db, body, now)
             if op == "heartbeat":
                 return {"ok": True}
+            if op == "read-all":
+                require(body.get("portfolio_version") == 1 and (not self.release or body.get("release") == self.release),
+                        "请先加载当前版本插件", 409)
+                require(not db.execute("SELECT 1 FROM update_gate").fetchone(), "节点更新维护中", 409)
+                prior = db.execute("""SELECT id FROM commands WHERE worker=? AND action=? AND status IN ('queued','running')
+                                   ORDER BY created LIMIT 1""", (wid, PORTFOLIO_SCAN)).fetchone()
+                if prior:
+                    return {"id": prior["id"]}
+                key = ident(body.get("id"))
+                if find_command(db, key):
+                    portfolio.owned(db, key, wid, sid)
+                    return {"id": key}
+                req = request(dict(node_id=self.node_id, worker_id=wid, action=PORTFOLIO_SCAN))
+                cmd = make_command(key, req, {"instance_id": self.instance_id}, {"session_id": sid}, None, now, "plugin")
+                insert(db, cmd, "queued", now)
+                return {"id": key}
             if op == "report":
                 if "cards" in body:
                     require(body.get("page","").rstrip("/")=="/accounts","需要活跃账户页面",409)
-                    return cards.update(db,wid,sid,body["cards"],now)
+                    reading = obj(body["cards"])
+                    ack = cards.update(db, wid, sid, reading, now)
+                    if "scan_id" in reading:
+                        row = portfolio.owned(db, reading["scan_id"], wid, sid)
+                        portfolio.listed(db, row, reading, now)
+                    return ack
+                if "portfolio" in body:
+                    require(body.get("page", "").rstrip("/") == "/portfolio", "需要 Portfolio 页面", 409)
+                    return portfolio.observe(db, wid, sid, body["portfolio"], now)
                 if "inventory" in body:
                     self._inventory(db, wid, sid, body["inventory"])
                 if "observation" in body:
@@ -360,24 +403,37 @@ class Bridge:
             require(op == "poll", "接口不存在", 404)
             if self.release and body.get("release") != self.release:
                 return {"command":None, "update_release":self.release}
-            if db.execute("SELECT 1 FROM commands WHERE worker=? AND status='running'", (wid,)).fetchone():
+            running = db.execute("SELECT * FROM commands WHERE worker=? AND status='running'", (wid,)).fetchone()
+            if running:
+                if running["action"] == PORTFOLIO_SCAN and json.loads(running["body"])["session_id"] == sid:
+                    return portfolio.delivery(db, running, body.get("cached_scan"), now)
                 return {"command": None}
+            refresh_generation = None
             if body.get("cards_version")==1:
                 gen = db.execute("SELECT generation FROM card_request").fetchone()[0]
                 ack = db.execute("SELECT session,generation FROM card_sync WHERE worker=?",(wid,)).fetchone()
                 manual_view = body.get("manual_view") is True and body["mode"]=="readonly"
                 if not ack or ack["generation"]!=gen or ack["session"]!=sid and not manual_view:
-                    return {"command":None,"refresh_cards":gen}
+                    refresh_generation = gen
             for row in db.execute("SELECT * FROM commands WHERE worker=? AND status='queued' ORDER BY created,id", (wid,)).fetchall():
                 cmd = json.loads(row["body"])
+                if refresh_generation is not None and cmd["action"] not in ("accounts.list", PORTFOLIO_SCAN):
+                    continue
                 try:
                     validate_target(cmd, *target(db, cmd), now)
                     check_reservations(db, cmd, now)
+                    if cmd["action"] == PORTFOLIO_SCAN:
+                        require(body.get("portfolio_version") == 1, "请重新加载支持全量读取账户信息的插件", 409)
                 except Problem as err:
                     finish(db, row["id"], "failed", now, str(err))
                     continue
                 db.execute("UPDATE commands SET status='running',claimed=?,updated=? WHERE id=?", (now, now, row["id"]))
+                if cmd["action"] == PORTFOLIO_SCAN:
+                    db.execute("UPDATE commands SET result=? WHERE id=?", (dump(portfolio.progress(row)), row["id"]))
+                    return portfolio.delivery(db, command(db, row["id"]), None, now)
                 return {"command": cmd, "run_until": now + RUN_TTL,"card_generation":db.execute("SELECT generation FROM card_request").fetchone()[0]}
+            if refresh_generation is not None:
+                return {"command":None,"refresh_cards":refresh_generation}
             return {"command": None,"card_generation":db.execute("SELECT generation FROM card_request").fetchone()[0]}
 
     def _preflight(self, db, cmd, wid, sid, body, now):
@@ -478,6 +534,10 @@ class Bridge:
         require(len(dump(result)) < 180000, "回执过大")
         error = string(body.get("error", ""), "错误信息", 500, True)
         status = "succeeded" if ok else "unknown" if cmd["intents"] else "failed"
+        if row["action"] == PORTFOLIO_SCAN:
+            require(not ok, "全量读取须先确认清单，再逐户提交详情", 409)
+            finish(db, row["id"], status, now, error, portfolio.progress(row))
+            return {"status": status}
         if ok and row["action"] in WRITE:
             try:
                 step = {"order.open": "open", "order.close": "close", "profit.withdraw": "withdraw"}.get(row["action"])

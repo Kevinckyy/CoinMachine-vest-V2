@@ -222,6 +222,43 @@ try {
     return s.workers[0].card_generation===manual.generation && !s.accounts.find(a=>a.name==='Gamma').present;
   },'manual full refresh replaces deleted accounts');
   assert.equal(await vest.evaluate("Number(sessionStorage.getItem('opens'))"),0);
+  // The loaded page and the plugin cache still contain Beta. Only a fresh directory visit can discover Gamma.
+  await vest.evaluate("sessionStorage.setItem('scanReplacement','1');sessionStorage.setItem('scanTrace','[]')");
+  const scans=await api('nodes/lab/accounts/read-all','POST',{});
+  assert.equal(scans.commands.length,1);
+  const scanned=await until(async()=>{
+    const c=await api('commands/'+scans.commands[0]);
+    if(c.status!=='succeeded')throw Error(c.status+' '+c.error+' '+JSON.stringify(c.result));
+    return c;
+  },'full portfolio read after authoritative directory replacement',50000);
+  assert.equal(scanned.result.read,2);
+  assert.deepEqual(scanned.result.accounts.map(a=>a.name),['Alpha','Gamma']);
+  assert.deepEqual(scanned.result.accounts.map(a=>[a.values.equity,a.values.health,a.values.daily_limit,a.values.drawdown_limit]),
+    [[1050,90,30,300],[1275,83,38.25,255]]);
+  const cached=await popup.evaluate("chrome.storage.local.get('cardCache').then(s=>s.cardCache)");
+  assert.deepEqual(cached.items.map(a=>a.name),['Alpha','Gamma']);
+  assert.equal(cached.portfolios.Gamma.drawdown,18.25);
+  await until(()=>vest.evaluate("location.pathname==='/accounts'"),'card monitoring resumes after full read');
+  const trace=await vest.evaluate("JSON.parse(sessionStorage.getItem('scanTrace'))");
+  assert.deepEqual(trace.filter(([event])=>event==='page').map(e=>e[1]),['/accounts','/portfolio','/accounts']);
+  assert.deepEqual(trace.filter(([event])=>event==='menu').map(e=>e[1]),['/portfolio','/portfolio']);
+  assert.deepEqual(trace.filter(([event])=>event==='select').map(e=>e[1]),['Gamma']);
+
+  await vest.evaluate("sessionStorage.setItem('partialDirectory','1');sessionStorage.setItem('scanTrace','[]')");
+  const localScan=await popup.evaluate("chrome.runtime.sendMessage({type:'ui.readAll'})");
+  assert.equal(localScan.ok,true);
+  await until(async()=>{
+    const s=(await api('state')).workers[0].portfolio_scan;
+    return s?.id===localScan.value.id && s.status==='failed' && s.error.includes('拉取账户列表失败');
+  },'incomplete first step preserves cache and skips all portfolio switches',35000);
+  assert.deepEqual(await popup.evaluate("chrome.storage.local.get('cardCache').then(s=>s.cardCache.items.map(a=>a.name))"),['Alpha','Gamma']);
+  assert.deepEqual(await vest.evaluate("JSON.parse(sessionStorage.getItem('scanTrace'))"),[['page','/accounts']]);
+  await vest.evaluate("sessionStorage.removeItem('scanReplacement');sessionStorage.removeItem('partialDirectory');sessionStorage.removeItem('scanTrace')");
+  const restored=await api('nodes/lab/accounts/refresh','POST',{});
+  await until(async()=>{
+    const s=await api('state');
+    return s.workers[0].card_generation===restored.generation && s.accounts.some(a=>a.name==='Beta' && a.present);
+  },'restore test inventory');
   for (const account of ['Alpha','Beta']) {
     const key=randomUUID();
     await api('commands/'+key,'PUT',{node_id:'lab',worker_id:worker.worker_id,account,action:'history.read',params:{}});
@@ -362,7 +399,7 @@ try {
   }
   await ui.send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   assert.equal(await ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
-  console.log('PASS: rebind after extension reload, single receiver, active card cache, startup refresh, new purchase, daily floor tooltip, zero-intent preflight rejection, history, analytics, two isolated nodes, navigation and center-issued extension upgrade');
+  console.log('PASS: extension rebind, active card cache, directory-first portfolio scans, incomplete directory recovery, strategy refresh, new purchase, stop buffer, preflight, history, analytics, node isolation, navigation and center-issued upgrade');
 } finally {
   if(browserCdp) await browserCdp.send('Browser.close').catch(()=>{});
   for(const ws of sockets)ws.close();

@@ -39,7 +39,8 @@ const paths = {
 };
 const icon = name => `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[name]}"/></svg>`;
 const actionTitles = {
-  'accounts.list': '全量刷新活动账户',
+  'accounts.list': '全量拉取账户列表',
+  'accounts.read_all': '全量读取账户信息',
   'account.read': '读取账户状态',
   'positions.read': '读取持仓',
   'history.read': '同步订单与盈亏历史',
@@ -81,7 +82,7 @@ const dir = {
   sell: '做空',
   random: '每批随机'
 };
-const READ = ['accounts.list', 'account.read', 'positions.read', 'history.read', 'page.navigate'];
+const READ = ['accounts.list', 'accounts.read_all', 'account.read', 'positions.read', 'history.read', 'page.navigate'];
 const tag = (label, cls = '') => `<span class="tag ${cls}"><i class="dot"></i>${esc(label)}</span>`;
 const badge = c => c.cancel_requested ? tag('取消中', 'warn') : tag(...(statuses[c.status] || [c.status]));
 const money = n => Number.isFinite(n) ? n.toLocaleString('zh-CN', {
@@ -208,7 +209,8 @@ function render() {
   const toolbar = page === 'nodes' || page === 'overview' ? btn('addNode', '＋ 添加服务器', 'primary') : selectedNode && ['commands', 'accounts'].includes(page) ? btn('send', '下达指令', 'primary') : '';
   const choices = state.nodes.map(n => option(n.id, n.label + ' · ' + n.id, n.id === selectedNode)).join('');
   const scope = scoped && choices ? '<label class="node-scope">当前节点<select id="nodeScope">' + choices + '</select></label>' : '';
-  const refreshCards = page === 'accounts' && selectedNode ? btn('refreshCards', '全量刷新账户') : '';
+  const refreshCards = page === 'accounts' && selectedNode ?
+    btn('refreshCards', actionTitles['accounts.list']) + btn('readAll', actionTitles['accounts.read_all']) : '';
   const heading = `<div><h1>${titles[page]}</h1><p>${descriptions[page]}</p></div><div class="buttons">${scope}${refreshCards}${toolbar}</div>`;
   if ($('heading')._template !== heading) {
     $('heading').innerHTML = heading;
@@ -317,16 +319,24 @@ function renderAccounts() {
     return `<tr><td class="cell"><strong>${esc(a.alias || a.name)}</strong><small>${routeLabel(a)}</small></td>
       <td>${tag(status,a.fresh && a.enabled ? 'good':'')} <small>${esc(a.phase || '')}</small></td>
       <td>${pnl}</td><td>${positionCount(a) ?? '—'}</td>
-      <td>${money(risk.daily_loss)} / ${money(risk.daily_limit)}</td><td>${money(risk.drawdown)} / ${money(risk.drawdown_limit)}</td>
+      <td>${risk.daily_unlimited ? '无限额' : money(risk.daily_loss)+' / '+money(risk.daily_limit)}</td><td>${money(risk.drawdown)} / ${money(risk.drawdown_limit)}</td>
       <td>${money(risk.equity)}</td><td class="cell">${money(a.daily_floor?.floor)}<small>${esc(({reset:'20:00 净值已核验',platform:'平台底线已核验',estimate:'按日损额度估算',conflict:'日损基准待核对'})[a.daily_floor?.source] || '')}</small></td>
       <td>${risk.health == null ? '—' : esc(risk.health)+'%'}</td><td>${a.candidate ? '可候选' : a.in_pool ? '入池待选' : '—'}</td>
-      <td>${time(Math.max(a.card_at || 0,a.observed_at || 0))}</td><td><div class="actions">${btn('account','管理','link',key)}${btn('accountCmd','指令','link',key)}</div></td></tr>`;
+      <td class="cell">${time(Math.max(a.card_at || 0,a.observed_at || 0,a.portfolio?.observed_at || 0))}${a.portfolio ? '<small>详情 '+time(a.portfolio.observed_at)+(a.portfolio.missing.length ? ' · 字段不全' : '')+'</small>' : ''}</td><td><div class="actions">${btn('account','管理','link',key)}${btn('accountCmd','指令','link',key)}</div></td></tr>`;
   });
   const node = state.nodes.find(n=>n.id===selectedNode);
   const workers = state.workers.filter(w=>w.node_id===selectedNode && w.online);
   const ready = workers.filter(w=>w.card_generation===node?.card_generation && w.card_session===w.session_id);
-  const progress = node?.card_generation ? '在线浏览器已刷新 '+ready.length+' / '+workers.length : '';
-  $('accountTable').innerHTML = panel('活动账户', rows.length ? table(['账户 / 来源','状态 / 阶段','卡片盈亏','活动持仓数','日损 / 上限','回撤 / 上限','净值','当日爆仓线 · USD','健康度','策略池','最近读数',''],rows) : empty('没有匹配的活动账户','可从已绑定的浏览器全量刷新。'),esc(progress)) + panel('持仓明细',positions(list));
+  const progress = node?.card_generation ? '列表已拉取 '+ready.length+' / '+workers.length+' 个在线浏览器' : '';
+  const scans = state.workers.filter(w=>w.node_id===selectedNode && w.portfolio_scan).map(w=>{
+    const s = w.portfolio_scan;
+    const stage = s.status !== 'running' ? statuses[s.status]?.[0] || s.status :
+      s.stage === 'portfolio' ? '逐户读取中' : '拉取列表并更新缓存';
+    return '<tr><td>'+esc(w.label)+'</td><td>'+esc(stage)+'</td><td>'+esc(s.total ?? '—')+'</td><td>'+esc(s.read ?? '—')+
+      '</td><td>'+esc(s.partial ?? '—')+'</td><td>'+esc(s.failed ?? '—')+'</td><td>'+esc(s.error || '')+'</td></tr>';
+  });
+  $('accountTable').innerHTML = (scans.length ? panel('最近一次全量读取',table(['浏览器','进度','账户数','读全','字段不全','失败','说明'],scans)) : '') +
+    panel('活动账户', rows.length ? table(['账户 / 来源','状态 / 阶段','卡片盈亏','活动持仓数','日损 / 上限','回撤 / 上限','净值','当日爆仓线 · USD','健康度','策略池','最近读数',''],rows) : empty('没有匹配的活动账户','可从已绑定的浏览器全量拉取账户列表。'),esc(progress)) + panel('持仓明细',positions(list));
 }
 async function renderCommands() {
   const sequence = ++historyRequest;
@@ -459,7 +469,7 @@ function commandForm(initial = []) {
     $('parameterFields').innerHTML = body;
   }
   function accounts() {
-    const needsAccount = !['accounts.list', 'page.navigate'].includes(f.action.value);
+    const needsAccount = !['accounts.list', 'accounts.read_all', 'page.navigate'].includes(f.action.value);
     const list = state.accounts.filter(a => a.node_id === f.node.value && a.worker_id === f.worker.value && a.present && !a.ambiguous);
     $('accountField').innerHTML = needsAccount ? select('account', '目标账户', list.map(a => option(a.name, a.alias ? a.alias + ' · ' + a.name : a.name, a.name === initial[2])).join('')) : '';
     if (f.account) f.account.onchange = params;
@@ -525,7 +535,13 @@ const operations = {
   nodeLogs: id => { selectNode(id); changePage('logs'); },
   refreshCards: async () => {
     await api('nodes/'+encodeURIComponent(selectedNode)+'/accounts/refresh','POST',{});
-    notify('已请求该节点全量刷新活动账户');
+    notify('已请求该节点全量拉取账户列表');
+    await refresh();
+  },
+  readAll: async () => {
+    const result = await api('nodes/'+encodeURIComponent(selectedNode)+'/accounts/read-all','POST',{});
+    notify('已为 '+result.commands.length+' 个浏览器安排全量读取账户信息'+
+      (result.skipped.length ? '，另有 '+result.skipped.length+' 个浏览器需要更新插件' : ''));
     await refresh();
   },
   addNode: () => nodeForm(),

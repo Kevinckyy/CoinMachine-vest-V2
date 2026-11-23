@@ -107,6 +107,120 @@ class FleetTest(unittest.TestCase):
         return dict({"name":name,"id":"card-"+name,"category":"eval","phase":"1/2","active_positions":0,
                      "daily_loss":0,"daily_limit":30,"drawdown":26.08,"drawdown_limit":300,"equity":1000},**changes)
 
+    def start_portfolio_scan(self):
+        self.plugin_meta["portfolio_version"] = 1
+        self.plugin("east", "heartbeat")
+        self.center.sync("east")
+        batch = self.center.read_accounts("east")
+        self.assertEqual(self.center.read_accounts("east"), batch)
+        self.assertEqual(batch["skipped"], [])
+        key, = batch["commands"]
+        self.center.sync("east")
+        first = self.plugin("east", "poll", cards_version=1)
+        self.assertEqual((first["command"]["id"], first["scan"]), (key, {"stage": "list"}))
+        return key
+
+    def scan_directory(self, key, names, **changes):
+        return self.report("east", page="/accounts", cards={
+            "generation": 0, "full": True, "observed_at": self.time,
+            "items": [self.card(name) for name in names], "scan_id": key, **changes})
+
+    def test_portfolio_requires_new_directory_and_local_cache_before_each_scan(self):
+        self.card_report("east", [self.card("Stale"), self.card("Shared")])
+        self.observe("east", "Shared")
+        trade_at = self.time
+        self.time += 2
+        key = self.start_portfolio_scan()
+        obs = dict(id=key, name="New", card_id="card-New",
+                   values=dict(equity=1200, health=83, daily_loss=3, daily_limit=36,
+                               drawdown=16, drawdown_limit=300, observed_at=self.time))
+        with self.assertRaises(Problem):
+            self.report("east", page="/portfolio", portfolio=obs)
+        with self.assertRaises(Problem):
+            self.scan_directory(key, ["New"], full=False)
+        with self.assertRaisesRegex(Problem, "清单早于本次指令"):
+            self.scan_directory(key, ["New"], observed_at=trade_at)
+        self.assertEqual({a["name"] for a in self.nodes["east"].status()["accounts"] if a["present"]}, {"Stale","Shared"})
+        self.scan_directory(key, ["New", "Shared"])
+        self.assertEqual(self.plugin("east", "poll", cached_scan="prior")["scan"]["stage"], "list")
+        with self.assertRaises(Problem):
+            self.plugin("east", "result", id=key, ok=True, result={})
+        first = self.plugin("east", "poll", cached_scan=key)["scan"]["target"]
+        self.assertEqual(first["name"], "New")
+        with self.assertRaises(Problem):
+            self.report("east", page="/trade/NQ-PERP", portfolio=obs)
+        with self.assertRaises(Problem):
+            self.report("east", page="/portfolio", portfolio={**obs, "name":"Shared", "card_id":"card-Shared"})
+        self.time += 82
+        self.report("east", page="/portfolio", portfolio=obs)
+        self.report("east", page="/portfolio", portfolio=obs)
+        self.nodes["east"].db.close()
+        self.nodes["east"] = Bridge(self.root / "east", "east", self.clock)
+        self.time += 72
+        self.assertEqual(self.plugin("east", "poll")["scan"]["target"]["name"], "Shared")
+        self.report("east", page="/portfolio", portfolio={**obs, "name":"Shared","card_id":"card-Shared",
+                    "values":{**obs["values"], "observed_at":self.time}})
+        self.center.sync("east")
+        result = self.center.get(key)
+        self.assertEqual((result["status"],result["result"]["read"],result["intents"]), ("succeeded",2,{}))
+        accounts = {a["name"]: a for a in self.center.state("east")["accounts"]}
+        self.assertFalse(accounts["Stale"]["present"])
+        self.assertIsNone(accounts["New"]["risk_at"])
+        self.assertEqual(accounts["New"]["snapshot"], {})
+        self.assertEqual(accounts["Shared"]["risk_at"], trade_at)
+        self.assertEqual(accounts["Shared"]["snapshot"]["equity"], 1000)
+        self.assertEqual(accounts["Shared"]["risk"]["equity"], 1200)
+        self.assertEqual(accounts["Shared"]["portfolio"]["daily_limit"], 36)
+        self.assertIsNone(self.plugin("west", "poll")["command"])
+
+    def test_portfolio_skips_ambiguous_missing_and_partial_accounts(self):
+        key = self.start_portfolio_scan()
+        self.scan_directory(key, ["Twice", "Missing", "Partial", "Unlimited", "Twice"])
+        self.assertEqual(self.plugin("east","poll",cached_scan=key)["scan"]["target"]["name"], "Missing")
+        for name, detail in [("Missing", {"error":"选择器中无此账户"}),
+                ("Partial", {"values":{"health":40,"equity":0,"observed_at":self.time}}),
+                ("Unlimited", {"values":{"health":80,"equity":1200,"drawdown":18,"drawdown_limit":300,
+                                        "daily_unlimited":True,"observed_at":self.time}})]:
+            self.report("east", page="/portfolio", portfolio={"id":key,"name":name,"card_id":"card-"+name,**detail})
+        self.center.sync("east")
+        cmd = self.center.get(key)
+        scan = cmd["result"]
+        self.assertEqual((cmd["status"],scan["total"],scan["read"],scan["partial"],scan["failed"]), ("failed",4,1,1,2))
+        partial = scan["accounts"][2]["values"]
+        self.assertIsNone(partial["daily_limit"])
+        self.assertIn("daily_limit", partial["missing"])
+        self.assertEqual(partial["equity"], 0)
+        latest = self.center.state("east")["workers"][0]["portfolio_scan"]
+        self.assertEqual((latest["id"],latest["partial"]), (key,1))
+
+    def test_empty_portfolio_scan_cache_ack_and_idle_timeout(self):
+        key = self.start_portfolio_scan()
+        self.scan_directory(key, [])
+        self.assertEqual(self.nodes["east"].get(key)["status"], "running")
+        self.assertIsNone(self.plugin("east","poll",cached_scan=key)["command"])
+        self.assertEqual(self.nodes["east"].get(key)["status"], "succeeded")
+        self.plugin("east","read-all",id="local")
+        self.plugin("east","poll")
+        self.scan_directory("local", ["A", "B"])
+        self.plugin("east","poll",cached_scan="local")
+        self.report("east",page="/portfolio",portfolio=dict(id="local",name="A",card_id="card-A",error="已消失"))
+        self.time += 119
+        self.plugin("east","heartbeat")
+        self.time += 2
+        expired = self.nodes["east"].get("local")
+        self.assertEqual((expired["status"],expired["result"]["failed"]), ("failed",1))
+
+    def test_scan_requires_capable_browser_and_stops_on_new_session(self):
+        with self.assertRaisesRegex(Problem, "重新加载"):
+            self.center.read_accounts("east")
+        key = self.start_portfolio_scan()
+        self.scan_directory(key, ["A"])
+        self.plugin("east","poll",cached_scan=key)
+        self.plugin("east","heartbeat",session_id="next-session",generation=2)
+        self.assertEqual(self.nodes["east"].get(key)["status"], "cancelled")
+        with self.assertRaises(Problem):
+            self.report("east",page="/portfolio",portfolio=dict(id=key,name="A",card_id="card-A",error="旧回执"))
+
     def test_full_directory_generation_and_new_accounts_during_strategy(self):
         self.center.strategy("start",{},"east")
         self.center.sync("east")

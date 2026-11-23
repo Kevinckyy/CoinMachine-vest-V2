@@ -18,7 +18,7 @@ def schema(db):
         CREATE TABLE IF NOT EXISTS open_preflight(id TEXT PRIMARY KEY,session TEXT NOT NULL,checked REAL NOT NULL);
     """)
     cols = {r[1] for r in db.execute("PRAGMA table_info(accounts)")}
-    for name, spec in (("card","TEXT"), ("card_at","REAL"), ("risk","TEXT"), ("risk_at","REAL"), ("preflight_at","REAL"), ("history_due_at","REAL")):
+    for name, spec in (("card","TEXT"), ("card_at","REAL"), ("risk","TEXT"), ("risk_at","REAL"), ("portfolio","TEXT"), ("preflight_at","REAL"), ("history_due_at","REAL")):
         if name not in cols:
             db.execute(f"ALTER TABLE accounts ADD COLUMN {name} {spec}")
 
@@ -91,12 +91,12 @@ def update(db, wid, sid, data, now):
         items[item["name"]] = item
     for name,row in previous.items():
         if row["present"] and name not in items:
-            db.execute("UPDATE accounts SET present=0,card=NULL,card_at=NULL,risk=NULL,risk_at=NULL,read_session=NULL WHERE worker_id=? AND name=?",(wid,name))
+            db.execute("UPDATE accounts SET present=0,card=NULL,card_at=NULL,risk=NULL,risk_at=NULL,portfolio=NULL,read_session=NULL WHERE worker_id=? AND name=?",(wid,name))
     for name,item in items.items():
         row = previous.get(name)
         prior = json.loads(row["card"]) if row and row["card"] else {}
         old_phase = prior.get("phase") if prior else row["phase"] if row else None
-        same = bool(row and row["present"] and (not prior.get("id") or prior["id"]==item["id"]) and
+        same = bool(row and row["present"] and not row["ambiguous"] and name not in duplicate and (not prior.get("id") or prior["id"]==item["id"]) and
                     (not item["phase"] or not old_phase or item["phase"]==old_phase))
         category = item["category"]
         if same and (category=="active" or row["risk_at"] and category==prior.get("category")):
@@ -128,9 +128,10 @@ def update(db, wid, sid, data, now):
           (wid,name,category,phase,name in duplicate,excluded,sid,dump(item),observed,dump(risk)))
         if not same or name in duplicate:
             db.execute("""UPDATE accounts SET snapshot='{}',observed_at=NULL,read_session=NULL,risk_at=NULL,read_error='',
-                       preflight_at=NULL,history_due_at=NULL,tracked_position=NULL WHERE worker_id=? AND name=?""",(wid,name))
+                       preflight_at=NULL,history_due_at=NULL,tracked_position=NULL,portfolio=NULL WHERE worker_id=? AND name=?""",(wid,name))
     db.execute("""INSERT INTO card_sync VALUES(?,?,?,?,?) ON CONFLICT(worker) DO UPDATE SET
                 session=excluded.session,generation=excluded.generation,full_at=excluded.full_at,seen=excluded.seen""",
                (wid,sid,gen,observed if full else sync["full_at"],observed))
-    return {"count":len(items),"generation":gen,"risks":{r["name"]:json.loads(r["risk"]) for r in
-            db.execute("SELECT name,risk FROM accounts WHERE worker_id=? AND present=1",(wid,))}}
+    rows = db.execute("SELECT name,risk,portfolio FROM accounts WHERE worker_id=? AND present=1",(wid,)).fetchall()
+    return {"count":len(items),"generation":gen,"risks":{r["name"]:json.loads(r["risk"]) for r in rows},
+            "portfolios":{r["name"]:json.loads(r["portfolio"]) for r in rows if r["portfolio"]}}

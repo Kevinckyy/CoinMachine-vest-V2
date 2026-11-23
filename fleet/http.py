@@ -127,6 +127,8 @@ def make_server(bind, port, app, token, plugin_token=None):
                     return app.strategy(keys[3], body, ident(keys[1]))
                 if len(keys)==4 and keys[0]=="nodes" and keys[2:]==["accounts","refresh"] and method=="POST":
                     return app.refresh_accounts(ident(keys[1]))
+                if len(keys)==4 and keys[0]=="nodes" and keys[2:]==["accounts","read-all"] and method=="POST":
+                    return app.read_accounts(ident(keys[1]))
                 if len(keys) == 2 and keys[0] == "nodes" and method == "PUT":
                     return app.configure_node(keys[1], body)
                 if keys == ["accounts", "config"] and method == "POST":

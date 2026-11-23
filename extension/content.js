@@ -74,7 +74,7 @@
       if (value.data?.authorize_click !== true) throw Error('该操作未获许可或已提交');
     }
   });
-  async function observe(data, force = false) {
+  async function observe(data, force = false, scanId) {
     if (location.pathname.replace(/\/$/,'') !== '/accounts' || data.moving) return;
     const full = force || data.refresh_cards !== undefined;
     if (!full && Date.now() < nextCards) return;
@@ -83,10 +83,16 @@
       const {cardCache} = await chrome.storage.local.get('cardCache');
       membership = cardCache?.worker_id===session.worker_id ? VestCards.membership(cardCache.items) : null;
     }
-    const reading = await VestCards.read(full,guard);
+    let reading;
+    try {
+      reading = await VestCards.read(full,guard);
+    } catch (err) {
+      if (scanId) await ipc('result',{id:scanId,ok:false,result:{},error:'拉取账户列表失败：'+brief(err).slice(0,460)});
+      throw err;
+    }
     const signature = VestCards.membership(reading.items);
     await report({cards:{...reading,generation:data.refresh_cards ?? data.card_generation ?? 0,
-      full:full || membership!==signature,purchase_request:data.purchase_request}});
+      full:full || membership!==signature,purchase_request:data.purchase_request,...(scanId ? {scan_id:scanId} : {})}});
     membership = signature;
     diagnostic = '';
     if (!force) return;
@@ -114,10 +120,24 @@
         await observe(value.data);
         return;
       }
+      if (job.session_id !== cycleSession.session_id || job.worker_id !== cycleSession.worker_id) throw Error('指令目标与当前浏览器不一致');
+      if (job.action === 'accounts.read_all') {
+        const step = value.data.scan;
+        if (step?.stage === 'list') {
+          await observe(value.data,true,job.id);
+        } else if (step?.stage === 'portfolio' && step.target) {
+          const {name,card_id,phase} = step.target;
+          const item = {id:job.id,name,card_id};
+          try { item.values = await page.readPortfolio(name,phase); }
+          catch (err) { item.error = brief(err); }
+          await report({portfolio:item});
+          diagnostic = item.error || '';
+        } else throw Error('无法识别全量读取步骤');
+        return;
+      }
       let result = {},
         error = '';
       try {
-        if (job.session_id !== cycleSession.session_id || job.worker_id !== cycleSession.worker_id) throw Error('指令目标与当前浏览器不一致');
         result = job.action==='accounts.list' ? await observe(value.data,true) : await page.execute(job);
       } catch (err) {
         error = brief(err);

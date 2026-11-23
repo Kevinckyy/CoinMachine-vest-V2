@@ -3,11 +3,13 @@
 <section id="deskAccounts" hidden><div role="tablist"><button role="tab" id="desk-trigger-active" aria-selected="true">活跃</button></div>
 <p data-testid="dashboard-total-value">$3,050.00</p><div class="grid"></div></section>
 <nav><a href="/portfolio">Portfolio</a><a href="/trade/NQ-PERP">Trade</a></nav>
+<section id="portfolioMetrics">
 <p data-testid="account-value">$1,050.00</p><p data-testid="account-upnl">$0.00</p><p data-testid="book-mark">$20,000</p>
 <p data-testid="account-health">90%</p>
 <div><span id="lossHelp" data-slot="tooltip-trigger">每日亏损</span><p data-testid="capital-indicator-daily-loss">$0.00 / $30.00</p></div>
 <div id="lossLabels" role="tooltip" hidden><span>美东时间晚上8点余额：$1,000.00</span><span>今日底线：$970.00</span></div>
 <span data-testid="capital-indicator-drawdown">$26.08 / $300</span>
+</section>
 <button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active positions</button>
 <div id="positions"><p>No positions yet</p></div>
 <button data-testid="account-tab-positions-history" aria-selected="false" aria-controls="closed">Positions history</button>
@@ -41,6 +43,7 @@
     }
   }
   if(sessionStorage.getItem('purchased')) accounts.push(['Gamma','eval','Evaluation','1/2','$1000.00']);
+  if(sessionStorage.getItem('scanReplacement')) accounts.splice(1,1,['Gamma','eval','Evaluation','1/2','$1,275.00']);
   renderCards();
   if(onAccounts && sessionStorage.getItem('partialDirectory')) {
     const grid=document.querySelector('#deskAccounts .grid');
@@ -83,6 +86,8 @@
     }
   });
   function route() {
+    document.getElementById('portfolioMetrics').dataset.testid=location.pathname==='/portfolio'?'portfolio-root':'trade-metrics';
+    trace('page',location.pathname);
     document.getElementById('desk-withdrawals').hidden=location.pathname !== '/portfolio';
     document.querySelector('[data-testid=account-tab-active-positions]').click();
   }
@@ -90,11 +95,18 @@
     e.preventDefault();history.pushState({},'',link.pathname);route();
   });
   route();
+  function trace(event,value) {
+    if(sessionStorage.getItem('scanTrace')===null) return;
+    const events=JSON.parse(sessionStorage.getItem('scanTrace'));
+    events.push([event,value]);
+    sessionStorage.setItem('scanTrace',JSON.stringify(events));
+  }
   function closeMenu() {
     menu?.remove(); menu=null; trigger.setAttribute('aria-expanded','false');
   }
   function openMenu() {
     if (menu) return;
+    trace('menu',location.pathname);
     sessionStorage.setItem('opens',String(Number(sessionStorage.getItem('opens') || 0)+1));
     menu=document.createElement('div');menu.setAttribute('role','menu');
     menu.onkeydown=e=>{if(e.key==='Escape')closeMenu();};
@@ -102,9 +114,22 @@
       const item=document.createElement('button');item.dataset.testid='account-item-'+code;
       item.innerHTML='<span class="truncate">'+name+'</span><span>'+category+'</span><span>'+phase+'</span>';
       item.onclick=()=>{
+        trace('select',name);
         trigger.innerHTML=item.innerHTML;
         document.querySelector('[data-testid="account-value"]').textContent=tradeEquity(name,equity);
         document.querySelector('[data-testid="capital-indicator-daily-loss"]').textContent=name==='Beta'?'$0.00 / $145.96':'$0.00 / $30.00';
+        if(location.pathname==='/portfolio' && name==='Gamma') {
+          document.querySelector('[data-testid="account-health"]').textContent='83%';
+          const limits=document.createElement('section');
+          limits.setAttribute('aria-labelledby','evaluation-limits-title');
+          for(const [key,pair] of [['daily-loss','$4.00 / $38.25'],['drawdown','$18.25 / $255.00']]) {
+            document.querySelector('[data-testid="capital-indicator-'+key+'"]').hidden=true;
+            const group=document.createElement('div');
+            group.innerHTML='<svg width="32" height="32" aria-hidden="true"><path data-testid="multi-step-'+key+'-gauge-progress" d="M1 1L12 12"></path></svg><div><p>Limit</p><p aria-label="Limit: '+pair+'">'+pair+'</p></div>';
+            limits.append(group);
+          }
+          document.getElementById('portfolioMetrics').append(limits);
+        }
         labels.firstElementChild.textContent='美东时间晚上8点余额：'+(name==='Beta'?'$4,865.33':'$1,000.00');
         labels.lastElementChild.textContent='今日底线：'+(name==='Beta'?'$4,719.37':'$970.00');
         showHistory(name);

@@ -7,7 +7,8 @@ from urllib.parse import urlsplit
 from .trading_day import entry_day_window
 
 
-READ = {"accounts.list", "account.read", "positions.read", "history.read", "page.navigate"}
+PORTFOLIO_SCAN = "accounts.read_all"
+READ = {"accounts.list", PORTFOLIO_SCAN, "account.read", "positions.read", "history.read", "page.navigate"}
 WRITE = {"order.open", "order.close", "position.protect", "profit.withdraw"}
 ACTIONS = READ | WRITE
 PENDING = {"pending", "sending", "queued", "running"}
@@ -95,7 +96,7 @@ def positive(value, label):
 
 def parameters(action, raw, legacy=False):
     p = dict(obj(raw))
-    if action in {"accounts.list", "account.read", "positions.read", "history.read"}:
+    if action in {"accounts.list", PORTFOLIO_SCAN, "account.read", "positions.read", "history.read"}:
         fields(p, ())
     elif action == "page.navigate":
         fields(p, ("destination",))
@@ -134,7 +135,7 @@ def request(data, legacy=False):
     fields(data, ("node_id", "worker_id", "account", "action", "params"))
     action = choice(data.get("action"), ACTIONS, "指令类型")
     account = data.get("account")
-    if action in {"accounts.list", "page.navigate"}:
+    if action in {"accounts.list", PORTFOLIO_SCAN, "page.navigate"}:
         require(account is None, "该指令作用于浏览器，无需账户")
     else:
         account = string(account, "账户名")
