@@ -3,7 +3,7 @@ import json
 import os
 import time
 import uuid
-from . import ledger, reporting, updates
+from . import cards, daily_floor, ledger, reporting, updates
 
 from .protocol import (PHASES, PRIMARY, RUN_TTL, TERMINAL, WRITE, Problem, boolean, choice,
                        dump, ident, number, obj, request, require, string, validate_target)
@@ -18,6 +18,7 @@ def account_view(row):
     if not row:
         return None
     return {**{k: row[k] for k in row.keys() if k != "tracked_position"}, "snapshot": json.loads(row["snapshot"]),
+            **{k:json.loads(row[k]) if row[k] else None for k in ("card","risk")},
             **{key: bool(row[key]) for key in ("present", "ambiguous", "excluded")}}
 
 
@@ -45,9 +46,17 @@ def verify_financial_receipt(cmd, result):
             require(all(snap.get(k) == v for k, v in cmd["expected_position"].items()), "修改保护的持仓不符")
         for key, report in (("stop_loss", "stop_check"), ("take_profit", "take_profit_check")):
             if action == "order.open" or key in params:
-                expected = "verified" if params.get(key) is not None else "omitted"
+                expected = "verified" if params.get(key) is not None or key=="stop_loss" and action=="order.open" else "omitted"
                 require(isinstance(snap.get(report), dict) and snap[report].get("status") == expected,
                         "回执未核验原生止盈止损")
+                if action=="order.open" and key=="stop_loss" and "stop_buffer" in params:
+                    target_risk = proof["stop_loss"]
+                    trigger = number(snap.get("native_sl_price"),"原生止损触发价",0.000001,1e12)
+                    entry = number(snap.get("entry_price"),"成交均价",0.000001,1e12)
+                    risk = (entry-trigger if params["side"]=="buy" else trigger-entry)*proof["quantity"]
+                    require(snap[report].get("target_risk")==target_risk and risk>0 and
+                            -1e-6 <= target_risk-risk < proof["quantity"]*0.25 and
+                            abs(trigger*4-round(trigger*4))<=1e-6,"原生止损价与下单时核定的风险金额不符")
     else:
         require(snap.get("position_open") is False, "执行回执未确认空仓")
         if action == "profit.withdraw":
@@ -78,7 +87,9 @@ class Bridge:
                 read_error TEXT NOT NULL DEFAULT '', listed_session TEXT, read_session TEXT, PRIMARY KEY(worker_id,name)
             );
         """)
+        cards.schema(self.db.conn)
         ledger.schema(self.db.conn)
+        daily_floor.schema(self.db.conn)
         reporting.log_schema(self.db.conn)
         with self.db.tx() as db:
             cols = {r["name"] for r in db.execute("PRAGMA table_info(accounts)")}
@@ -121,9 +132,19 @@ class Bridge:
                     "launch_id": self.launch_id,
                     "ledger_seq": db.execute("SELECT COALESCE(MAX(seq),0) FROM book").fetchone()[0],
                     "log_seq": db.execute("SELECT COALESCE(MAX(id),0) FROM node_logs").fetchone()[0],
-                    "workers": [worker_view(r) for r in db.execute("""SELECT w.*,COALESCE(b.release,'') AS release FROM workers w
-                                LEFT JOIN worker_build b ON b.worker_id=w.worker_id ORDER BY label""")],
-                    "accounts": [account_view(r) for r in db.execute("SELECT * FROM accounts ORDER BY worker_id,name")]}
+                    "card_generation":db.execute("SELECT generation FROM card_request").fetchone()[0],
+                    "workers": [worker_view(r) for r in db.execute("""SELECT w.*,COALESCE(b.release,'') AS release,
+                                c.session AS card_session,c.generation AS card_generation,c.full_at AS cards_full_at FROM workers w
+                                LEFT JOIN worker_build b ON b.worker_id=w.worker_id LEFT JOIN card_sync c ON c.worker=w.worker_id ORDER BY label""")],
+                    "accounts": [{**account_view(r),"daily_floor":daily_floor.view(db,r["worker_id"],r["name"],self.clock())}
+                                 for r in db.execute("SELECT * FROM accounts ORDER BY worker_id,name")]}
+
+    def refresh_cards(self, body):
+        require(body.get("instance_id")==self.instance_id,"节点数据库身份不匹配",409)
+        gen = number(body.get("generation"),"刷新批次",1,2**53-1,True)
+        with self.db.tx() as db:
+            db.execute("UPDATE card_request SET generation=MAX(generation,?)",(gen,))
+        return {"generation":gen}
 
     def ledger_page(self, after):
         after = number(after, "同步游标", 0, 2**63-1, True)
@@ -144,7 +165,7 @@ class Bridge:
 
     def submit(self, key, body, cancel=False):
         now = self.clock()
-        req = request({k: body[k] for k in ("node_id", "worker_id", "account", "action", "params") if k in body})
+        req = request({k: body[k] for k in ("node_id", "worker_id", "account", "action", "params") if k in body},legacy=True)
         require(key == ident(body.get("id")) and req["node_id"] == self.node_id
                 and body.get("instance_id") == self.instance_id, "目标桥身份不符", 409)
         cmd = {**req, "id": key, "instance_id": self.instance_id, "session_id": ident(body.get("session_id")),
@@ -154,6 +175,9 @@ class Bridge:
         require(cmd["phase"] is None or cmd["phase"] in PHASES, "阶段无效")
         if cmd["action"] in WRITE:
             cmd["account_ref"] = string(body.get("account_ref", cmd["account"]), "交易账户标识")
+        if cmd["action"]=="order.open" and "expected_risk" in body:
+            cmd["expected_risk"] = obj(body["expected_risk"])
+            cmd["expected_floor"] = obj(body.get("expected_floor",{}))
         if cmd["action"] in ("order.close", "position.protect"):
             expected = obj(body.get("expected_position"))
             require(expected.get("position_id") == cmd["params"]["position_id"] and expected.get("symbol") == "NQ-PERP",
@@ -296,6 +320,11 @@ class Bridge:
         db.execute("""UPDATE accounts SET snapshot=?,category=?,phase=?,observed_at=?,read_error='',read_session=listed_session,
             tracked_position=?,excluded=MAX(excluded,?) WHERE worker_id=? AND name=?""",
             (dump(snap), category, phase, observed, dump(tracked) if tracked else None, category.lower() in PRIMARY, wid, name))
+        risk = cards.from_trade(snap)
+        db.execute("UPDATE accounts SET risk=?,risk_at=? WHERE worker_id=? AND name=?",
+                   (dump(risk),observed,wid,name))
+        daily_floor.capture(db,wid,name,observed,risk["daily_limit"],
+                            snap.get("daily_reset_equity"),snap.get("daily_floor"))
 
     def plugin(self, op, body):
         now = self.clock()
@@ -308,6 +337,9 @@ class Bridge:
             if op == "heartbeat":
                 return {"ok": True}
             if op == "report":
+                if "cards" in body:
+                    require(body.get("page","").rstrip("/")=="/accounts","需要活跃账户页面",409)
+                    return cards.update(db,wid,sid,body["cards"],now)
                 if "inventory" in body:
                     self._inventory(db, wid, sid, body["inventory"])
                 if "observation" in body:
@@ -322,11 +354,20 @@ class Bridge:
                 return {"ok": True}
             if op == "intent":
                 return self._intent(db, wid, sid, body, now)
+            if op == "preflight":
+                cmd = record(command(db,ident(body.get("id"))))
+                return self._preflight(db,cmd,wid,sid,body,now)
             require(op == "poll", "接口不存在", 404)
             if self.release and body.get("release") != self.release:
                 return {"command":None, "update_release":self.release}
             if db.execute("SELECT 1 FROM commands WHERE worker=? AND status='running'", (wid,)).fetchone():
                 return {"command": None}
+            if body.get("cards_version")==1:
+                gen = db.execute("SELECT generation FROM card_request").fetchone()[0]
+                ack = db.execute("SELECT session,generation FROM card_sync WHERE worker=?",(wid,)).fetchone()
+                manual_view = body.get("manual_view") is True and body["mode"]=="readonly"
+                if not ack or ack["generation"]!=gen or ack["session"]!=sid and not manual_view:
+                    return {"command":None,"refresh_cards":gen}
             for row in db.execute("SELECT * FROM commands WHERE worker=? AND status='queued' ORDER BY created,id", (wid,)).fetchall():
                 cmd = json.loads(row["body"])
                 try:
@@ -336,8 +377,56 @@ class Bridge:
                     finish(db, row["id"], "failed", now, str(err))
                     continue
                 db.execute("UPDATE commands SET status='running',claimed=?,updated=? WHERE id=?", (now, now, row["id"]))
-                return {"command": cmd, "run_until": now + RUN_TTL}
-            return {"command": None}
+                return {"command": cmd, "run_until": now + RUN_TTL,"card_generation":db.execute("SELECT generation FROM card_request").fetchone()[0]}
+            return {"command": None,"card_generation":db.execute("SELECT generation FROM card_request").fetchone()[0]}
+
+    def _preflight(self, db, cmd, wid, sid, body, now):
+        require(cmd["action"]=="order.open" and cmd["worker_id"]==wid and cmd["session_id"]==sid and
+                cmd["status"]=="running" and not cmd["intents"] and body["mode"]=="execute" and now<cmd["expires_at"],
+                "开仓核对租约已失效",409)
+        require(body.get("page","").rstrip("/") in ("/trade/NQ-PERP","/trade/NDX-USD-PERP"),"需要在 NQ 交易页核对",409)
+        obs = obj(body.get("observation"))
+        require(obs.get("name")==cmd["account"],"核对的账户不符",409)
+        snap = obj(obs.get("snapshot"))
+        number(snap.get("observed_at"),"交易页核对时间",max(cmd["claimed_at"]-1,now-15),now+5)
+        risk = cards.from_trade(snap)
+        _, account = target(db,cmd)
+        expected = cmd.get("expected_risk",{})
+        require(account and account["present"] and not account["ambiguous"],"账户已消失或名称不唯一",409)
+        require(snap["observed_at"] >= (account["risk_at"] or 0),"过期的交易页风控读数",409)
+        card_id = (account["card"] or {}).get("id")
+        actual = {**risk,"phase":obs.get("phase"),"category":obs.get("category"),"card_id":card_id}
+        current = {**(account["risk"] or {}),"phase":account["phase"],"category":account["category"],"card_id":card_id}
+        changed = sorted(k for k in actual if expected.get(k)!=actual[k] or current.get(k)!=expected.get(k))
+        issue = cards.risk_error(risk, complete=True)
+        if not actual["phase"] or actual["category"] not in ("eval","funded","live"):
+            issue = "交易页未确认可交易账户类别和阶段"
+        self._observe(db,wid,obs,now)
+        db.execute("UPDATE accounts SET preflight_at=? WHERE worker_id=? AND name=?",(now,wid,cmd["account"]))
+        floor = daily_floor.view(db,wid,cmd["account"],now)
+        floor_key = {k:(floor or {}).get(k) for k in ("start","floor","verified")}
+        if cmd.get("expected_floor")!=floor_key:
+            changed.append("daily_floor")
+        amount = daily_floor.stop_amount(risk["equity"],floor,cmd["params"].get("stop_buffer",20))
+        qty = body.get("quantity") if body.get("stage")!="open" else obj(body.get("proof",{})).get("quantity")
+        min_stop = number(qty,"实际 Vest 数量",0.000001,1e12)*0.25 if qty is not None else None
+        if "stop_buffer" not in cmd["params"]:
+            issue = "旧版固定止损指令需要重新决策"
+        elif amount is None:
+            issue = "等待核对美东 20:00 净值或平台当日爆仓线"
+        elif amount<=0:
+            issue = "净值至爆仓线的余量不足以保留止损缓冲"
+        elif min_stop is not None and amount<min_stop:
+            issue = "止损余量不足当前仓位的一个价格跳动"
+            risk["size_minimum"] = {"size_percent":cmd["params"].get("size_percent"),"minimum":min_stop}
+            db.execute("UPDATE accounts SET risk=? WHERE worker_id=? AND name=?",(dump(risk),wid,cmd["account"]))
+        if changed or issue:
+            reason = issue or "交易页读数与候选快照不符"
+            finish(db,cmd["id"],"cancelled",now,reason,{"reselect":True,"changed":changed,"risk":actual,
+                   "observed_at":snap["observed_at"]})
+            return {"approved":False,"reselect":True,"reason":reason,"risk":actual}
+        db.execute("INSERT OR REPLACE INTO open_preflight VALUES(?,?,?)",(cmd["id"],sid,now))
+        return {"approved":True,"risk":actual,"stop_loss":amount,"daily_floor":floor}
 
     def _intent(self, db, wid, sid, body, now):
         row = command(db, ident(body.get("id")))
@@ -350,6 +439,18 @@ class Bridge:
         intents = cmd["intents"]
         if stage in intents:
             return {"authorize_click": False}
+        if stage=="open":
+            require(db.execute("SELECT 1 FROM open_preflight WHERE id=? AND session=?",(cmd["id"],sid)).fetchone(),
+                    "开仓前需要先完成交易页风控核对",409)
+            checked = self._preflight(db,cmd,wid,sid,body,now)
+            if not checked["approved"]:
+                return {**checked,"authorize_click":False}
+            proof = obj(body.get("proof"))
+            qty = number(proof.get("quantity"),"实际 Vest 数量",0.000001,1e12)
+            require(proof.get("stop_loss")==checked["stop_loss"] and checked["stop_loss"]>=qty*0.25,
+                    "止损输入与可用净值或实际仓位不符",409)
+            proof["daily_floor"] = checked["daily_floor"]
+            proof["stop_buffer"] = cmd["params"]["stop_buffer"]
         if stage == "protect" and row["action"] == "order.open":
             require("open" in intents, "尚未提交开仓", 409)
         else:

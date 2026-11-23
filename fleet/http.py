@@ -93,6 +93,8 @@ def make_server(bind, port, app, token, plugin_token=None):
             if is_bridge:
                 if keys == ["status"] and method == "GET":
                     return app.status()
+                if keys == ["status"] and method == "PUT":
+                    return app.refresh_cards(body)
                 if keys in (["ledger"], ["logs"]) and method == "GET":
                     query = parse_qs(urlsplit(self.path).query)
                     after = int(query.get("after", ["0"])[0])
@@ -123,6 +125,8 @@ def make_server(bind, port, app, token, plugin_token=None):
                         return {"accounts": app.state(nid)["accounts"]}
                 if len(keys) == 4 and keys[0] == "nodes" and keys[2] == "strategy" and method == "POST":
                     return app.strategy(keys[3], body, ident(keys[1]))
+                if len(keys)==4 and keys[0]=="nodes" and keys[2:]==["accounts","refresh"] and method=="POST":
+                    return app.refresh_accounts(ident(keys[1]))
                 if len(keys) == 2 and keys[0] == "nodes" and method == "PUT":
                     return app.configure_node(keys[1], body)
                 if keys == ["accounts", "config"] and method == "POST":

@@ -11,6 +11,7 @@
 | GET | `/healthz` | 无密钥健康检查，只返回角色和版本 |
 | GET | `/v1/state?node_id=cloud-01` | `nodes,workers,accounts,strategies,unknown_count,commands`。可省略节点取全网数据。一个节点范围内另返回 `strategy`，多节点时该字段为 `null` |
 | GET | `/v1/nodes/{node_id}/accounts` | 节点独立目录及持仓快照，返回 `accounts` |
+| POST | `/v1/nodes/{node_id}/accounts/refresh` | 正文 `{}`，返回新的 `generation`。在线浏览器通过账户页完成全量刷新，离线浏览器重连后补读 |
 | GET | `/v1/nodes/{node_id}/logs?level=warning&offset=0` | 该节点的运行事件。可选 `level=info/warning/error`，返回 `total,items`，每页 50 条。事件的 `source` 为 `local`（中心）或 `bridge` |
 | GET | `/v1/analytics` | 分节点、分阶段的盈亏、出金和历史明细，筛选参数见下文 |
 | PUT | `/v1/nodes/{node_id}` | 登记或更新 `{label,url,token}`。更新时可省略密钥 |
@@ -20,7 +21,7 @@
 | GET | `/v1/commands/{id}` | 获取状态、目标、参数、资金操作许可记录、结果、错误和时间 |
 | POST | `/v1/commands/{id}/cancel` | 请求取消尚未被插件领取的指令，正文为 `{}` |
 | POST | `/v1/commands/{id}/resolve` | 人工结清待核验指令，正文为 `{"executed":true,"note":"平台记录和核验依据"}` |
-| POST | `/v1/nodes/{node_id}/strategy/config` | 停止状态下更新该节点的 `batch_size,interval_seconds,side,size_percent,stop_loss,take_profit` |
+| POST | `/v1/nodes/{node_id}/strategy/config` | 停止状态下更新该节点的 `batch_size,interval_seconds,side,size_percent,stop_buffer,take_profit` |
 | POST | `/v1/nodes/{node_id}/strategy/start`、`/v1/nodes/{node_id}/strategy/stop` | 启停所选节点，正文为 `{}`。旧 `/v1/strategy/*` 兼容单节点，多节点须指定目标 |
 
 ### 筛选交易与出金
@@ -68,13 +69,15 @@ Content-Type: application/json
 | `account.read` | 必填 | `{}` | `observation`，含余额、净值、浮盈亏、风险指标和时间 |
 | `positions.read` | 必填 | `{}` | `observation.snapshot`，含明确的持仓状态、ID、方向、数量、均价和原生保护价 |
 | `history.read` | 必填 | `{}` | 只读。补读该账户的历史持仓及原生订单，对实盘或已归档账户也尝试读取 Portfolio 出金。返回 `observation,tables`。各表含 `available` 和可用时的 `ready,rows_read,skipped,bottom_seen`。历史行分批写入节点桥 |
-| `page.navigate` | 省略 | `{"destination":"trade"}` 或 `{"destination":"portfolio"}` | 浏览器完成加载后核对的 `path` |
-| `order.open` | 必填 | `{"side":"buy","micro":1,"stop_loss":130}` | 已确认成交和原生保护的持仓快照 |
+| `page.navigate` | 省略 | `destination` 取 `accounts`、`trade` 或 `portfolio` | 浏览器完成加载后核对的 `path` |
+| `order.open` | 必填 | `{"side":"buy","micro":1,"stop_buffer":20}` | 已确认成交和原生保护的持仓快照。开仓许可凭据含下单时核定的爆仓线、缓冲和实际止损金额 |
 | `order.close` | 必填 | `{"position_id":"页面持仓ID"}` | 全量平仓后的空仓快照 |
 | `position.protect` | 必填 | `{"position_id":"页面持仓ID","stop_loss":100,"take_profit":250}` | 已核验的实际保护状态，至少指定一项金额 |
 | `profit.withdraw` | 必填 | `{"amount":50}` | 核验后的源账户余额、申请金额、预计到账额与主账户收款对象 |
 
-开仓方向为 `buy` 或 `sell`。`micro` 是正整数，也可用 `size_percent` 指定平台的 25、50、75 或 100 百分档，两者选一。可选 `take_profit` 和必填 `stop_loss` 使用 USDC。平仓和保护修改会固定派发时的持仓 ID、方向、数量、品种和均价。领取金额须为正数，最多六位小数。
+开仓方向为 `buy` 或 `sell`。`micro` 是正整数，也可用 `size_percent` 指定 25、50、75 或 100 百分档，两者选一。`stop_buffer` 是账户爆仓线上方要保留的 USD 净值，可为零，省略则使用该节点策略配置（初始 20）。填入平台的止损金额等于最新净值减去当日有效爆仓线，再减去缓冲，精确到美分。`take_profit` 为可选的单笔 USDC 金额。平仓和保护修改会固定派发时的持仓 ID、方向、数量、品种和均价。领取金额须为正数，最多六位小数。
+
+账户目录中的 `card,card_at` 对应活动卡片，`risk,risk_at` 保留风控读数及上次交易页实读时间。`in_pool` 表示允许策略选用，`candidate` 表示当前会话、空仓、额度和风控条件允许进入下单前核验。`daily_floor` 含美东 20:00 交易日的 `start,end,reset_equity,daily_limit,gross_withdrawn,floor,source,verified`。`source` 可为 `reset`、`platform`、`estimate` 或 `conflict`。开仓前需要 `verified=true`。插件当前会话的 `card_session,card_generation,cards_full_at` 可用于检查全量刷新进度。
 
 当前交易适配器针对 Vest NQ 桌面持仓表的单一可核验仓位。无法从页面唯一确认持仓时，`account.read` 的 `position_open` 可以是 `null`，`positions.read` 会返回失败。空仓使用 `false` 表示。`observed_at` 表示实际页面读取时间，`last_seen` 表示通信时间。
 
@@ -86,7 +89,7 @@ Content-Type: application/json
 | `queued` / `running` | 桥已持久化 / 插件已独占领取 |
 | `succeeded` | 已收到执行结果。资金操作还需通过对应回执核验 |
 | `failed` | 参数、页面条件、权限或执行前置检查失败 |
-| `expired` / `cancelled` | 领取前已过期或已取消 |
+| `expired` / `cancelled` | 指令已过期、被取消，或在开仓许可前发现读数差异。风控重选时 `result.reselect=true`、`intents={}` |
 | `unknown` | 资金操作结果不确定，需检查 `intents`、`error` 和平台记录 |
 | `resolved` | 已人工记录核验结论，`result.executed` 和 `result.note` 保留依据 |
 
@@ -99,6 +102,7 @@ Content-Type: application/json
 | 调用方 | 方法和路径 | 用途 |
 | --- | --- | --- |
 | 中心 | `GET /v1/status` | 节点 ID、协议版本、持久化实例 ID、浏览器会话、账户快照、历史序号 `ledger_seq` 和日志序号 `log_seq` |
+| 中心 | `PUT /v1/status` | 使用 `instance_id,generation` 请求全节点全量刷新 |
 | 中心 | `GET /v1/ledger?after=0` | 返回 `node_id,instance_id,items`，按递增 `seq` 返回游标之后最多 200 行。同一历史记录补全或更新时获得新序号 |
 | 中心 | `GET /v1/logs?after=0` | 同样按序号返回最多 200 条节点本地日志。中心落盘后记录游标，重连续传 |
 | 中心 | `PUT /v1/commands/{id}` | 投递不可变的执行请求，重复投递返回已有记录 |
@@ -106,9 +110,10 @@ Content-Type: application/json
 | 中心 | `PUT /v1/commands/{id}/cancel` | 携带原始执行请求，原子取消；先收到取消时也持久化取消记录 |
 | 中心 | `POST /v1/commands/{id}/resolve` | 核验指定 `instance_id` 的未知结果 |
 | 插件 | `POST /v1/plugin/heartbeat` | 上报浏览器、页面、只读或执行模式和当前会话 |
-| 插件 | `POST /v1/plugin/report` | 上报菜单 `inventory`、单账户 `observation` 或 `history:{name,items}`。历史仅接受当前会话已确认且无歧义的账户，每次最多 200 行 |
+| 插件 | `POST /v1/plugin/report` | 上报账户页 `cards:{generation,full,observed_at,items}`、单账户 `observation` 或 `history:{name,items}`。旧插件可继续上报菜单 `inventory`。活动卡片按整份清单替换，历史每次最多 200 行 |
+| 插件 | `POST /v1/plugin/preflight` | 在 NQ 交易页上报目标 `id,observation`。通过时返回 `approved,stop_loss,daily_floor`；需重选时原指令终止 |
 | 插件 | `POST /v1/plugin/poll` | 原子领取一条指令，空闲返回 `{"command":null}` |
-| 插件 | `POST /v1/plugin/intent` | 在实际资金操作前登记 `id,stage,proof` 并取得一次点击许可 |
+| 插件 | `POST /v1/plugin/intent` | 在实际资金操作前登记 `id,stage,proof` 并取得单次点击许可。开仓再次附上 `observation`，并用 `proof.quantity,proof.stop_loss` 核对实仓数量和表单金额 |
 | 插件 | `POST /v1/plugin/result` | 按原会话和指令 ID 上报 `ok,result,error`，可重传回执 |
 
 中心发送的执行请求包含管理接口的目标和参数，另有 `id,instance_id,session_id,phase,source,created_at,expires_at`。资金指令带 `account_ref`，平仓和保护修改还带 `expected_position`。插件上报时携带 `worker_id,session_id,generation,mode,label`；同一浏览器配置文件的授权轮次单调递增，旧轮次无法领取或授权点击。回执使用实际领取指令的会话。

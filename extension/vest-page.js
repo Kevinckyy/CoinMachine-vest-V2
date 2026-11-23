@@ -504,6 +504,51 @@
         } : null];
       }));
     }
+    function dailyUnlimited() {
+      return [...document.querySelectorAll('div.sticky.top-14 p,[data-testid="capital-indicator-daily-loss"]')].some(el =>
+        visible(el) && /^(?:(?:max\.? daily loss|最大日亏损)\s*[:：]\s*)?(?:no daily loss limit|unlimited|无每日亏损上限|无日损限制|不限)$/i.test(core.normalized(el.innerText)));
+    }
+    async function dailyReference(name) {
+      const groups = [...document.querySelectorAll('[data-testid="capital-indicator-daily-loss"]')]
+        .filter(visible).map(el=>el.parentElement).filter(el=>el && el!==document.body);
+      const group = groups.find(el=>el.querySelector('[data-slot="tooltip-trigger"]')) || groups[0];
+      if (!group) return {};
+      const trigger = group.querySelector('[data-slot="tooltip-trigger"]');
+      const readLabels = () => {
+        const linked = trigger?.getAttribute('aria-describedby');
+        const tooltip = linked && document.getElementById(linked);
+        const result = {};
+        for (const root of [group,tooltip].filter(Boolean)) {
+          for (const el of root.querySelectorAll('p,span,div')) {
+            if (el.children.length && !el.matches('span')) continue;
+            const label = core.normalized(el.textContent);
+            const m = label.match(/^(8\s*pm ET balance|美东时间晚上\s*8\s*点余额|today['’]s floor|今日底线|今日底線)\s*[:：]\s*(\$?\s*[\d,]+(?:\.\d+)?)$/i);
+            if (!m) continue;
+            if (!visible(el) && root!==tooltip) continue;
+            result[/^(?:8|美东)/.test(m[1])?'daily_reset_equity':'daily_floor'] = core.parseMoney(m[2]);
+          }
+        }
+        return result;
+      };
+      let result = readLabels();
+      if ((!result.daily_reset_equity || result.daily_floor==null) && trigger && visible(trigger)) {
+        const opts = {bubbles:true,pointerType:'mouse'};
+        try {
+          trigger.dispatchEvent(new PointerEvent('pointerover',opts));
+          trigger.dispatchEvent(new PointerEvent('pointermove',opts));
+          for (let i=0;i<10;i++) {
+            await delay(110);
+            assertLive();
+            if (observerIdentity().name!==name) throw Error('读取日损基准时账户已变化');
+            result = readLabels();
+            if (result.daily_reset_equity || result.daily_floor!=null) break;
+          }
+        } finally {
+          trigger.dispatchEvent(new PointerEvent('pointerout',{...opts,relatedTarget:document.body}));
+        }
+      }
+      return result;
+    }
     function bannerUnrealized() {
       // The desktop second-row banner has no account-upnl test ID. Read its
       // exact visible label without opening the account selector or any menu.
@@ -810,6 +855,8 @@
         position_open: null,
         observed_at: account.observed_at
       };
+      const reference = await dailyReference(name);
+      if (observerIdentity().signature!==id.signature) throw Error('读取期间账户或阶段已变化');
       const restricted = ['default', 'main', 'primary', 'master', 'closed', 'failed'].includes(selected.category);
       return {
         name,
@@ -820,7 +867,8 @@
           balance: account.balance,
           equity: account.equity,
           unrealized_pnl: account.unrealized_pnl,
-          capital_metrics: account.capital_metrics
+          capital_metrics: account.capital_metrics,
+          daily_unlimited: dailyUnlimited(), ...reference
         }
       };
     }
@@ -854,10 +902,14 @@
       await prepare(assertArmed);
       if (readyCheck().position_open !== false) throw Error('开仓前需确认空仓');
       core.validateJob(job, config);
-      if (!job.size_percent) await setInput('quantity', core.nqVestToInput(job.quantity, 'micro'));
+      if (job.size_percent) job.quantity = await selectPositionSize(job);
+      else await setInput('quantity', core.nqVestToInput(job.quantity, 'micro'));
+      if (job.stop_loss<job.quantity*0.25) {
+        const reading = await read(config.accountName,config.accountCategory);
+        job.stop_loss = (await hooks.preflight(reading,job.quantity)).stop_loss;
+      }
       await setInput('stopLoss', job.stop_loss);
       await setInput('takeProfit', job.take_profit ?? '');
-      if (job.size_percent) job.quantity = await selectPositionSize(job);
       const beforeSubmit = () => {
         assertArmed();
         if (observerIdentity().category === 'passed' || (readAccountHealth()?.percent ?? 100) < 25) throw Error('账户当前不可开仓');
@@ -869,16 +921,23 @@
         return field(job.side === 'buy' ? 'buy' : 'sell', true);
       };
       beforeSubmit();
+      const reference = await dailyReference(config.accountName);
+      const latest = observerValues(config.accountName,true);
+      const latestId = observerIdentity();
       await hooks.intent('open', {
         symbol: job.symbol,
         side: job.side,
         quantity: job.quantity,
         stop_loss: job.stop_loss,
         take_profit: job.take_profit ?? null
-      });
+      }, {name:latestId.name,category:latestId.category,phase:latestId.phase,
+        snapshot:{...latest.phase_snapshot,observed_at:latest.observed_at,equity:latest.equity,balance:latest.balance,
+          unrealized_pnl:latest.unrealized_pnl,capital_metrics:latest.capital_metrics,daily_unlimited:dailyUnlimited(),...reference}});
       click(beforeSubmit());
       const filled = await awaitPosition(job, new Set());
-      const missing = [filled.stop_check, filled.take_profit_check].find(v => v?.status === 'failed');
+      const missing = [[filled.stop_check,job.stop_loss,filled.native_sl_absent],
+                       [filled.take_profit_check,job.take_profit,filled.native_tp_absent]]
+        .find(([check,target,absent]) => check?.status==='failed' && !(target!=null && absent===true))?.[0];
       if (missing) throw Object.assign(Error(missing.error), {
         snapshot: filled
       });
@@ -1041,19 +1100,10 @@
       }
     }
     async function execute(cmd) {
-      if (cmd.action === 'accounts.list') {
-        const inventory = await list();
-        await hooks.report({
-          inventory
-        });
-        return {
-          inventory
-        };
-      }
       const observation = await read(cmd.account, null, true);
-      await hooks.report({
-        observation
-      });
+      let approved;
+      if (cmd.action === 'order.open') approved = await hooks.preflight(observation);
+      else await hooks.report({observation});
       if (cmd.action === 'history.read') {
         const tables = await history(cmd.account, true);
         if (observation.phase === 'live' || ['funded','live','closed','failed'].includes(observation.category)) {
@@ -1099,6 +1149,7 @@
           if (!['eval', 'funded', 'live'].includes(observation.category)) throw Error('该账户状态不可开仓');
           current = await openOrder({
             ...job,
+            stop_loss:approved.stop_loss,
             type: 'open',
             ...(p.micro ? {
               quantity: core.nqInputToVest(p.micro, 'micro')

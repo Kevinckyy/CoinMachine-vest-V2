@@ -93,13 +93,13 @@ def positive(value, label):
     return number(value, label, 0.000001)
 
 
-def parameters(action, raw):
+def parameters(action, raw, legacy=False):
     p = dict(obj(raw))
     if action in {"accounts.list", "account.read", "positions.read", "history.read"}:
         fields(p, ())
     elif action == "page.navigate":
         fields(p, ("destination",))
-        choice(p.get("destination"), {"trade", "portfolio"}, "目标页面")
+        choice(p.get("destination"), {"accounts","trade", "portfolio"}, "目标页面")
     elif action == "profit.withdraw":
         fields(p, ("amount",))
         amount = positive(p.get("amount"), "领取金额")
@@ -114,20 +114,23 @@ def parameters(action, raw):
         for key in p.keys() & {"stop_loss", "take_profit"}:
             positive(p[key], key)
     elif action == "order.open":
-        fields(p, ("side", "micro", "size_percent", "stop_loss", "take_profit"))
+        fields(p, ("side", "micro", "size_percent", "stop_buffer", "take_profit") + (("stop_loss",) if legacy else ()))
         choice(p.get("side"), {"buy", "sell"}, "方向")
         require(("micro" in p) != ("size_percent" in p), "请指定 Micro 数量或仓位比例")
         if "micro" in p:
             p["micro"] = number(p["micro"], "Micro 数量", 1, 1_000_000, True)
         else:
             require(type(p["size_percent"]) is int and p["size_percent"] in (25, 50, 75, 100), "仓位比例无效")
-        positive(p.get("stop_loss"), "止损金额")
+        if legacy and "stop_loss" in p and "stop_buffer" not in p:
+            positive(p["stop_loss"],"旧版止损金额")
+        else:
+            p["stop_buffer"] = number(p.get("stop_buffer",20),"爆仓线净值缓冲",0,1e9)
         if p.get("take_profit") is not None:
             positive(p["take_profit"], "止盈金额")
     return p
 
 
-def request(data):
+def request(data, legacy=False):
     fields(data, ("node_id", "worker_id", "account", "action", "params"))
     action = choice(data.get("action"), ACTIONS, "指令类型")
     account = data.get("account")
@@ -136,7 +139,7 @@ def request(data):
     else:
         account = string(account, "账户名")
     return dict(node_id=ident(data.get("node_id")), worker_id=ident(data.get("worker_id")),
-                account=account, action=action, params=parameters(action, data.get("params", {})))
+                account=account, action=action, params=parameters(action, data.get("params", {}),legacy))
 
 
 def validate_target(cmd, worker, account, now):
@@ -149,22 +152,26 @@ def validate_target(cmd, worker, account, now):
     require(worker["mode"] == "execute", "插件处于只读模式", 409)
     require(not account["excluded"] and account["category"] not in ("failed", "closed", "default"),
             "主账户、已关闭或失败账户仅支持读取", 409)
-    require(account.get("listed_session") == account.get("read_session") == worker["session_id"],
+    card_candidate = cmd["action"]=="order.open" and account.get("card") and account["listed_session"]==worker["session_id"] and now-(account.get("card_at") or 0)<=OBS_TTL
+    require(card_candidate or account.get("listed_session") == account.get("read_session") == worker["session_id"],
             "等待本次浏览器会话重新确认账户和读数", 409)
     require(account["phase"] == cmd["phase"], "账户阶段已变化", 409)
-    require(not account["read_error"] and account["observed_at"] and now - account["observed_at"] <= OBS_TTL,
+    require(card_candidate or not account["read_error"] and account["observed_at"] and now - account["observed_at"] <= OBS_TTL,
             "账户读数过期或不完整，请刷新账户", 409)
     snap = account["snapshot"]
-    if cmd["action"] in ("order.open", "profit.withdraw"):
+    if cmd["action"]=="order.open":
+        from .cards import risk_error
+        risk = account.get("risk") or {}
+        issue = risk_error(risk,complete=bool(account.get("risk_at") and now-account["risk_at"]<60))
+        require(not issue,issue,409)
+        require(account["category"] in ("active","eval","funded","live"),"该账户状态不可开仓",409)
+        return
+    if cmd["action"] == "profit.withdraw":
         require(snap.get("position_open") is False, "需要已确认的空仓读数", 409)
     else:
         require(snap.get("position_open") is True and snap.get("position_id") == cmd["params"]["position_id"],
                 "当前持仓与指令不匹配", 409)
         require(all(snap.get(k) == v for k, v in cmd["expected_position"].items()), "持仓数量、方向或均价已变化", 409)
-    if cmd["action"] == "order.open":
-        require(account["category"] in ("eval", "funded", "live"), "该账户状态不可开仓", 409)
-        health = snap.get("account_health")
-        require(health is None or health >= 25, "账户健康度低于 25%", 409)
     if cmd["action"] == "profit.withdraw":
         require(account["phase"] == "live" and account["category"] in ("funded", "live"), "仅 Live 账户可领取利润", 409)
 
@@ -177,6 +184,11 @@ def make_command(key, req, node, worker, account, now, source="manual"):
             "phase": account["phase"] if account else None, "source": source, "created_at": now, "expires_at": end}
     if req["action"] in WRITE:
         cmd["account_ref"] = account["account_ref"] or req["account"]
+    if req["action"]=="order.open":
+        cmd["expected_risk"] = {**(account.get("risk") or {}),"phase":account["phase"],"category":account["category"],
+                                "card_id":(account.get("card") or {}).get("id")}
+        floor = account.get("daily_floor") or {}
+        cmd["expected_floor"] = {k:floor.get(k) for k in ("start","floor","verified")}
     if req["action"] in ("order.close", "position.protect"):
         cmd["expected_position"] = {k: account["snapshot"].get(k) for k in ("position_id", "symbol", "side", "quantity", "entry_price")}
     return cmd

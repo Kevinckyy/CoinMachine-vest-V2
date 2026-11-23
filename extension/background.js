@@ -5,6 +5,7 @@ const BASE = 'http://127.0.0.1:8877/v1/plugin/';
 const BUILD = /^git\.([0-9a-f]{40})$/.exec(chrome.runtime.getManifest().version_name || '')?.[1] || '';
 const UPDATE_ALARM = 'node-release';
 const DESTINATIONS = {
+  accounts: '/accounts',
   trade: '/trade/NQ-PERP',
   portfolio: '/portfolio'
 };
@@ -32,6 +33,7 @@ function publicBinding({
 }) {
   return {
     release: BUILD,
+    cards_version: 1,
     session_id,
     worker_id,
     mode,
@@ -94,13 +96,20 @@ async function setBinding(message) {
   const previous = await binding();
   if (message.type === 'ui.state') {
     const saved = await chrome.storage.session.get(['diagnostic', 'receiptError']);
+    const {cardCache} = await chrome.storage.local.get('cardCache');
     return {
       label: cfg.label || '',
       paired: !!cfg.token,
       mode: previous?.mode || 'unbound',
       worker_id: cfg.worker_id || '',
-      diagnostic: saved.receiptError || saved.diagnostic || ''
+      diagnostic: saved.receiptError || saved.diagnostic || '',
+      cacheCount: cardCache && cardCache.worker_id === cfg.worker_id ? cardCache.items.length : null
     };
+  }
+  if (message.type === 'ui.refresh') {
+    if (!previous) throw Error('请先绑定浏览器');
+    await chrome.storage.local.set({cardRequest:crypto.randomUUID()});
+    return {ok:true};
   }
   if (message.type === 'ui.disconnect') {
     await chrome.storage.local.remove('updateResume');
@@ -128,6 +137,7 @@ async function setBinding(message) {
     };
   }
   if (message.type !== 'ui.bind') throw Error('未知设置');
+  await chrome.storage.session.remove('manualView');
   if (!['readonly', 'execute'].includes(message.mode)) throw Error('模式无效');
   const [tab] = await chrome.tabs.query({
     active: true,
@@ -174,7 +184,14 @@ async function context(message, sender) {
       type: 'fleet.identify'
     });
     if (page?.pageId !== message.pageId) throw Error('旧页面已退出');
-    owner = await rotate(current, cfg, sender.tab.id, message.pageId, 'readonly');
+    const {cardRoute} = await chrome.storage.session.get('cardRoute');
+    if (cardRoute?.sid === current.session_id && cardRoute.from === current.pageId &&
+        Date.now() < cardRoute.expires && onPath(sender.url,cardRoute.path)) {
+      owner = {...current,pageId:message.pageId};
+      await chrome.storage.session.set({binding:owner});
+    } else {
+      owner = await rotate(current, cfg, sender.tab.id, message.pageId, 'readonly');
+    }
   }
   if (message.session_id && message.session_id !== owner.session_id) throw Error('浏览器授权已变化');
   return {
@@ -299,9 +316,10 @@ async function navigate(cmd, owner, cfg) {
     if (!dest || (await binding())?.session_id !== owner.session_id) throw Error('目标页面或会话失效');
     const tab = await chrome.tabs.get(owner.tabId);
     if (new URL(tab.url).origin !== VEST) throw Error('执行窗口已离开 Vest');
-    if (!confirmedPath(tab.url)) await chrome.tabs.update(owner.tabId, {
-      url: VEST + dest
-    });
+    if (!confirmedPath(tab.url)) {
+      await chrome.storage.session.set({manualView:{tabId:owner.tabId,path:dest}});
+      await chrome.tabs.update(owner.tabId,{url:VEST+dest});
+    }
     const until = Date.now() + 20000;
     while (Date.now() < until) {
       const target = await chrome.tabs.get(owner.tabId);
@@ -326,17 +344,88 @@ async function navigate(cmd, owner, cfg) {
     result
   }, cfg);
 }
+function onPath(value,path) {
+  const url = new URL(value);
+  const actual = url.pathname.replace(/\/$/,'');
+  return url.origin === VEST && !url.search && !url.hash && (actual === path ||
+    path === DESTINATIONS.trade && actual === '/trade/NDX-USD-PERP');
+}
+async function startRoute(owner,url,path,work) {
+  const route = {sid:owner.session_id,from:owner.pageId,path,expires:Date.now()+22000,work};
+  await chrome.storage.session.set({cardRoute:route});
+  try {
+    if (onPath(url,path)) await chrome.tabs.reload(owner.tabId);
+    else await chrome.tabs.update(owner.tabId,{url:VEST+path});
+  } catch (err) {
+    await chrome.storage.session.remove('cardRoute');
+    throw err;
+  }
+  return {moving:true};
+}
+async function pollWork(owner,cfg,meta,url) {
+  if ((await binding())?.session_id !== owner.session_id) throw Error('绑定已变化');
+  await drain(cfg);
+  const saved = await chrome.storage.session.get(['cardRoute','cardVisit','returnCards']);
+  const route = saved.cardRoute;
+  let data;
+  if (route) {
+    if (route.sid === owner.session_id && Date.now() < route.expires) {
+      if (route.from === owner.pageId || !onPath(url,route.path)) return {moving:true};
+      data = route.work;
+    } else if (route.work.command) {
+      await persistReceipt({...route.work.owner,id:route.work.command.id,ok:false,error:'页面跳转未完成或授权已变化',result:{}},cfg);
+    }
+    await chrome.storage.session.remove('cardRoute');
+  }
+  if (!data) {
+    const {manualView} = await chrome.storage.session.get('manualView');
+    const manual = owner.mode==='readonly' && manualView?.tabId===owner.tabId && onPath(url,manualView.path);
+    data = await post('poll',{...meta,manual_view:manual},cfg);
+  }
+  if (data.update_release) return data;
+  const cmd = data.command;
+  if (cmd?.action === 'page.navigate') return data;
+  if (cmd) {
+    const path = cmd.action === 'accounts.list' ? DESTINATIONS.accounts : DESTINATIONS.trade;
+    if (!data.arrived && (!onPath(url,path) || cmd.action === 'accounts.list')) {
+      return startRoute(owner,url,path,{...data,arrived:true,owner:publicBinding(owner)});
+    }
+    await chrome.storage.session.set({['lease.'+cmd.id]:{...owner,action:cmd.action}});
+    return data;
+  }
+  const {cardRequest} = await chrome.storage.local.get('cardRequest');
+  const generation = data.refresh_cards ?? data.card_generation ?? 0;
+  if (data.refresh_cards !== undefined || cardRequest || data.forceCards) {
+    const key = JSON.stringify([owner.session_id,generation,cardRequest || '']);
+    if (!data.arrived && (saved.cardVisit !== key || !onPath(url,DESTINATIONS.accounts))) {
+      return startRoute(owner,url,DESTINATIONS.accounts,{arrived:true,forceCards:true,refresh_cards:generation});
+    }
+    await chrome.storage.session.set({cardVisit:key});
+    return {refresh_cards:generation,purchase_request:cardRequest};
+  }
+  if (saved.returnCards === owner.session_id) {
+    await chrome.storage.session.remove('returnCards');
+    if (!onPath(url,DESTINATIONS.accounts))
+      return startRoute(owner,url,DESTINATIONS.accounts,{arrived:true,card_generation:generation});
+  }
+  return data;
+}
 async function handle(message, sender) {
   if (sender.id !== chrome.runtime.id) throw Error('无效的消息来源');
   if (message.type?.startsWith('ui.') && sender.url === chrome.runtime.getURL('popup.html')) {
     return exclusive(() => setBinding(message));
   }
   if (!sender.tab || sender.frameId !== 0 || new URL(sender.url).origin !== VEST) throw Error('无效的执行页面');
+  if (message.type === 'purchase.ready') {
+    await exclusive(()=>chrome.storage.local.set({cardRequest:crypto.randomUUID()}));
+    return {ok:true};
+  }
   // Revoking execution prevents new clicks. Its original document can still return a receipt.
   if (message.type === 'result') {
     const key = 'lease.' + message.data.id;
     const owner = (await chrome.storage.session.get(key))[key];
     if (!owner || owner.tabId !== sender.tab.id || owner.pageId !== message.pageId || owner.session_id !== message.session_id) throw Error('没有属于该页面的指令租约');
+    if (owner.action !== 'accounts.list') await chrome.storage.session.set({returnCards:owner.session_id});
     await persistReceipt({
       ...message.data,
       ...publicBinding(owner)
@@ -359,13 +448,31 @@ async function handle(message, sender) {
     error: String(message.diagnostic || '').replace(/\s+/g, ' ').slice(0, 500)
   };
   const op = message.type;
-  if (!['intent', 'poll', 'report', 'heartbeat'].includes(op)) throw Error('未知插件接口');
-  if (op === 'intent' && (!message.session_id || owner.mode !== 'execute')) throw Error('执行授权已撤销');
-  if (op === 'poll') await drain(cfg);
-  const data = await post(op, {
+  if (!['intent', 'preflight', 'poll', 'report', 'heartbeat'].includes(op)) throw Error('未知插件接口');
+  if (['intent','preflight'].includes(op) && (!message.session_id || owner.mode !== 'execute')) throw Error('执行授权已撤销');
+  const payload = {
     ...message.data,
     ...meta
-  }, cfg);
+  };
+  const data = op === 'poll' ? await exclusive(() => pollWork(owner,cfg,meta,sender.url)) : await post(op,payload,cfg);
+  if (op === 'report' && payload.cards) {
+    const {cards} = payload;
+    await exclusive(async () => {
+      if ((await binding())?.session_id!==owner.session_id) return;
+      await chrome.storage.local.set({cardCache:{worker_id:owner.worker_id,items:cards.items,risks:data.risks,observed_at:cards.observed_at}});
+      if (cards.full && cards.purchase_request && (await chrome.storage.local.get('cardRequest')).cardRequest===cards.purchase_request)
+        await chrome.storage.local.remove('cardRequest');
+    });
+  }
+  if (data.risk && payload.observation) {
+    await exclusive(async () => {
+      const {cardCache} = await chrome.storage.local.get('cardCache');
+      if ((await binding())?.session_id===owner.session_id && cardCache?.worker_id===owner.worker_id) {
+        cardCache.risks[payload.observation.name] = data.risk;
+        await chrome.storage.local.set({cardCache});
+      }
+    });
+  }
   if (op === 'intent' && data.authorize_click === true) {
     await exclusive(() => reserveClick(owner, message.data.id, message.data.stage));
   }
@@ -375,10 +482,6 @@ async function handle(message, sender) {
   if (op === 'poll' && data.command?.action === 'page.navigate') {
     await navigate(data.command, owner, cfg);
     data.command = null;
-  } else if (op === 'poll' && data.command) {
-    await chrome.storage.session.set({
-      ['lease.' + data.command.id]: owner
-    });
   }
   if (op === 'poll' || op === 'heartbeat') await chrome.storage.session.set({
     diagnostic: meta.error || '已连接本机桥'

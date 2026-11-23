@@ -8,6 +8,17 @@ import {createServer} from 'node:net';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
+import '../extension/stop-protection.js';
+
+for (const [side,quantity,trigger] of [['buy',2,19930],['sell',2,20070],['buy',6,19976.75],['sell',6,20023.25]]) {
+  const position={side,quantity,entry_price:20000,native_sl_price:trigger};
+  const check=globalThis.VestStopProtection.plan(position,140,'sl',true);
+  assert.equal(check.status,'verified');
+  assert.equal(check.target_price,trigger);
+  assert.ok(check.actual_risk<=140 && 140-check.actual_risk<quantity*0.25);
+  const uncorrected={...position,native_sl_price:trigger+(side==='buy'?-0.25:0.25)};
+  assert.equal(globalThis.VestStopProtection.plan(uncorrected,140,'sl',true).status,'mismatch');
+}
 
 const root=fileURLToPath(new URL('../',import.meta.url));
 const browser=process.env.VEST_TEST_BROWSER || [
@@ -151,13 +162,48 @@ try {
   },'extension account discovery');
   const data=await api('state'),worker=data.workers[0];
   assert.equal(worker.mode,'readonly');
-  assert.deepEqual(data.accounts.map(a=>[a.name,a.snapshot.equity]),[['Alpha',1050],['Beta',2000]]);
+  assert.deepEqual(data.accounts.map(a=>[a.name,a.card.equity,a.card.active_positions]),[['Alpha',1050,0],['Beta',2000,1]]);
+  assert.equal(await vest.evaluate('location.pathname'),'/accounts');
+  assert.equal(await vest.evaluate("Number(sessionStorage.getItem('opens'))"),0);
+  assert.equal(data.accounts[1].card.pnl,111.50);
+  assert.equal(data.accounts[1].card.drawdown_limit,300);
+  assert.equal(data.accounts[1].card.daily_limit,145.96);
+  await vest.evaluate("sessionStorage.setItem('partialDirectory','1')");
+  const partial=await api('nodes/lab/accounts/refresh','POST',{});
+  await until(async()=>{
+    const s=await api('state?node_id=lab');
+    return s.workers[0].error.includes('未读到完整') && s.workers[0].card_generation!==partial.generation;
+  },'incomplete card grid cannot acknowledge the new generation',35000);
+  assert.deepEqual((await api('state?node_id=lab')).accounts.filter(a=>a.present).map(a=>a.name),['Alpha','Beta']);
+  assert.equal(await popup.evaluate("chrome.storage.local.get('cardCache').then(s=>s.cardCache.items.length)"),2);
+  await vest.evaluate("sessionStorage.removeItem('partialDirectory');document.querySelector('#deskAccounts .grid').removeAttribute('aria-busy');renderCards()");
+  await until(async()=>(await api('state?node_id=lab')).workers[0].card_generation===partial.generation,'full directory recovers');
+  await api('nodes/lab/strategy/start','POST',{});
+  await until(async()=>{
+    const s=await api('state?node_id=lab');
+    return s.nodes[0].card_generation>0 && s.workers[0].card_generation===s.nodes[0].card_generation;
+  },'strategy waits for a new full directory read');
+  await vest.evaluate("sessionStorage.setItem('purchased','yes');const p=document.createElement('p');p.setAttribute('role','status');p.textContent='Your Funded Account is ready to trade.';document.body.append(p)");
+  await until(async()=>(await api('state?node_id=lab')).accounts.find(a=>a.name==='Gamma')?.in_pool,'new purchase joins a running strategy');
+  await api('nodes/lab/strategy/stop','POST',{});
+  await vest.evaluate("sessionStorage.removeItem('purchased')");
+  const manual=await api('nodes/lab/accounts/refresh','POST',{});
+  await until(async()=>{
+    const s=await api('state?node_id=lab');
+    return s.workers[0].card_generation===manual.generation && !s.accounts.find(a=>a.name==='Gamma').present;
+  },'manual full refresh replaces deleted accounts');
+  assert.equal(await vest.evaluate("Number(sessionStorage.getItem('opens'))"),0);
+  for (const account of ['Alpha','Beta']) {
+    const key=randomUUID();
+    await api('commands/'+key,'PUT',{node_id:'lab',worker_id:worker.worker_id,account,action:'history.read',params:{}});
+    await until(async()=>{const c=await api('commands/'+key);if(c.status!=='succeeded')throw Error(c.status+' '+c.error);return true;},'targeted history '+account,45000);
+  }
   const report=await until(async()=>{
     const data=await api('analytics?node_id=lab');return data.summary.settled===3 && data;
   },'persisted native position history');
   assert.deepEqual([report.summary.wins,report.summary.losses,report.summary.flat,report.summary.realized_pnl],[1,1,1,13.25]);
   assert.deepEqual(report.nodes[0].stages.map(s=>s.realized_pnl),[20.5,-7.25,0]);
-  await until(async()=>(await api('analytics?section=order')).total===2,'native orders from both accounts');
+  await until(async()=>(await api('analytics?section=order')).total===3,'native orders from both accounts');
   const payouts=await until(async()=>{
     const p=await api('analytics?section=payout');return p.total===2 && p;
   },'read-only portfolio payout history');
@@ -177,6 +223,8 @@ try {
     return c?.status==='succeeded'&&await api('commands/'+c.id);
   },'read command receipt');
   assert.equal(receipt.result.observation.name,'Alpha');assert.equal(receipt.result.observation.snapshot.equity,1050);
+  assert.equal(receipt.result.observation.snapshot.daily_reset_equity,1000);
+  assert.equal(receipt.result.observation.snapshot.daily_floor,970);
   await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
   const syncId=randomUUID();
   await api('commands/'+syncId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Alpha',action:'history.read',params:{}});
@@ -196,9 +244,10 @@ try {
   await until(()=>ui.evaluate("document.querySelector('#nodeScope')?.options.length===2"),'node switcher');
   await ui.evaluate("const scope=document.getElementById('nodeScope');scope.value='spare';scope.dispatchEvent(new Event('change'))");
   assert.equal(await ui.evaluate("document.querySelectorAll('[data-op=account]').length"),0);
-  await ui.evaluate("document.querySelector('[data-value=strategy]').click();document.querySelector('[data-op=strategyConfig]').click();const sf=document.getElementById('dialogForm');sf.elements.batch_size.value='3';sf.requestSubmit()");
+  await ui.evaluate("document.querySelector('[data-value=strategy]').click();document.querySelector('[data-op=strategyConfig]').click();const sf=document.getElementById('dialogForm');sf.elements.batch_size.value='3';sf.elements.stop_buffer.value='0';sf.requestSubmit()");
   await until(async()=>(await api('state?node_id=spare')).strategy.config.batch_size===3,'node-only strategy settings');
   assert.equal((await api('state?node_id=lab')).strategy.config.batch_size,1);
+  assert.equal((await api('state?node_id=spare')).strategy.config.stop_buffer,0);
   await until(()=>ui.evaluate("!document.getElementById('dialog').open"),'settings saved');
   await ui.evaluate("document.querySelector('[data-value=logs]').click()");
   await until(()=>ui.evaluate("document.querySelector('#logTable')?.textContent.includes('更新策略参数')"),'per-node runtime logs');
@@ -228,7 +277,7 @@ try {
   await until(async()=>(await api('commands/'+returnId)).status==='succeeded','return to the trading page for account reads');
   await until(async()=>{
     const state=await api('state?node_id=lab');
-    return state.workers[0].page.startsWith('/trade/') && state.accounts.every(a=>a.fresh);
+    return state.workers[0].page.startsWith('/trade/');
   },'trade page before update');
   await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
   await popup.evaluate("document.getElementById('execute').click()");
@@ -236,6 +285,26 @@ try {
     const w=(await api('state?node_id=lab')).workers[0];
     return w.mode==='execute' && w;
   },'prior profile mode on the isolated fixture');
+  await until(async()=>{
+    const s=await api('state?node_id=lab');
+    return s.workers[0].card_session===beforeUpdate.session_id && s.accounts.find(a=>a.name==='Alpha')?.fresh;
+  },'execute profile has its own active directory');
+  await vest.evaluate("sessionStorage.setItem('tradeEquity','$1,040.00')");
+  const staleId=randomUUID();
+  await api('commands/'+staleId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Alpha',action:'order.open',params:{side:'buy',micro:1}});
+  const stale=await until(async()=>{
+    const c=await api('commands/'+staleId);
+    if (c.status!=='cancelled') throw Error(c.status+' '+c.error);
+    return c;
+  },'changed trade equity cancels before filling an order');
+  assert.equal(stale.result.reselect,true);
+  assert.ok(stale.result.changed.includes('equity'));
+  assert.deepEqual(stale.intents,{});
+  assert.equal(stale.params.stop_buffer,20);
+  await until(async()=>{
+    const s=await api('state?node_id=lab'), a=s.accounts.find(a=>a.name==='Alpha');
+    return s.workers[0].page==='/accounts' && a.risk.equity===1040 && a.daily_floor.verified;
+  },'corrected risk cached after return to account cards');
   await ui.evaluate("document.querySelector('[data-value=nodes]').click();document.querySelector('[data-op=deployUpdate]').click()");
   await ui.evaluate(`(() => {const f=document.getElementById('dialogForm'); for(const box of f.querySelectorAll('[name=target]')) box.checked=box.value==='lab'; f.elements.revision.value=${JSON.stringify(second)}; f.requestSubmit();})()`);
   await until(async()=>{
@@ -251,6 +320,7 @@ try {
   await until(async()=>{
     const command=await api('commands/'+afterReload);
     if(command.status!=='succeeded')throw Error(command.status+' '+command.error);
+    assert.deepEqual(command.result.inventory.map(a=>a.name),['Alpha','Beta']);
     return true;
   },'bound read command after automatic upgrade');
   assert.equal((await api('state?node_id=spare')).nodes[0].update,null);
@@ -263,7 +333,7 @@ try {
   }
   await ui.send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   assert.equal(await ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
-  console.log('PASS: two bridges, read-only MV3, history, analytics, filters, isolated strategies and logs, receipts, navigation, center-issued Git update, actual extension reload, post-update read and responsive layout');
+  console.log('PASS: active card cache, startup refresh, new purchase, authoritative replacement, daily floor tooltip, zero-intent preflight rejection, history, analytics, two isolated nodes, navigation and center-issued extension upgrade');
 } finally {
   if(browserCdp) await browserCdp.send('Browser.close').catch(()=>{});
   for(const ws of sockets)ws.close();

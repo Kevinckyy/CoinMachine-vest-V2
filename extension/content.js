@@ -7,23 +7,15 @@
     job = null,
     lastContact = 0,
     diagnostic = '';
-  let inventory = [],
-    nextInventory = 0,
-    nextAccount = 0,
+  let nextCards = 0, membership,
     working = false,
     heartbeatBusy = false;
   let runUntil = 0;
-  const historyDue = new Map(), payoutDue = new Map();
-  let nextPortfolio = 0;
   const brief = err => String(err?.message ?? err).replace(/\s+/g, ' ').slice(0, 500);
   function invalidate() {
     session = null;
     lastContact = 0;
-    nextInventory = 0;
-    inventory = [];
-    historyDue.clear();
-    payoutDue.clear();
-    nextPortfolio = 0;
+    nextCards = 0;
   }
   chrome.runtime.onMessage.addListener((message, sender, reply) => {
     if (sender.id !== chrome.runtime.id) return;
@@ -62,66 +54,43 @@
   const page = globalThis.VestPage.create({
     guard,
     report,
-    intent: async (stage, proof) => {
+    preflight: async (observation,quantity) => {
+      guard(true);
+      const value = await ipc('preflight',{id:job.id,observation,quantity});
+      if (!value.data.approved) throw Error(value.data.reason || '候选账户需重新决策');
+      return value.data;
+    },
+    intent: async (stage, proof, observation) => {
       guard(true);
       const value = await ipc('intent', {
         id: job.id,
         stage,
-        proof
+        proof, observation
       });
       guard(true);
       if (value.data?.authorize_click !== true) throw Error('该操作未获许可或已提交');
     }
   });
-  async function observe() {
-    if (!VestBridgeCore.isNqTradePath(location.pathname)) {
-      diagnostic = '当前位于持仓或其他页面，可下达跳转交易页指令';
-      return;
+  async function observe(data, force = false) {
+    if (location.pathname.replace(/\/$/,'') !== '/accounts' || data.moving) return;
+    const full = force || data.refresh_cards !== undefined;
+    if (!full && Date.now() < nextCards) return;
+    nextCards = Date.now()+8000;
+    if (membership === undefined) {
+      const {cardCache} = await chrome.storage.local.get('cardCache');
+      membership = cardCache?.worker_id===session.worker_id ? VestCards.membership(cardCache.items) : null;
     }
-    if (Date.now() >= nextInventory) {
-      inventory = await page.list();
-      await report({
-        inventory
-      });
-      nextInventory = Date.now() + 45000;
-    }
-    const usable = inventory.filter(item => !item.ambiguous);
-    if (!usable.length) return;
-    const account = usable[nextAccount++ % usable.length];
-    let observation;
-    try {
-      observation = await page.read(account.name, account.category);
-      await report({
-        observation
-      });
-      diagnostic = '';
-    } catch (err) {
-      diagnostic = brief(err);
-      await report({
-        observation: {
-          name: account.name,
-          error: diagnostic
-        }
-      });
-      return;
-    }
-    if (Date.now() >= (historyDue.get(account.name) || 0)) {
-      historyDue.set(account.name, Date.now() + 60000);
-      try {
-        await page.history(account.name);
-      } catch (err) {
-        diagnostic = '历史读取 · ' + brief(err);
-      }
-    }
-    if (observation.phase === 'live' && Date.now() >= nextPortfolio && Date.now() >= (payoutDue.get(account.name) || 0)) {
-      nextPortfolio = Date.now() + 30000;
-      payoutDue.set(account.name, Date.now() + 15 * 60000);
-      try {
-        await page.payoutHistory(account.name, false);
-      } catch (err) {
-        diagnostic = '出金历史读取 · ' + brief(err);
-      }
-    }
+    const reading = await VestCards.read(full,guard);
+    const signature = VestCards.membership(reading.items);
+    await report({cards:{...reading,generation:data.refresh_cards ?? data.card_generation ?? 0,
+      full:full || membership!==signature,purchase_request:data.purchase_request}});
+    membership = signature;
+    diagnostic = '';
+    if (!force) return;
+    const counts = new Map();
+    for (const item of reading.items) counts.set(item.name,(counts.get(item.name) || 0)+1);
+    const inventory = reading.items.map(({name,category,phase})=>({name,category,phase,ambiguous:counts.get(name)>1}));
+    return {source:'accounts',full:true,count:inventory.length,inventory};
   }
   async function cycle() {
     let cadence = 1500;
@@ -139,14 +108,14 @@
       job = value.data.command;
       runUntil = (value.data.run_until || 0) * 1000;
       if (!job) {
-        await observe();
+        await observe(value.data);
         return;
       }
       let result = {},
         error = '';
       try {
         if (job.session_id !== cycleSession.session_id || job.worker_id !== cycleSession.worker_id) throw Error('指令目标与当前浏览器不一致');
-        result = await page.execute(job);
+        result = job.action==='accounts.list' ? await observe(value.data,true) : await page.execute(job);
       } catch (err) {
         error = brief(err);
         if (err.snapshot) result = {
@@ -187,4 +156,30 @@
     }
   }, 5000);
   cycle();
+  // A confirmed purchase can appear in another Vest tab in this browser profile.
+  let announced = null;
+  const ready = /^(?:Your (?:\d+ )?Funded Accounts? (?:is|are) ready to trade|Your new account is ready\. You can start trading now|您的新账户已准备就绪，现在可以开始交易|您的\s*(?:\d+\s*个\s*)?Funded Account\s*已可交易|账户购买成功|Account purchased successfully)[.!。]?$/i;
+  const successText = /ready to trade|start trading now|开始交易|已可交易|购买成功|purchased successfully/i;
+  const notice = '[role="dialog"] p,[role="alert"],[role="status"],[data-sonner-toast] p,main p';
+  function checkPurchase(node) {
+    if (!successText.test(node.textContent || '')) return;
+    const root = node.nodeType===Node.ELEMENT_NODE ? node : node.parentElement;
+    if (!root) return;
+    const found = [root.closest(notice),...root.querySelectorAll(notice)].filter(Boolean).find(el =>
+      el.getClientRects().length && ready.test(VestBridgeCore.normalized(el.innerText)));
+    if (found && found!==announced) {
+      announced=found;
+      chrome.runtime.sendMessage({type:'purchase.ready'}).catch(()=>{});
+    }
+  }
+  new MutationObserver(changes => {
+    if (!chrome.runtime.id) return;
+    if (announced && (!announced.isConnected || !ready.test(VestBridgeCore.normalized(announced.textContent)))) announced=null;
+    for (const change of changes) {
+      if (change.type==='characterData') checkPurchase(change.target);
+      else for (const node of change.addedNodes) checkPurchase(node);
+    }
+  })
+    .observe(document.body,{childList:true,subtree:true,characterData:true});
+  checkPurchase(document.body);
 })();

@@ -12,6 +12,7 @@ from datetime import datetime
 
 from fleet.bridge import Bridge
 from fleet.center import Center
+from fleet import daily_floor, ledger
 from fleet.http import make_server
 from fleet.protocol import Problem
 from fleet.reporting import ZONE
@@ -38,6 +39,8 @@ class FleetTest(unittest.TestCase):
             self.observe(nid, "Shared")
             self.observe(nid, "Only-" + nid)
             self.center.sync(nid)
+            for name in ("Shared","Only-"+nid):
+                self.center.account_config(dict(node_id=nid,worker_id="browser",account=name,in_pool=False))
 
     def close(self):
         self.center.db.close()
@@ -47,7 +50,7 @@ class FleetTest(unittest.TestCase):
     def transport(self, node, verb, path, data=None):
         bridge = self.nodes[node["id"]]
         if path == "/v1/status":
-            return bridge.status()
+            return bridge.refresh_cards(data) if verb=="PUT" else bridge.status()
         if path.startswith("/v1/ledger?after="):
             return bridge.ledger_page(int(path.split("=")[1]))
         if path.startswith("/v1/logs?after="):
@@ -64,14 +67,209 @@ class FleetTest(unittest.TestCase):
         return response
 
     def plugin(self, nid, op, **body):
+        if op=="intent" and body["stage"]=="open" and "observation" not in body:
+            cmd = self.nodes[nid].get(body["id"])
+            obs = self.reading(cmd["account"])
+            if cmd["status"]=="running" and not cmd["intents"]:
+                checked = self.plugin(nid,"preflight",id=cmd["id"],observation=obs)
+                self.assertTrue(checked["approved"],checked)
+                body["proof"] = {"quantity":2,**body.get("proof",{}),"stop_loss":checked["stop_loss"]}
+            body["observation"] = obs
         return self.nodes[nid].plugin(op, {**self.plugin_meta, **body})
 
     def report(self, nid, **body):
         return self.plugin(nid, "report", **body)
 
+    def reading(self, name):
+        return dict(name=name,phase="1/2",category="eval",snapshot=dict(position_open=False,balance=1000,equity=1000,
+                    account_health=90,daily_reset_equity=1000,daily_floor=970,capital_metrics={"daily_loss":{"current":0,"limit":30},
+                    "drawdown":{"current":26.08,"limit":300}},unrealized_pnl=0,observed_at=self.time))
+
     def observe(self, nid, name):
-        self.report(nid, observation=dict(name=name, phase="1/2", category="eval",
-                    snapshot=dict(position_open=False, balance=1000, equity=1000, unrealized_pnl=0, observed_at=self.time)))
+        self.report(nid, observation=self.reading(name))
+
+    def card_report(self, nid, items=None, full=True):
+        bridge = self.nodes[nid]
+        if items is None:
+            items = [{"name":a["name"],"category":a["category"],"phase":a["phase"],"active_positions":0}
+                     for a in bridge.status()["accounts"] if a["present"]]
+        return self.plugin(nid,"report",page="/accounts",cards=dict(items=items,full=full,observed_at=self.time,
+                           generation=bridge.status()["card_generation"]))
+
+    def start_ready(self,nid):
+        self.center.strategy("start",{},nid)
+        self.center.sync(nid)
+        self.card_report(nid)
+        self.center.sync(nid)
+
+    @staticmethod
+    def card(name, **changes):
+        return dict({"name":name,"id":"card-"+name,"category":"eval","phase":"1/2","active_positions":0,
+                     "daily_loss":0,"daily_limit":30,"drawdown":26.08,"drawdown_limit":300,"equity":1000},**changes)
+
+    def test_full_directory_generation_and_new_accounts_during_strategy(self):
+        self.center.strategy("start",{},"east")
+        self.center.sync("east")
+        bridge = self.nodes["east"]
+        generation = bridge.status()["card_generation"]
+        self.assertEqual(self.plugin("east","poll",cards_version=1)["refresh_cards"],generation)
+        with self.assertRaises(Problem):
+            self.report("east",page="/accounts",cards=dict(generation=generation-1,items=[],full=True,observed_at=self.time))
+        self.center.decide()
+        self.assertEqual(self.center.state("east")["commands"],[])
+        initial = [self.card("Shared"),self.card("Only-east")]
+        self.card_report("east",initial)
+        self.center.sync("east")
+        self.center.decide()
+        self.assertEqual(self.center.state("east")["commands"],[])
+        self.time += 2
+        new = self.card("New")
+        self.card_report("east",initial+[new],full=False)
+        self.center.sync("east")
+        self.center.decide()
+        state = self.center.state("east")
+        self.assertEqual([c["account"] for c in state["commands"]],["New"])
+        self.assertEqual({a["name"] for a in state["accounts"] if a["in_pool"]},{"New"})
+        self.time += 1
+        self.card_report("east",[new,new],full=False)
+        self.center.sync("east")
+        by_name = {a["name"]:a for a in self.center.state("east")["accounts"]}
+        self.assertTrue(by_name["New"]["ambiguous"])
+        self.assertFalse(by_name["New"]["in_pool"])
+        self.assertFalse(by_name["Shared"]["present"])
+        self.assertTrue(next(a for a in self.center.state("west")["accounts"] if a["name"]=="Shared")["present"])
+
+    def test_preflight_replaces_one_member_without_disturbing_batch(self):
+        items = [self.card(name) for name in ("One","Two","Three")]
+        self.card_report("east",items)
+        for a in items:
+            self.observe("east",a["name"])
+        self.center.sync("east")
+        self.center.strategy("config",{"batch_size":2},"east")
+        self.center.strategy("start",{},"east")
+        self.center.sync("east")
+        self.card_report("east",items)
+        self.center.sync("east")
+        self.center.decide()
+        self.center.sync("east")
+        first = self.plugin("east","poll")["command"]
+        original = self.center.state("east")["strategy"]["members"]
+        self.time += 1
+        obs = self.reading(first["account"])
+        obs["snapshot"]["account_health"] = 10
+        reply = self.plugin("east","preflight",id=first["id"],observation=obs)
+        self.assertFalse(reply["approved"])
+        self.assertEqual(self.nodes["east"].get(first["id"])["intents"],{})
+        self.card_report("east",items,full=False)
+        self.center.sync("east")
+        self.center.decide()
+        s = self.center.state("east")["strategy"]
+        self.assertTrue(s["enabled"])
+        self.assertEqual((s["batch"],len(s["members"])),(1,2))
+        self.assertEqual(set(s["members"]) & set(original),set(original)-{first["id"]})
+        self.assertTrue(all(self.center.get(k)["account"]!=first["account"] and
+                            self.center.get(k)["params"]["side"]==first["params"]["side"] for k in s["members"]))
+
+    def test_daily_stop_rechecked_with_equity_buffer_at_final_intent(self):
+        obs = self.reading("Shared")
+        snap = obs["snapshot"]
+        snap.update(equity=9850,balance=9850,daily_reset_equity=10000,daily_floor=9700)
+        snap["capital_metrics"]["daily_loss"].update(limit=300,current=150)
+        self.report("east",observation=obs)
+        self.center.sync("east")
+        self.center.strategy("config",{"stop_buffer":10},"east")
+        params = {"side":"buy","micro":1}
+        self.center.submit("dynamic",self.req(action="order.open",params=params))
+        self.center.sync("east")
+        cmd = self.plugin("east","poll")["command"]
+        self.assertEqual(cmd["params"]["stop_buffer"],10)
+        intent = dict(id=cmd["id"],stage="open",proof={"quantity":2,"stop_loss":140},observation=obs)
+        with self.assertRaisesRegex(Problem,"先完成"):
+            self.plugin("east","intent",**intent)
+        self.assertEqual(self.plugin("east","preflight",id=cmd["id"],observation=obs)["stop_loss"],140)
+        with self.assertRaisesRegex(Problem,"实际仓位"):
+            self.plugin("east","intent",**{**intent,"proof":{"quantity":2,"stop_loss":139}})
+        snap["equity"] = 9849
+        self.assertFalse(self.plugin("east","intent",**intent)["authorize_click"])
+        self.assertEqual(self.nodes["east"].get(cmd["id"])["intents"],{})
+        self.center.sync("east")
+        self.assertEqual(self.center.get("dynamic")["status"],"cancelled")
+        self.assertIn("equity",self.center.get("dynamic")["result"]["changed"])
+        self.center.submit("resized",self.req(action="order.open",params=params))
+        self.center.sync("east")
+        cmd = self.plugin("east","poll")["command"]
+        self.assertEqual(self.plugin("east","preflight",id=cmd["id"],observation=obs)["stop_loss"],139)
+        intent.update(id=cmd["id"],proof={"quantity":6,"stop_loss":139})
+        self.assertTrue(self.plugin("east","intent",**intent)["authorize_click"])
+        proof = self.nodes["east"].get("resized")["intents"]["open"]["proof"]
+        self.assertEqual((proof["daily_floor"]["floor"],proof["stop_buffer"]),(9700,10))
+
+    def test_floor_reset_with_dst_gross_debits_and_duplicate_history(self):
+        at = datetime.fromisoformat("2026-11-01T14:00:00+00:00").timestamp()
+        route = ("east","browser","Live")
+        with self.nodes["east"].db.tx() as db:
+            def level(stamp=at):
+                return daily_floor.view(db,*route[1:],stamp)
+            daily_floor.capture(db,*route[1:],at-2000,300)
+            self.assertFalse(level()["verified"])
+            self.assertIsNone(daily_floor.stop_amount(9850,level(),10))
+            daily_floor.capture(db,*route[1:],at-2000,300,10000,9700)
+            day = level()
+            self.assertEqual(day["end"]-day["start"],25*3600)
+            self.assertEqual(daily_floor.stop_amount(9850,day,20),130)
+            for ref,stamp in (("a",at-600),("b",at-400)):
+                ledger.save(db,route,"withdrawal",ref,dict(phase="live",amount=40,expected_received=32,verified_at=stamp))
+            def payout(ref,amount,created,executed):
+                ledger.native_rows(db,route,{"items":[dict(kind="payout",ref=ref,status="completed",gross_amount=amount,
+                                   net_amount=amount*0.8,created_at=created,executed_at=executed,phase="live")]})
+            for _ in range(2):
+                payout("platform-a",40,at-605,at-590)
+                payout("external",15,at-150,at-120)
+            daily_floor.capture(db,*route[1:],at,300,10000,9605)
+            self.assertEqual((level()["gross_withdrawn"],level()["floor"]),(95,9605))
+            reset = day["end"]
+            self.assertIsNone(level(reset))
+            daily_floor.capture(db,*route[1:],reset,297,9900)
+            payout("settled-later",40,at-401,reset+90)
+            self.assertEqual((level(reset+90)["gross_withdrawn"],level(reset+90)["floor"]),(0,9603))
+            spring = datetime.fromisoformat("2026-03-08T14:00:00+00:00").timestamp()
+            daily_floor.capture(db,*route[1:],spring,platform=9700)
+            self.assertEqual(level(spring)["end"]-level(spring)["start"],23*3600)
+            daily_floor.capture(db,*route[1:],spring+10,allowance=299.99)
+            self.assertEqual((level(spring)["source"],level(spring)["floor"]),("platform",9700))
+            daily_floor.capture(db,*route[1:],spring+15,allowance=200,reset=10000)
+            self.assertFalse(level(spring)["verified"])
+
+    def test_card_close_schedules_one_targeted_history_read(self):
+        items = [self.card("Shared",active_positions=1)]
+        self.card_report("east",items)
+        self.center.sync("east")
+        self.assertEqual(self.center.state("east")["commands"],[])
+        self.time+=1
+        items[0]["active_positions"]=0
+        for _ in range(3):
+            self.card_report("east",items,full=False)
+            self.center.sync("east")
+        cmds = self.center.state("east")["commands"]
+        self.assertEqual([(c["action"],c["account"],c["source"]) for c in cmds],[("history.read","Shared","card-close")])
+
+    def test_selected_size_must_leave_one_tick_before_open(self):
+        self.enable("east")
+        self.start_ready("east")
+        self.center.decide()
+        self.center.sync("east")
+        cmd = self.plugin("east","poll")["command"]
+        obs = self.reading(cmd["account"])
+        self.assertEqual(self.plugin("east","preflight",id=cmd["id"],observation=obs)["stop_loss"],10)
+        checked = self.plugin("east","preflight",id=cmd["id"],observation=obs,quantity=44)
+        self.assertTrue(checked["reselect"])
+        self.center.sync("east")
+        self.center.decide()
+        state = self.center.state("east")
+        self.assertTrue(state["strategy"]["enabled"])
+        self.assertFalse(any(a["candidate"] for a in state["accounts"]))
+        self.assertEqual(len(state["commands"]),1)
+        self.assertEqual(self.center.get(cmd["id"])["intents"],{})
 
     @staticmethod
     def req(nid="east", name="Shared", action="account.read", params=None):
@@ -102,7 +300,7 @@ class FleetTest(unittest.TestCase):
                 self.center.deployment("east","up","create",invalid)
         self.center.submit("inflight", self.req())
         self.enable("east")
-        self.center.strategy("start", {}, "east")
+        self.start_ready("east")
         self.center.deployment("east","up","create",req)
         self.center.db.close()
         self.center = Center(self.root/"center", self.clock, self.transport)
@@ -228,7 +426,7 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(self.nodes["east"].get("queued-read")["status"], "cancelled")
         self.center.sync("east")
         with self.assertRaisesRegex(Problem, "只读|消失"):
-            self.center.submit("no-write", self.req(action="order.open", params={"side":"buy","micro":1,"stop_loss":1}))
+            self.center.submit("no-write", self.req(action="order.open", params={"side":"buy","micro":1,"stop_buffer":1}))
         self.time += 26
         self.center.sync("east")
         state = self.center.state()
@@ -255,7 +453,7 @@ class FleetTest(unittest.TestCase):
         self.center.sync("east")
         with self.assertRaisesRegex(Problem, "不唯一"):
             self.center.submit("ambiguous", self.req())
-        req = self.req(name="Main", action="order.open", params={"side":"sell","micro":1,"stop_loss":1})
+        req = self.req(name="Main", action="order.open", params={"side":"sell","micro":1,"stop_buffer":1})
         with self.assertRaisesRegex(Problem, "主账户"):
             self.center.submit("main", req)
         self.center.submit("old-store", self.req("west"))
@@ -272,7 +470,7 @@ class FleetTest(unittest.TestCase):
         for nid, side in (("east","buy"), ("west","sell")):
             self.enable(nid)
             self.center.strategy("config", {"side":side}, nid)
-            self.center.strategy("start", {}, nid)
+            self.start_ready(nid)
         self.center.decide()
         original = self.center.state()["commands"]
         self.assertEqual({c["node_id"] for c in original}, {"east","west"})
@@ -294,11 +492,11 @@ class FleetTest(unittest.TestCase):
         for nid in self.nodes:
             self.center.account_config(dict(node_id=nid, worker_id="browser", account="Shared", in_pool=True))
         self.center.strategy("config", {"batch_size":2}, "east")
-        self.center.strategy("start", {}, "east")
+        self.start_ready("east")
         self.center.decide()
         self.assertEqual(self.center.state()["commands"], [])
         self.center.strategy("stop", {}, "east")
-        p = {"side":"buy", "micro":1, "stop_loss":2}
+        p = {"side":"buy", "micro":1, "stop_buffer":2}
         self.center.submit("first", self.req(action="order.open", params=p))
         with self.assertRaisesRegex(Problem, "未完成"):
             self.center.submit("duplicate", self.req("west", action="order.open", params=p))
@@ -315,7 +513,7 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(a["observed_at"], self.time)
 
     def test_late_receipt_and_invalid_proof(self):
-        p = {"side":"buy","micro":1,"stop_loss":130}
+        p = {"side":"buy","micro":1,"stop_buffer":20}
         self.center.submit("late-proof", self.req(action="order.open", params=p))
         self.center.sync("east")
         self.plugin("east", "poll")
@@ -327,14 +525,17 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(self.nodes["east"].get("late-proof")["status"], "unknown")
         evidence = dict(name="Shared", phase="1/2", category="eval", snapshot=dict(equity=1000,balance=1000,unrealized_pnl=0,
             position_open=True, position_id="synthetic", symbol="NQ-PERP", side="buy", quantity=2, entry_price=20000,
-            observed_at=self.time, stop_check={"status":"verified"}, take_profit_check={"status":"omitted"}))
+            observed_at=self.time, native_sl_price=19995, stop_check={"status":"verified","target_risk":10}, take_profit_check={"status":"omitted"}))
+        wrong = {**evidence,"snapshot":{**evidence["snapshot"],"native_sl_price":19994.75}}
+        self.assertEqual(self.plugin("east","result",id="late-proof",ok=True,
+                         result={"observation":wrong})["status"],"unknown")
         self.plugin("east", "result", id="late-proof", ok=True, result={"observation":evidence})
         self.center.sync("east")
         self.assertEqual(self.center.get("late-proof")["status"], "succeeded")
         self.assertEqual(self.center.history("unknown")["total"], 0)
 
     def test_lost_node_blocks_mutations_until_original_ledger_replies(self):
-        req = self.req(action="order.open", params={"side":"buy","micro":1,"stop_loss":1})
+        req = self.req(action="order.open", params={"side":"buy","micro":1,"stop_buffer":1})
         self.center.submit("partition", req)
         self.lose_delivery = True
         self.center.sync("east")
@@ -348,7 +549,7 @@ class FleetTest(unittest.TestCase):
     def test_uncertain_financial_intent_never_released_twice(self):
         # Simulate a stopped worker at the protocol boundary. No clicks or broker exist.
         self.enable("east")
-        self.center.strategy("start", {}, "east")
+        self.start_ready("east")
         self.center.decide()
         self.center.sync("east")
         cmd = self.plugin("east", "poll")["command"]
@@ -370,14 +571,15 @@ class FleetTest(unittest.TestCase):
     def test_batch_waits_for_observed_exit_then_interval(self):
         self.enable("east")
         self.center.strategy("config", {"interval_seconds":2}, "east")
-        self.center.strategy("start", {}, "east")
+        self.start_ready("east")
         self.center.decide()
         self.center.sync("east")
         cmd = self.plugin("east", "poll")["command"]
         self.plugin("east", "intent", id=cmd["id"], stage="open", proof={"quantity":2})
         snap = dict(position_open=True, position_id="fixture", symbol="NQ-PERP", side=cmd["params"]["side"],
                     quantity=2, entry_price=1000, balance=1000, equity=1000, unrealized_pnl=0, observed_at=self.time,
-                    stop_check={"status":"verified"}, take_profit_check={"status":"omitted"})
+                    native_sl_price=995 if cmd["params"]["side"]=="buy" else 1005,
+                    stop_check={"status":"verified","target_risk":10}, take_profit_check={"status":"omitted"})
         self.plugin("east", "result", id=cmd["id"], ok=True,
                     result={"observation":{"name":"Only-east","phase":"1/2","snapshot":snap}})
         self.center.sync("east")
@@ -577,7 +779,7 @@ class FleetTest(unittest.TestCase):
     def test_legacy_global_run_migrates_without_authorizing_extra_trades(self):
         for nid in self.nodes:
             self.enable(nid)
-            self.center.strategy("start",{},nid)
+            self.start_ready(nid)
         self.center.decide()
         legacy = self.center.state("east")["strategy"]
         legacy.pop("node_id")

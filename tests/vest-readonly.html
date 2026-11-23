@@ -1,8 +1,13 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>本地账户读取测试</title></head>
 <body><button data-testid="account-selector-trigger" aria-expanded="false"><span class="truncate">Alpha</span><span>Evaluation</span><span>1/2</span></button>
+<section id="deskAccounts" hidden><div role="tablist"><button role="tab" id="desk-trigger-active" aria-selected="true">活跃</button></div>
+<p data-testid="dashboard-total-value">$3,050.00</p><div class="grid"></div></section>
 <nav><a href="/portfolio">Portfolio</a><a href="/trade/NQ-PERP">Trade</a></nav>
 <p data-testid="account-value">$1,050.00</p><p data-testid="account-upnl">$0.00</p><p data-testid="book-mark">$20,000</p>
 <p data-testid="account-health">90%</p>
+<div><span id="lossHelp" data-slot="tooltip-trigger">每日亏损</span><p data-testid="capital-indicator-daily-loss">$0.00 / $30.00</p></div>
+<div id="lossLabels" role="tooltip" hidden><span>美东时间晚上8点余额：$1,000.00</span><span>今日底线：$970.00</span></div>
+<span data-testid="capital-indicator-drawdown">$26.08 / $300</span>
 <button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active positions</button>
 <div id="positions"><p>No positions yet</p></div>
 <button data-testid="account-tab-positions-history" aria-selected="false" aria-controls="closed">Positions history</button>
@@ -12,8 +17,36 @@
 <div id="payouts" hidden></div>
 <script>
   const trigger = document.querySelector('button');
+  const lossHelp=document.getElementById('lossHelp'), labels=document.getElementById('lossLabels');
+  lossHelp.onpointerover=()=>{labels.hidden=false;lossHelp.setAttribute('aria-describedby',labels.id);};
+  lossHelp.onpointerout=()=>{labels.hidden=true;lossHelp.removeAttribute('aria-describedby');};
+  function tradeEquity(name,equity) {
+    return name==='Alpha' && sessionStorage.getItem('tradeEquity') || equity;
+  }
+  document.querySelector('[data-testid="account-value"]').textContent=tradeEquity('Alpha','$1,050.00');
   const accounts = [['Alpha','eval','Evaluation','1/2','$1,050.00'],['Beta','funded','Funded','Live','$2,000.00']];
   let menu;
+  const onAccounts=location.pathname==='/accounts';
+  document.getElementById('deskAccounts').hidden=!onAccounts;
+  trigger.hidden=onAccounts;
+  function renderCards() {
+    const grid=document.querySelector('#deskAccounts .grid');
+    grid.replaceChildren();
+    for(const [name,code,category,phase,equity] of accounts) {
+      const link=document.createElement('a'); link.href='/portfolio';
+      link.innerHTML='<p><span class="truncate">'+name+'</span><button data-testid="edit-account-name-'+name+'"></button></p><span data-slot="badge">'+phase+'</span><span data-slot="badge">'+category+'</span>'+
+        '<div><p>账户价值</p><p>'+equity+'</p><p>+$111.50 (+10.77%)</p></div><div><p>每日亏损</p><p>$0.00 / '+(name==='Beta'?'$145.96':'$30.00')+'</p></div>'+
+        '<div><p>回撤</p><p>$26.08 / $300</p></div><p>'+(name==='Beta'?1:0)+' 笔影响账户的交易</p>';
+      grid.append(link);
+    }
+  }
+  if(sessionStorage.getItem('purchased')) accounts.push(['Gamma','eval','Evaluation','1/2','$1000.00']);
+  renderCards();
+  if(onAccounts && sessionStorage.getItem('partialDirectory')) {
+    const grid=document.querySelector('#deskAccounts .grid');
+    grid.lastElementChild.remove();
+    grid.setAttribute('aria-busy','true');
+  }
   const td = (key, html) => '<td data-testid="td-' + key + '">' + html + '</td>';
   const market = '<a href="/trade/NQ-PERP"><p>NQ</p><p>Long 2x</p></a>';
   const clock = value => '<time datetime="' + value + '">' + value + '</time>';
@@ -62,6 +95,7 @@
   }
   function openMenu() {
     if (menu) return;
+    sessionStorage.setItem('opens',String(Number(sessionStorage.getItem('opens') || 0)+1));
     menu=document.createElement('div');menu.setAttribute('role','menu');
     menu.onkeydown=e=>{if(e.key==='Escape')closeMenu();};
     accounts.forEach(([name,code,category,phase,equity])=>{
@@ -69,7 +103,10 @@
       item.innerHTML='<span class="truncate">'+name+'</span><span>'+category+'</span><span>'+phase+'</span>';
       item.onclick=()=>{
         trigger.innerHTML=item.innerHTML;
-        document.querySelector('[data-testid="account-value"]').textContent=equity;
+        document.querySelector('[data-testid="account-value"]').textContent=tradeEquity(name,equity);
+        document.querySelector('[data-testid="capital-indicator-daily-loss"]').textContent=name==='Beta'?'$0.00 / $145.96':'$0.00 / $30.00';
+        labels.firstElementChild.textContent='美东时间晚上8点余额：'+(name==='Beta'?'$4,865.33':'$1,000.00');
+        labels.lastElementChild.textContent='今日底线：'+(name==='Beta'?'$4,719.37':'$970.00');
         showHistory(name);
         closeMenu();
       };

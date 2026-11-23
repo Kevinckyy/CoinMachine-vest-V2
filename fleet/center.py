@@ -8,7 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
-from . import ledger, reporting, updates
+from . import daily_floor, ledger, reporting, updates
 
 from .protocol import (NODE_TTL, OBS_TTL, PENDING, RUN_TTL, TERMINAL, WORKER_TTL, WRITE, Problem, boolean,
                        bridge_url, choice, dump, fields, ident, make_command, number, obj, parameters,
@@ -41,7 +41,7 @@ def uid():
 
 
 DEFAULT_CONFIG = {"batch_size": 1, "interval_seconds": 60, "side": "random", "size_percent": 25,
-                  "stop_loss": 130, "take_profit": None}
+                  "stop_buffer": 20, "take_profit": None}
 
 
 def initial_strategy(nid):
@@ -62,6 +62,7 @@ class Center:
             CREATE TABLE IF NOT EXISTS account_config(node TEXT,worker TEXT,name TEXT,alias TEXT,note TEXT,
                 enabled INTEGER NOT NULL,in_pool INTEGER NOT NULL,account_ref TEXT NOT NULL DEFAULT '',PRIMARY KEY(node,worker,name));
             CREATE TABLE IF NOT EXISTS node_strategy(node TEXT PRIMARY KEY REFERENCES nodes(id), data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS directory_refresh(node TEXT PRIMARY KEY REFERENCES nodes(id),generation INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS ledger_cursor(node TEXT PRIMARY KEY REFERENCES nodes(id), seq INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS log_cursor(node TEXT PRIMARY KEY REFERENCES nodes(id), seq INTEGER NOT NULL);
         """)
@@ -76,6 +77,8 @@ class Center:
             if "account_ref" not in {r["name"] for r in db.execute("PRAGMA table_info(account_config)")}:
                 db.execute("ALTER TABLE account_config ADD COLUMN account_ref TEXT NOT NULL DEFAULT ''")
             self._migrate_strategies(db)
+            db.execute("""UPDATE node_strategy SET data=json_set(json_remove(data,'$.config.stop_loss'),
+                      '$.config.stop_buffer',20) WHERE json_extract(data,'$.config.stop_buffer') IS NULL""")
             ledger.backfill(db)
 
     def _migrate_strategies(self, db):
@@ -128,17 +131,24 @@ class Center:
             snap = json.loads(row["snapshot"])
             last = db.execute("SELECT * FROM node_updates WHERE node=? ORDER BY created DESC,rowid DESC LIMIT 1", (nid,)).fetchone()
             agent = db.execute("SELECT seen,actual FROM node_agents WHERE node=?", (nid,)).fetchone()
+            refresh = db.execute("SELECT generation FROM directory_refresh WHERE node=?",(nid,)).fetchone()
             nodes[nid] = {**node, "online": online, "release":snap.get("release",""), "agent_seen":agent["seen"] if agent else None,
-                          "agent_release":agent["actual"] if agent else "", "update":updates.view(last) if last else None}
+                          "agent_release":agent["actual"] if agent else "", "update":updates.view(last) if last else None,
+                          "card_generation":refresh[0] if refresh else 0}
             for w in snap["workers"]:
                 workers[nid, w["worker_id"]] = {**w, "node_id": nid, "online": online and now - w["last_seen"] < WORKER_TTL}
             for a in snap["accounts"]:
                 key = (nid, a["worker_id"], a["name"])
                 cfg = configs.get(key)
+                worker = workers[key[:2]]
+                card_fresh = bool(a.get("card") and a["present"] and worker["online"] and
+                                  worker["session_id"]==a["listed_session"] and now-a["card_at"]<=OBS_TTL)
+                eligible = a["present"] and not a["ambiguous"] and not a["excluded"] and a["category"] in ("active","eval","funded","live")
                 accounts[key] = {**a, "node_id": nid, "alias": cfg["alias"] if cfg else "",
                                  "note": cfg["note"] if cfg else "", "enabled": bool(cfg["enabled"]) if cfg else True,
-                                 "in_pool": bool(cfg and cfg["in_pool"]), "account_ref": cfg["account_ref"] if cfg else "",
-                                 "fresh": bool(workers[key[:2]]["online"] and a.get("read_session") == a.get("listed_session") == workers[key[:2]]["session_id"]
+                                 "in_pool": bool(eligible and (cfg["enabled"] and cfg["in_pool"] if cfg else a.get("card"))),
+                                 "account_ref": cfg["account_ref"] if cfg else "", "card_fresh":card_fresh,
+                                 "fresh": card_fresh or bool(worker["online"] and a.get("read_session") == a.get("listed_session") == worker["session_id"]
                                                and a["present"] and not a["read_error"]
                                                and a["observed_at"] and now - a["observed_at"] <= OBS_TTL)}
         return nodes, workers, accounts
@@ -151,6 +161,11 @@ class Center:
             recent = db.execute("SELECT * FROM commands"+cond+" ORDER BY created DESC,id DESC LIMIT 100", args)
             unknown = db.execute("SELECT COUNT(*) FROM commands WHERE status='unknown'"+(" AND node=?" if node_id else ""), args).fetchone()[0]
             strategies = [json.loads(r[0]) for r in db.execute("SELECT data FROM node_strategy"+cond+" ORDER BY node", args)]
+            for a in accounts.values():
+                a["candidate"] = False
+            for s in strategies:
+                for cmd in self._strategy_candidates(db,s,(nodes,workers,accounts),"buy"):
+                    accounts[cmd["node_id"],cmd["worker_id"],cmd["account"]]["candidate"] = True
             return dict(now=self.clock(), nodes=list(nodes.values()), workers=list(workers.values()),
                         accounts=list(accounts.values()), strategies=strategies, strategy=strategies[0] if len(strategies)==1 else None,
                         unknown_count=unknown, commands=[summary(r) for r in recent])
@@ -230,6 +245,15 @@ class Center:
         require(not node["agent_release"] or node["agent_release"] == node["release"], "等待同步节点桥的新版本", 409)
         require(not node["release"] or worker.get("release") == node["release"], "浏览器尚未加载当前节点版本", 409)
         a = accounts.get((*route, req["account"]))
+        if req["action"]=="order.open" and a:
+            budget = daily_floor.stop_amount((a.get("risk") or {}).get("equity"),a.get("daily_floor"),req["params"]["stop_buffer"])
+            if budget is not None:
+                require(budget>0 and budget>=req["params"].get("micro",0)*2*0.25,"净值缓冲后的止损余量不足",409)
+                size = (a.get("risk") or {}).get("size_minimum")
+                if size and req["params"].get("size_percent") and size["size_percent"]==req["params"]["size_percent"] and self.clock()-(a["preflight_at"] or 0)<60:
+                    require(budget>=size["minimum"],"止损余量不足当前仓位的一个价格跳动",409)
+            elif a.get("preflight_at") and self.clock()-a["preflight_at"]<60:
+                raise Problem("等待有效的当日爆仓线",409)
         require(req["action"] not in WRITE or a and a["enabled"], "账户已停用或不存在", 409)
         cmd = make_command(key, req, node, worker, a, self.clock(), source)
         validate_target(cmd, worker, a, self.clock())
@@ -240,6 +264,9 @@ class Center:
         req = request(body)
         with self.db.tx() as db:
             prior = find_command(db, ident(key))
+            if req["action"]=="order.open" and "stop_buffer" not in body.get("params",{}):
+                req["params"]["stop_buffer"] = (json.loads(prior["body"])["params"].get("stop_buffer",20) if prior else
+                                              self._strategy(db,req["node_id"])["config"]["stop_buffer"])
             if prior:
                 old = json.loads(prior["body"])
                 require(old["source"] == "manual" and all(old[k] == v for k, v in req.items()), "该 ID 已用于其他指令", 409)
@@ -287,6 +314,23 @@ class Center:
             self._receipt(db, cmd, reply)
             return record(command(db, key))
 
+    def _queue_closed_history(self, db, nid, snapshot):
+        events = [a for a in snapshot["accounts"] if a.get("history_due_at") and a["present"] and not a["ambiguous"]]
+        if not events:
+            return
+        inventory = self._inventory(db,nid)
+        for a in events:
+            event = [snapshot["instance_id"],a["worker_id"],a["name"],a["history_due_at"]]
+            key = str(uuid.uuid5(uuid.NAMESPACE_URL,dump(event)))
+            if find_command(db,key):
+                continue
+            req = dict(node_id=nid,worker_id=a["worker_id"],account=a["name"],action="history.read",params={})
+            try:
+                cmd = self._prepare(db,key,req,inventory,"card-close")
+            except Problem:
+                continue
+            insert(db,cmd,"pending",self.clock())
+
     def sync(self, nid):
         with self.db.tx() as db:
             node = dict(db.execute("SELECT * FROM nodes WHERE id=?", (nid,)).fetchone())
@@ -330,8 +374,12 @@ class Center:
                         message = w.get("error") or ("浏览器在线 · "+mode if live else "浏览器离线")
                         reporting.log(db, nid, self.clock(), "browser", message,
                                       "warning" if w.get("error") or not live else "info", worker=w["worker_id"])
+                self._queue_closed_history(db,nid,snap)
                 todo = [r[0] for r in db.execute("""SELECT id FROM commands WHERE node=? AND
                         status IN ('pending','sending','queued','running','unknown') ORDER BY created,id""", (nid,))]
+                requested = db.execute("SELECT generation FROM directory_refresh WHERE node=?",(nid,)).fetchone()
+            if requested and "card_generation" in snap and snap["card_generation"] < requested[0]:
+                self.transport(node,"PUT","/v1/status",{"instance_id":instance,"generation":requested[0]})
             for key in todo:
                 with self.db.tx() as db:
                     row = command(db, key)
@@ -427,6 +475,19 @@ class Center:
             if row["node"] == s["node_id"]:
                 self._cancel(db, row)
 
+    def _request_cards(self, db, nid):
+        self._strategy(db,nid)
+        gen = int(self.clock()*1000000)
+        db.execute("""INSERT INTO directory_refresh VALUES(?,?) ON CONFLICT(node) DO UPDATE SET
+                   generation=MAX(directory_refresh.generation+1,excluded.generation)""",(nid,gen))
+        return db.execute("SELECT generation FROM directory_refresh WHERE node=?",(nid,)).fetchone()[0]
+
+    def refresh_accounts(self, nid):
+        with self.db.tx() as db:
+            generation = self._request_cards(db,nid)
+            reporting.log(db,nid,self.clock(),"account","已请求手动全量刷新活动账户")
+            return {"generation":generation}
+
     def strategy(self, op, body, node_id=None):
         with self.db.tx() as db:
             if node_id is None:
@@ -442,7 +503,9 @@ class Center:
                 # A stopped, partially delivered batch must finish before another run.
                 for key in s["members"]:
                     require(command(db, key)["status"] not in PENDING | {"unknown"}, "上一批仍有未结束的指令", 409)
-                s.update(enabled=True, draining=False, run=uid(), batch=0, members=[], next_at=self.clock(), message="等待可用账户")
+                self._request_cards(db,node_id)
+                s.update(enabled=True, draining=False, run=uid(), batch=0, members=[], replace=0,
+                         next_at=self.clock(), message="等待浏览器全量刷新活动账户")
             elif op == "config":
                 require(not s["enabled"], "请先停止策略再修改参数", 409)
                 fields(body, DEFAULT_CONFIG)
@@ -451,7 +514,7 @@ class Center:
                 c["batch_size"] = int(c["batch_size"])
                 number(c["interval_seconds"], "批间等待秒数", 1, 86400, True)
                 choice(c["side"], {"buy", "sell", "random"}, "策略方向")
-                parameters("order.open", {**{k: c[k] for k in ("size_percent", "stop_loss", "take_profit")}, "side": "buy"})
+                parameters("order.open", {**{k: c[k] for k in ("size_percent", "stop_buffer", "take_profit")}, "side": "buy"})
                 s["config"] = c
             else:
                 raise Problem("接口不存在", 404)
@@ -481,16 +544,40 @@ class Center:
                     self._pause(db, s, "节点策略异常，已暂停 · "+str(err)[:200])
                     self._save_strategy(db, s)
 
+    def _strategy_candidates(self, db, s, inventory, side):
+        config = s["config"]
+        params = {**{k:config[k] for k in ("size_percent","stop_buffer","take_profit")},"side":side}
+        for (nid,wid,name), a in inventory[2].items():
+            if nid!=s["node_id"] or not a["in_pool"] or not a["fresh"]:
+                continue
+            req = dict(node_id=nid,worker_id=wid,account=name,action="order.open",params=params)
+            try:
+                yield self._prepare(db,uid(),req,inventory,"strategy-"+(s.get("run") or "preview"))
+            except Problem:
+                continue
+
     def _decide_node(self, db, s, inventory, now):
         if s["members"]:
             members = [record(command(db, k)) for k in s["members"]]
+            stale = [m for m in members if m["status"]=="cancelled" and not m["intents"] and (m["result"] or {}).get("reselect")]
+            if stale:
+                for m in stale:
+                    account = inventory[2].get((m["node_id"],m["worker_id"],m["account"]))
+                    if account and account["present"] and (account.get("risk_at") or 0)<m["result"].get("observed_at",0):
+                        s["message"] = "等待节点同步已修正的交易页风控读数"
+                        self._save_strategy(db,s)
+                        return
+                s["avoid_once"] = [m["account_ref"] for m in stale]
+                s["replace"] = s.get("replace",0)+len(stale)
+                s["members"] = [m["id"] for m in members if m not in stale]
+                members = [m for m in members if m not in stale]
             failed = next((m for m in members if m["status"] in TERMINAL and m["status"] != "succeeded"), None)
             if failed:
                 self._pause(db, s, f"第 {s['batch']} 批已暂停 · {failed['error'] or failed['status']}")
-            elif all(m["status"] == "succeeded" for m in members):
+            elif not s.get("replace") and all(m["status"] == "succeeded" for m in members):
                 for m in members:
                     a = inventory[2].get((m["node_id"], m["worker_id"], m["account"]))
-                    if not a or not a["fresh"] or a["snapshot"].get("position_open") is not False or a["observed_at"] <= m["updated_at"]:
+                    if not a or not a["fresh"] or (a.get("risk") or a["snapshot"]).get("position_open") is not False or max(a.get("card_at") or 0,a["observed_at"] or 0) <= m["updated_at"]:
                         s["message"] = "等待本批全部持仓确认结束"
                         break
                 else:
@@ -498,36 +585,40 @@ class Center:
                         s.update(enabled=False, draining=False, members=[], message="升级前的批次已结束")
                     else:
                         s.update(members=[], next_at=now + s["config"]["interval_seconds"], message="批间等待")
-            self._save_strategy(db, s)
-            return
+            if failed or not s.get("replace") or s.get("draining"):
+                self._save_strategy(db, s)
+                return
         if updates.active(db, s["node_id"]):
             s["message"] = "等待节点完成软件更新"
             self._save_strategy(db, s)
             return
         config = s["config"]
+        node = inventory[0][s["node_id"]]
+        online = [w for w in inventory[1].values() if w["online"]]
+        if not node["card_generation"]:
+            self._request_cards(db,s["node_id"])
+        if not node["card_generation"] or not online or any(w.get("card_generation")!=node["card_generation"] or
+                w["mode"]=="execute" and w.get("card_session")!=w["session_id"] for w in online):
+            s["message"] = "等待浏览器全量刷新活动账户"
+            self._save_strategy(db,s)
+            return
         # The legacy random-entry policy draws one direction for the entire batch.
-        side = random.choice(("buy", "sell")) if config["side"] == "random" else config["side"]
-        params = {**{k: config[k] for k in ("size_percent", "stop_loss", "take_profit")}, "side": side}
+        side = s["batch_side"] if s.get("replace") else random.choice(("buy", "sell")) if config["side"] == "random" else config["side"]
         candidates = {}
-        for (nid, wid, name), a in inventory[2].items():
-            if not a["in_pool"] or not a["fresh"]:
-                continue
-            req = dict(node_id=nid, worker_id=wid, account=name, action="order.open", params=params)
-            try:
-                cmd = self._prepare(db, uid(), req, inventory, "strategy-" + s["run"])
-                candidates.setdefault(cmd["account_ref"], []).append(cmd)
-            except Problem:
-                continue
-        size = config["batch_size"]
+        for cmd in self._strategy_candidates(db,s,inventory,side):
+            candidates.setdefault(cmd["account_ref"],[]).append(cmd)
+        size = s.get("replace") or config["batch_size"]
         if len(candidates) < size:
             s["message"] = f"等待可用账户 · {len(candidates)} / {size}"
         else:
             batch = []
-            for account_ref in random.sample(list(candidates), size):
+            preferred = [ref for ref in candidates if ref not in s.get("avoid_once",[])]
+            for account_ref in random.sample(preferred if len(preferred)>=size else list(candidates), size):
                 cmd = random.choice(candidates[account_ref])
                 insert(db, cmd, "pending", now)
                 batch.append(cmd["id"])
-            s.update(batch=s["batch"] + 1, members=batch, message=f"第 {s['batch']+1} 批等待执行回执")
+            batch_num = s["batch"] if s.get("replace") else s["batch"]+1
+            s.update(batch=batch_num,batch_side=side,replace=0,avoid_once=[],members=s["members"]+batch,message=f"第 {batch_num} 批等待执行回执")
         self._save_strategy(db, s)
 
     def run(self, stop: threading.Event):
