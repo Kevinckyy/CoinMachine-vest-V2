@@ -51,6 +51,8 @@ class FleetTest(unittest.TestCase):
 
     def transport(self, node, verb, path, data=None):
         bridge = self.nodes[node["id"]]
+        if path.startswith("/v1/status?since="):
+            return bridge.status(path.split("=")[1])
         if path == "/v1/status":
             return bridge.refresh_cards(data) if verb=="PUT" else bridge.status()
         if path.startswith("/v1/ledger?after="):
@@ -618,15 +620,80 @@ class FleetTest(unittest.TestCase):
             self.assertFalse(self.center._opened_today(db,a))
 
     def test_plugin_version_reporting_and_old_clients(self):
-        for actual,status in (("1.5.1","behind"),("1.6.0","current"),("1.10.0","ahead"),("","unknown")):
+        target = self.center.plugin_version
+        for actual,status,can_open in (("1.5.1","behind",False),("1.6.0","behind",True),(target,"current",True),
+                                      ("1.10.0","ahead",True),("","unknown",False)):
             self.plugin("east","heartbeat",plugin_version=actual)
             self.center.sync("east")
             state = self.center.state("east")
             worker = state["workers"][0]
-            self.assertEqual((state["plugin_version"],worker["plugin_version"],worker["version_status"]),("1.6.0",actual,status))
-            self.assertEqual(worker["supports_open_policy"],status in ("current","ahead"))
+            self.assertEqual((state["plugin_version"],worker["plugin_version"],worker["version_status"]),(target,actual,status))
+            self.assertEqual(worker["supports_open_policy"],can_open)
         with self.assertRaisesRegex(Problem,"插件版本号"):
             self.plugin("east","heartbeat",plugin_version="invalid")
+
+    def test_position_metrics_keep_trade_identity_and_allow_sparse_recovery(self):
+        bridge = self.nodes["east"]
+        initial = [self.card("Shared",active_positions=1,pnl=3), self.card("Other")]
+        self.card_report("east",initial)
+        obs = self.reading("Shared")
+        obs["snapshot"].update(position_open=True,position_id="pid",symbol="NQ-PERP",side="sell",quantity=2,
+                               entry_price=1250,native_sl_absent=True,native_tp_price=1230)
+        self.report("east",observation=obs)
+        self.plugin("east","heartbeat",page="/accounts")
+        self.center.sync("east")
+        baseline = bridge.status("initial")
+        gen = baseline["card_generation"]
+        def tick(changes, *, base=None):
+            previous = self.time
+            self.time += 1
+            return self.plugin("east","report",page="/accounts",metrics=dict(generation=gen,base_at=previous if base is None else base,
+                               observed_at=self.time,directory=False,items=changes))
+        tick([dict(name="Shared",pnl=-7.25,drawdown=42,daily_loss=0)])
+        delta = bridge.status(baseline["status_cursor"])
+        self.assertNotIn("accounts",delta)
+        self.assertTrue(all(isinstance(value,(int,float)) for _,value in delta["changes"]))
+        self.center.sync("east",metrics_only=True)
+        a = next(a for a in self.center.state("east")["accounts"] if a["name"]=="Shared")
+        self.assertEqual([a["position_detail"][k] for k in ("symbol","quantity","take_profit","stop_loss","submitted_at")],
+                         ["NQ-PERP",2,40,"omitted",None])
+        self.assertEqual(len(self.center.position_metrics("east")["items"]),1)
+        m = self.center.position_metrics("east")["items"][0]
+        self.assertEqual([m[k] for k in ("position_id","at","pnl","drawdown","daily_loss")],["pid",self.time,-7.25,42,0])
+        self.assertNotIn("snapshot",m)
+        self.assertFalse(self.center.position_metrics("west")["items"])
+        self.assertTrue(next(a for a in bridge.status()["accounts"] if a["name"]=="Other")["present"])
+        base = self.time
+        with self.assertRaisesRegex(Problem,"基线"):
+            tick([],base=base-1)
+        with self.assertRaisesRegex(Problem,"未识别"):
+            tick([dict(name="Shared",quantity=99)],base=base)
+        tick([dict(name="Shared",active_positions=0)],base=base)
+        self.center.sync("east")
+        self.assertEqual(self.center.position_metrics("east")["items"],[])
+        tick([dict(name="Shared",active_positions=1,pnl=0)])
+        self.center.sync("east")
+        reopened = next(a for a in self.center.state("east")["accounts"] if a["name"]=="Shared")
+        self.assertIsNone(reopened["position_detail"])
+
+    def test_displayed_order_time_and_protection_belong_to_the_confirmed_fill(self):
+        self.start_cards([self.card("One")])
+        self.center.sync("east")
+        opened = self.fill_exam_order()
+        submitted = self.nodes["east"].get(opened["id"])["intents"]["open"]["time"]
+        self.time += 8
+        self.card_report("east",[self.card("One",active_positions=1,pnl=25)])
+        self.center.sync("east")
+        account = next(a for a in self.center.state("east")["accounts"] if a["name"]=="One")
+        detail = account["position_detail"]
+        self.assertEqual([detail[k] for k in ("quantity","entry_price","take_profit","stop_loss","submitted_at")],
+                         [2,1000,"omitted",10,submitted])
+        self.assertLess(detail["submitted_at"],account["card_at"])
+        self.time += 1
+        self.card_report("east",[self.card("One",active_positions=2,pnl=35)])
+        self.center.sync("east")
+        account = next(a for a in self.center.state("east")["accounts"] if a["name"]=="One")
+        self.assertIsNone(account["position_detail"])
 
     def test_floor_reset_with_dst_gross_debits_and_duplicate_history(self):
         at = datetime.fromisoformat("2026-11-01T14:00:00+00:00").timestamp()

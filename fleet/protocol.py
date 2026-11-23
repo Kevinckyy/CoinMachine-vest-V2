@@ -109,7 +109,9 @@ def parameters(action, raw, legacy=False):
         fields(p, ("destination",))
         choice(p.get("destination"), {"accounts","trade", "portfolio"}, "目标页面")
     elif action == "profit.withdraw":
-        fields(p, ("amount",))
+        fields(p, ("amount","all_available"))
+        if "all_available" in p:
+            boolean(p["all_available"])
         amount = positive(p.get("amount"), "领取金额")
         require(abs(round(amount, 6) - amount) < 1e-12, "领取金额最多六位小数")
     elif action == "order.close":

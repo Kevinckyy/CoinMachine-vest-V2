@@ -104,7 +104,7 @@ const empty = (title, help = '', action = '') => `<div class="empty"><strong>${e
 const panel = (name, content, action = '') => `<section class="panel"><div class="panel-head"><h2>${esc(name)}</h2>${action}</div>${content}</section>`;
 const table = (headers, rows) => `<div class="scroll"><table><thead><tr>${headers.map(h => '<th>' + esc(h) + '</th>').join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
 let token = sessionStorage.getItem('vest.admin') || '',
-  state,
+  state, stateBaseline,
   busy = false;
 function activeRoute() {
   const hash = location.hash.slice(1);
@@ -163,8 +163,10 @@ function notify(text) {
 }
 function loginScreen() {
   token = '';
+  liveMetrics.clear();
   sessionStorage.removeItem('vest.admin');
   state = null;
+  stateBaseline = null;
   if ($('dialog').open) $('dialog').close();
   $('login').hidden = false;
   $('app').hidden = true;
@@ -175,7 +177,18 @@ async function refresh() {
   busy = true;
   const requestToken = token;
   try {
-    const latest = await api('state');
+    const response = await api('state?since='+encodeURIComponent(stateBaseline?.status_cursor || 'initial'));
+    if (token !== requestToken) return;
+    if (response.base) {
+      if (response.base !== stateBaseline?.status_cursor) { stateBaseline = null; return; }
+      for (const [path,value] of response.changes) {
+        let parent = stateBaseline;
+        for (const key of path.slice(0,-1)) parent = parent[key];
+        parent[path.at(-1)] = value;
+      }
+      stateBaseline.status_cursor = response.status_cursor;
+    } else stateBaseline = response;
+    const latest = {...stateBaseline};
     latest.receivedAt = performance.now();
     const nodeId = page === 'strategy' && strategyNode;
     if (nodeId && latest.commands.length >= recentCommandLimit && latest.nodes.some(n => n.id === nodeId)) {
@@ -272,19 +285,60 @@ function positionCount(a) {
 function openLockDetail(a) {
   return a.open_locked ? '<small>'+esc(a.open_lock.reason)+' · '+time(a.open_lock.until)+' 后重新核验</small>' : '';
 }
+const liveMetrics = new Map();
+const metricKey = (a, cardId, pid, count) => JSON.stringify([a.node_id,a.worker_id,a.name,cardId ?? '',pid ?? '',count]);
+const amountAndLimit = (used, limit) => money(used)+' / '+money(limit);
+const protectionAmount = n => n === 'omitted' ? '未设置' : money(n);
+function metricText(m) {
+  return {pnl:money(m.pnl), drawdown:amountAndLimit(m.drawdown,m.drawdown_limit),
+    daily:amountAndLimit(m.daily_loss,m.daily_limit), at:time(m.at)};
+}
 function positions(accounts) {
   const rows = accounts.filter(a => a.present && positionCount(a)>0).map(a => {
-    const s = a.snapshot;
-    if (a.card && a.card_at >= (a.observed_at || 0)) {
-      return `<tr><td class="cell"><strong>${esc(a.alias || a.name)}</strong><small>${routeLabel(a)}</small></td><td colspan="4">账户卡片 · ${positionCount(a)} 笔活动持仓</td><td>${money(a.card.pnl)}</td><td>—</td><td>${time(a.card_at)}</td></tr>`;
-    }
-    return `<tr><td class="cell"><strong>${esc(a.alias || a.name)}</strong><small>${routeLabel(a)}</small></td>
-      <td>${esc(s.symbol)}</td><td>${tag(dir[s.side] || '未知', s.side === 'buy' ? 'good' : 'info')}</td><td class="num">${esc(s.quantity)}</td>
-      <td class="num">${money(s.entry_price)}</td><td class="num ${positive(s.unrealized_pnl)}">${money(s.unrealized_pnl)}</td>
-      <td class="num">${money(s.native_tp_price)} / ${money(s.native_sl_price)}</td><td>${a.fresh ? esc(time(a.observed_at)) : tag('旧读数', 'warn')}</td></tr>`;
+    const count = positionCount(a), d = a.position_detail, card = a.card || {}, risk = a.risk || {};
+    const cardLatest = a.card && a.card_at >= (a.observed_at || 0);
+    const base = cardLatest ? {...card,at:a.card_at} : {...risk,pnl:a.snapshot.unrealized_pnl,at:a.observed_at};
+    const pid = Object.hasOwn(a,'tracked_position_id') ? a.tracked_position_id : a.snapshot.position_id;
+    const key = metricKey(a,card.id,pid,count), tick = liveMetrics.get(key);
+    const m = tick && tick.at > base.at ? tick : base, values = metricText(m);
+    const note = a.ambiguous ? '同名账户待核对' : count>1 ? count+' 笔持仓合计' : !d ? '等待该笔成交明细' : '';
+    return `<tr data-position-key="${esc(key)}" data-observed-at="${esc(m.at)}"><td class="cell"><strong>${esc(a.alias || a.name)}</strong><small>${routeLabel(a)}</small>${note ? '<small>'+esc(note)+'</small>' : ''}</td>
+      <td>${esc(d?.symbol || '—')}</td><td>${d?.side ? tag(dir[d.side],d.side==='buy'?'good':'info') : '—'}</td>
+      <td class="num">${esc(d?.quantity ?? '—')}</td><td class="num">${money(d?.entry_price)}</td>
+      <td data-metric="pnl" class="num ${positive(m.pnl)}">${values.pnl}</td>
+      <td data-metric="drawdown" class="num">${values.drawdown}</td><td data-metric="daily" class="num">${values.daily}</td>
+      <td class="num">${protectionAmount(d?.take_profit)} / ${protectionAmount(d?.stop_loss)}</td>
+      <td>${time(d?.submitted_at)}</td><td data-metric="at">${values.at}</td></tr>`;
   });
-  return rows.length ? table(['账户 / 来源', '合约', '方向', 'Vest 数量', '成交均价', '浮动盈亏 · USDC', '止盈 / 止损价', '读取时间'], rows) : empty('暂无已读到的持仓', '插件读取到活动持仓后会显示在这里。');
+  return rows.length ? table(['账户 / 来源','合约','方向','Vest 数量','成交均价','浮动盈亏 · USDC','回撤 / 上限 · USD',
+    '每日亏损 / 上限 · USD','止盈 / 止损 · USD','下单时间','读取时间'],rows) : empty('暂无已读到的持仓','插件读取到活动持仓后会显示在这里。');
 }
+let readingMetrics = false;
+async function refreshPositionMetrics() {
+  if (readingMetrics || !token || document.hidden || !document.querySelector('[data-position-key]')) return;
+  const scope = page==='accounts' ? selectedNode : strategyNode;
+  const requestedToken = token;
+  readingMetrics = true;
+  try {
+    const {items} = await api('position-metrics'+(scope ? '?node_id='+encodeURIComponent(scope) : ''));
+    if (token !== requestedToken) return;
+    liveMetrics.clear();
+    for (const m of items) liveMetrics.set(metricKey(m,m.card_id,m.position_id,m.active_positions),m);
+    for (const row of document.querySelectorAll('[data-position-key]')) {
+      const m = liveMetrics.get(row.dataset.positionKey);
+      if (!m || m.at <= Number(row.dataset.observedAt)) continue;
+      const values = metricText(m);
+      for (const cell of row.querySelectorAll('[data-metric]')) {
+        const key = cell.dataset.metric;
+        if (cell.textContent !== values[key]) cell.textContent = values[key];
+        if (key==='pnl') cell.className = 'num '+positive(m.pnl);
+      }
+      row.dataset.observedAt = m.at;
+    }
+  } catch { /* The visible source timestamp stays at the last successful read. */ }
+  finally { readingMetrics = false; }
+}
+setInterval(refreshPositionMetrics,1000);
 function commandsTable(list, formatTime = time) {
   if (!list.length) return empty('暂无指令记录');
   return table(['创建时间', '操作', '目标账户 / 浏览器', '来源', '状态', ''], list.map(c => `<tr><td class="num">${formatTime(c.created_at)}</td><td><strong>${esc(actionTitles[c.action])}</strong></td><td class="cell">${esc(c.account || '浏览器')}<small>${routeLabel(c)}</small></td><td>${c.source === 'manual' ? '手动' : '策略'}</td><td>${badge(c)}</td><td>${btn('detail', '详情', 'link', c.id)}</td></tr>`));

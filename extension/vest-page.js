@@ -1093,16 +1093,16 @@
         type: 'close'
       }, null, expected);
     }
-    async function withdraw(cmd) {
-      let before, preview, after;
+    async function withdraw(cmd, continuation) {
+      let before = continuation && {balance:continuation.balance_before}, preview = continuation?.preview, after;
       const claim = {
         id: cmd.id,
         name: cmd.account,
         account_id: cmd.account,
-        identity: config.identityText,
+        identity: observerIdentity().signature,
         policy: cmd.strategy_payout || {
           live_payout_recipient: 'main',
-          live_payout_mode: 'amount',
+          live_payout_mode: cmd.params.all_available ? 'all' : 'amount',
           live_payout_amount: cmd.params.amount
         }
       };
@@ -1138,7 +1138,9 @@
           }
           if (data.action === 'intent') {
             preview = data.preview;
-            if (preview.amount !== cmd.params.amount || preview.recipient !== 'main') throw Error('提现预览与指令不符');
+            if (preview.amount !== cmd.params.amount || preview.recipient !== 'main') {
+              throw Error('提现预览与指令不符，页面可领取 '+preview.available+'，申请 '+preview.amount+'，预计实收 '+preview.received);
+            }
             await hooks.intent('withdraw', {
               balance_before: before.balance,
               ...preview
@@ -1159,9 +1161,11 @@
         }
       });
       try {
-        await flow.begin(claim, 1);
+        if (continuation) flow.resume(claim,1,continuation.stage,continuation.started);
+        else await flow.begin(claim,1);
         while (flow.active) {
-          await flow.run(1);
+          const next = await flow.run(1);
+          if (next?.stage) return {continuation:{...next,balance_before:before.balance,preview}};
           if (flow.active) await delay(220);
         }
         return {
@@ -1184,38 +1188,33 @@
     }
     const history = globalThis.VestHistory.create({guard: () => { assertLive(); assertNoDialogs(); }, identity: observerIdentity,
       query: queryOne, selected: isSelected, select: selectTab, report: hooks.report});
-    async function payoutHistory(name, deep = true) {
-      const owner = observerIdentity();
-      const portfolio = core.navigationLink(['/portfolio'], /^(持仓|持倉|Portfolio|Positions)$/i, visible);
-      if (!portfolio) return {available: false, reason: '未找到 Portfolio 导航'};
-      const arrive = async matches => {
-        const deadline = Date.now() + 5500;
-        do {
-          assertLive();
-          assertNoDialogs();
-          if (matches(location.pathname) && observerIdentity(true)?.name === name) return;
-          await delay(150);
-        } while (Date.now() < deadline);
-        throw Error('页面跳转后未能核对来源账户');
-      };
-      assertNoDialogs();
-      if (owner.name !== name) throw Error('出金历史账户不一致');
-      click(portfolio);
-      try {
-        await arrive(path => path.replace(/\/$/, '') === '/portfolio');
-        return (await history(name, deep, true)).payout;
-      } finally {
-        assertLive();
+    async function continueCommand(cmd, step) {
+      const claim = cmd.action === 'profit.withdraw', portfolio = step.stage === 'portfolio';
+      if (!claim && (cmd.action !== 'history.read' || !portfolio) || !portfolio && step.stage !== 'return')
+        throw Error('无法识别跨页指令步骤');
+      const check = () => {
+        hooks.guard(claim);
         assertNoDialogs();
-        if (location.pathname.replace(/\/$/, '') === '/portfolio' && observerIdentity(true)?.name === name) {
-          const trade = core.navigationLink(['/trade/NQ-PERP','/trade/NDX-USD-PERP','/trade'], /^(交易|Trade)$/i, visible);
-          if (!trade) throw Error('已读取 Portfolio，请通过交易导航返回 NQ 页');
-          click(trade);
-          await arrive(core.isNqTradePath);
-        }
+        if (location.origin !== 'https://next.vestmarkets.com' || !(portfolio ?
+          location.pathname.replace(/\/$/,'') === '/portfolio' : core.isNqTradePath(location.pathname)))
+          throw Error('指令未到达指定页面');
+      };
+      const id = await waitForAccountIdentity(check, portfolio ? '[data-testid="portfolio-root"]' : undefined);
+      if (id.name !== cmd.account) {
+        try { await observerSelect({name:cmd.account},check,Date.now()+6000,check); }
+        finally { if (observerSelectorOpen()) await observerCloseSelector(check); }
       }
+      check();
+      const current = observerIdentity();
+      if (current.name !== cmd.account || cmd.phase && current.phase !== cmd.phase || claim && current.phase !== 'live')
+        throw Error('跳转后账户或阶段与指令不一致');
+      if (claim) return withdraw(cmd,step);
+      const tables = {...step.tables,payout:(await history(cmd.account,true,true)).payout};
+      if (!Object.values(tables).some(t => t.ready)) throw Error('未读到已加载的历史表格，请检查页面布局后重试');
+      return {observation:step.observation,tables};
     }
-    async function execute(cmd) {
+    async function execute(cmd, continuation) {
+      if (continuation) return continueCommand(cmd,continuation);
       const observation = await read(cmd.account, null, true);
       let approved;
       if (cmd.action === 'order.open') approved = await hooks.preflight(observation);
@@ -1223,7 +1222,8 @@
       if (cmd.action === 'history.read') {
         const tables = await history(cmd.account, true);
         if (observation.phase === 'live' || ['funded','live','closed','failed'].includes(observation.category)) {
-          tables.payout = await payoutHistory(cmd.account);
+          assertNoDialogs();
+          return {continuation:{stage:'portfolio',observation,tables}};
         }
         if (!Object.values(tables).some(t => t.ready)) throw Error('未读到已加载的历史表格，请检查页面布局后重试');
         return {observation, tables};
@@ -1294,7 +1294,6 @@
       read,
       readPortfolio,
       history,
-      payoutHistory,
       execute
     };
   }

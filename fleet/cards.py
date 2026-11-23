@@ -70,29 +70,60 @@ def read_item(raw):
     return entry
 
 
-def update(db, wid, sid, data, now):
+MONITOR_FIELDS = ("active_positions", "pnl", "drawdown", "drawdown_limit", "daily_loss", "daily_limit")
+
+
+def metric_items(previous, changes, directory, sid):
+    """Expand numeric changes against the exact acknowledged list. An omitted row is never a removal."""
+    patches = {}
+    allowed = ("active_positions", *NUMBERS) if directory else MONITOR_FIELDS
+    for patch in changes:
+        fields(patch, ("name", *allowed))
+        name = string(patch.get("name"), "账户名")
+        row = previous.get(name)
+        require(row and row["present"] and row["card"] and not row["ambiguous"] and row["listed_session"] == sid
+                and name not in patches, "账户列表已变化，需要重新拉取", 409)
+        patches[name] = patch
+    items = {}
+    for name, row in previous.items():
+        if not row["present"] or row["ambiguous"] or row["listed_session"] != sid or not row["card"]:
+            continue
+        prior = json.loads(row["card"])
+        if directory or prior["active_positions"] or name in patches:
+            items[name] = read_item({**prior, **patches[name]}) if name in patches else prior
+    return items
+
+
+def update(db, wid, sid, data, now, *, metrics=False):
     data = obj(data)
     gen = number(data.get("generation"),"刷新批次",0,2**53-1,True)
     requested = db.execute("SELECT generation FROM card_request").fetchone()[0]
     require(gen == requested, "有更新的账户刷新请求",409)
     observed = number(data.get("observed_at"), "卡片读取时间", now-120,now+10)
-    full = boolean(data.get("full"))
+    full = False if metrics else boolean(data.get("full"))
     raw = data.get("items")
     require(isinstance(raw,list) and len(raw)<=500,"卡片清单无效")
     sync = db.execute("SELECT * FROM card_sync WHERE worker=?",(wid,)).fetchone()
     require(full or sync and sync["session"]==sid and sync["generation"]==gen,"需要先完成全量刷新",409)
     require(not sync or sync["session"]!=sid or observed>=sync["seen"],"过期的卡片读数",409)
     previous = {r["name"]:r for r in db.execute("SELECT * FROM accounts WHERE worker_id=?",(wid,))}
-    items = {}
     duplicate = set()
-    for raw_item in raw:
-        item = read_item(raw_item)
-        if item["name"] in items:
-            duplicate.add(item["name"])
-        items[item["name"]] = item
-    for name,row in previous.items():
-        if row["present"] and name not in items:
-            db.execute("UPDATE accounts SET present=0,card=NULL,card_at=NULL,risk=NULL,risk_at=NULL,portfolio=NULL,read_session=NULL,initial_balance=NULL,baseline_phase=NULL WHERE worker_id=? AND name=?",(wid,name))
+    if metrics:
+        fields(data, ("generation", "observed_at", "base_at", "directory", "items"))
+        require(sync["seen"] == data.get("base_at") and observed > sync["seen"], "监控读数基线已变化", 409)
+        directory = boolean(data.get("directory"))
+        items = metric_items(previous, raw, directory, sid)
+    else:
+        items = {}
+        for raw_item in raw:
+            item = read_item(raw_item)
+            if item["name"] in items:
+                duplicate.add(item["name"])
+            items[item["name"]] = item
+        for name,row in previous.items():
+            if row["present"] and name not in items:
+                db.execute("UPDATE accounts SET present=0,card=NULL,card_at=NULL,risk=NULL,risk_at=NULL,portfolio=NULL,read_session=NULL,initial_balance=NULL,baseline_phase=NULL WHERE worker_id=? AND name=?",(wid,name))
+    changed_risks = {}
     for name,item in items.items():
         row = previous.get(name)
         lock = json.loads(row["open_lock"]) if row and row["open_lock"] else None
@@ -137,11 +168,15 @@ def update(db, wid, sid, data, now):
                        preflight_at=NULL,history_due_at=NULL,tracked_position=NULL,portfolio=NULL,initial_balance=NULL,baseline_phase=NULL WHERE worker_id=? AND name=?""",(wid,name))
         if not same or row["phase"] != phase or row["phase_started_at"] is None:
             db.execute("UPDATE accounts SET phase_started_at=? WHERE worker_id=? AND name=?", (observed if phase else None,wid,name))
+        if metrics and dump(risk) != row["risk"]:
+            changed_risks[name] = risk
     db.execute("""INSERT INTO card_sync VALUES(?,?,?,?,?) ON CONFLICT(worker) DO UPDATE SET
                 session=excluded.session,generation=excluded.generation,full_at=excluded.full_at,seen=excluded.seen""",
                (wid,sid,gen,observed if full else sync["full_at"],observed))
+    if metrics:
+        return {"observed_at": observed, "risks": changed_risks}
     rows = db.execute("SELECT name,risk,portfolio,open_lock FROM accounts WHERE worker_id=? AND present=1",(wid,)).fetchall()
-    return {"count":len(items),"generation":gen,"risks":{r["name"]:json.loads(r["risk"]) for r in rows},
+    return {"count":len(items),"generation":gen,"supports_metrics":True,"risks":{r["name"]:json.loads(r["risk"]) for r in rows},
             "floors":{r["name"]:daily_floor.view(db,wid,r["name"],now) for r in rows},
             "open_locks":{r["name"]:json.loads(r["open_lock"]) for r in rows if r["open_lock"]},
             "portfolios":{r["name"]:json.loads(r["portfolio"]) for r in rows if r["portfolio"]}}

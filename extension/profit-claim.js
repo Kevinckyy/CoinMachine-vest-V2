@@ -1,7 +1,6 @@
 /* Public DOM only. A persisted server intent precedes the one financial click. */
 (() => {
   'use strict';
-  const NAVIGATION_LINK_TIMEOUT_MS=4000;
   function units(value) {
     const text=String(value),match=text.match(/^(\d+)(?:\.(\d{1,6}))?$/);
     if(!match)throw new Error('领取金额精度不明确');
@@ -106,14 +105,6 @@
       if(leverage!==0||position_margin!==0||order_margin!==0)throw new Error('持仓页显示持仓或挂单占用，禁止领取');
       return {leverage,position_margin,order_margin,observed_at:Date.now()/1000};
     }
-    function navigate(paths,pattern,label) {
-      own();if(dialogs().length)throw new Error('存在额外弹窗，禁止切换领取页面');
-      const link=globalThis.VestBridgeCore.navigationLink(paths,pattern,a.visible);
-      if(link){state.navigationWaitSince=null;a.click(link);return true;}
-      state.navigationWaitSince??=Date.now();
-      if(Date.now()-state.navigationWaitSince>=NAVIGATION_LINK_TIMEOUT_MS)throw new Error(`领取流程未找到可用的「${label}」导航链接`);
-      return false;
-    }
     function edit(input,value) {
       if(!(input instanceof HTMLInputElement)||input.disabled||input.readOnly)throw new Error('领取输入框不可编辑');
       own();input.focus();
@@ -124,6 +115,10 @@
       get active(){return !!state;},
       heartbeat(){return state?.reserved?payload('heartbeat'):null;},
       dispose(){state=null;},
+      resume(claim,epoch,stage,started) {
+        if(state || !['portfolio','return'].includes(stage))throw Error('领取步骤无效');
+        state={claim,epoch,stage,started,reserved:true};
+      },
       async begin(claim,epoch) {
         if(state)throw new Error('已有领取流程尚未核验');
         state={claim,epoch,stage:'reserve',started:Date.now()};
@@ -146,8 +141,8 @@
           a.guard(epoch);if(Date.now()-state.started>90000)throw new Error('利润领取超过 90 秒未完成核验；禁止重试提交');
           if(!own(['portfolio','return','go-return'].includes(state.stage)))return true;
           if(state.stage==='go-portfolio'){
-            if(navigate(['/portfolio'],/^(持仓|持倉|Portfolio|Positions)$/i,'持仓'))state.stage='portfolio';
-            return true;
+            if(dialogs().length)throw Error('存在额外弹窗，禁止切换领取页面');
+            return {stage:'portfolio',started:state.started};
           }
           if(state.stage==='portfolio'){
             if(location.pathname.replace(/\/$/,'')!=='/portfolio')return true;
@@ -200,8 +195,7 @@
             // mounted on the next render time to appear before leaving.
             if(state.stage==='submitted'){state.stage='go-return';return true;}
             if(a.isTrade(location.pathname)){state.stage='return';return true;}
-            if(navigate(['/trade/NQ-PERP','/trade/NDX-USD-PERP','/trade'],/^(交易|Trade)$/i,'交易'))state.stage='return';
-            return true;
+            return {stage:'return',started:state.started};
           }
           if(state.stage==='return'){
             if(!a.isTrade(location.pathname))return true;

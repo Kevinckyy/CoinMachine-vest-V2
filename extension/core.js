@@ -34,19 +34,6 @@
     return Number.isFinite(number) ? (text.includes('(') && text.includes(')') ? -Math.abs(number) : number) : null;
   }
   const normalized = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
-  function navigationLink(paths, label, visible) {
-    const links = [...document.querySelectorAll('a[href]')].filter(e => visible(e) && e.origin === location.origin &&
-      !e.username && !e.password && !e.search && !e.hash && (!e.target || e.target.toLowerCase() === '_self') && !e.hasAttribute('download') &&
-      !e.closest('[hidden],[inert],[aria-hidden="true"],[aria-disabled="true"],[role="menu"]') &&
-      [e.innerText, e.getAttribute('aria-label')].some(value => label.test((value || '').trim())));
-    for (const path of paths) {
-      const matches = links.filter(e => e.pathname.replace(/\/$/, '') === path);
-      const navigation = matches.filter(e => e.closest('header,nav,[role="navigation"]'));
-      const candidates = navigation.length ? navigation : matches;
-      if (candidates.length) return candidates.find(e => e.pathname === path) || candidates[0];
-    }
-    return null;
-  }
   const isNqTradePath = path => ['/trade/NQ-PERP','/trade/NDX-USD-PERP'].includes(String(path).replace(/\/$/,''));
   function canonicalNqPosition(label, href, baseUrl) {
     if (!/^(?:NQ|NDX|NAS100)(?:-PERP)?$|^NDX-USD-PERP$/i.test(normalized(label))) throw new Error('发现非 NQ 或无法识别的持仓品种');
@@ -159,7 +146,7 @@
     }
     return job;
   }
-  root.VestBridgeCore = { defaults, parseMoney, normalized, navigationLink, isNqTradePath, canonicalNqPosition, CAPITAL_INDICATORS,
+  root.VestBridgeCore = { defaults, parseMoney, normalized, isNqTradePath, canonicalNqPosition, CAPITAL_INDICATORS,
     parseCapitalMetric, accountCategory, accountPhase, positionState, parseSide, sameQuantity, nqInputToVest,
     nqVestToInput, matchesPosition, assertExecutionAllowed, validateJob };
 })(globalThis);

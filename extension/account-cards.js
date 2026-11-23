@@ -35,13 +35,13 @@
     if (phase && item.category === 'active') item.category = phase === 'live' ? 'funded' : 'eval';
     return Number.isSafeInteger(item.active_positions) ? item : null;
   }
-  function sample() {
+  function sample(selectActive = true) {
     if (location.pathname.replace(/\/$/,'') !== '/accounts' || all(document,'[role="dialog"],[role="alertdialog"]').length) return null;
     const tabs = all(document,'[role="tab"][id$="-trigger-active"]').filter(el => /^(active|活跃|活躍)$/i.test(clean(el.innerText)));
     if (tabs.length !== 1) return null;
     const tab = tabs[0];
     if (tab.getAttribute('aria-selected') !== 'true') {
-      if (!tab.disabled) {
+      if (selectActive && !tab.disabled) {
         tab.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0}));
         if (tab.getAttribute('aria-selected') !== 'true') tab.click();
       }
@@ -78,5 +78,25 @@
     } while (Date.now() < deadline);
     throw Error('未读到完整的活跃账户卡片，请检查登录状态、筛选和页面加载情况');
   }
-  globalThis.VestCards = {read,membership};
+  const monitorFields = ['active_positions','pnl','drawdown','drawdown_limit','daily_loss','daily_limit'];
+  const directoryFields = [...monitorFields,'pnl_percent','equity','health'];
+  function index(items) {
+    const result = new Map();
+    for (const item of items) result.set(item.name, result.has(item.name) ? null : {...item});
+    return result;
+  }
+  function changes(items, baseline, directory) {
+    const result = [];
+    for (const item of items) {
+      const old = baseline.get(item.name);
+      if (!old || !directory && !old.active_positions && !item.active_positions) continue;
+      const patch = {};
+      for (const key of directory ? directoryFields : monitorFields) {
+        if ((item[key] ?? null) !== (old[key] ?? null)) patch[key] = item[key] ?? null;
+      }
+      if (Object.keys(patch).length) result.push({name:item.name, ...patch});
+    }
+    return result;
+  }
+  globalThis.VestCards = {read,sample,membership,index,changes};
 })();

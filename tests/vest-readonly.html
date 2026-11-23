@@ -2,7 +2,6 @@
 <body><button data-testid="account-selector-trigger" aria-expanded="false"><span class="truncate">Alpha</span><span>Evaluation</span><span>1/2</span></button>
 <section id="deskAccounts" hidden><div role="tablist"><button role="tab" id="desk-trigger-active" aria-selected="true">活跃</button></div>
 <p data-testid="dashboard-total-value">$3,050.00</p><div class="grid"></div></section>
-<nav><a href="/portfolio">Portfolio</a><a href="/trade/NQ-PERP">Trade</a></nav>
 <section id="portfolioMetrics">
 <p data-testid="account-value">$1,050.00</p><p data-testid="account-upnl">$0.00</p><p data-testid="book-mark">$20,000</p>
 <p data-testid="account-health">90%</p>
@@ -52,6 +51,7 @@
   lossHelp.onpointerover=()=>{labels.hidden=false;lossHelp.setAttribute('aria-describedby',labels.id);};
   lossHelp.onpointerout=()=>{labels.hidden=true;lossHelp.removeAttribute('aria-describedby');};
   function tradeEquity(name,equity) {
+    if(name==='Beta' && sessionStorage.getItem('testPayoutDebited')) return '$1,960.00';
     return name==='Alpha' && sessionStorage.getItem('tradeEquity') || equity;
   }
   document.querySelector('[data-testid="account-value"]').textContent=tradeEquity('Alpha','$1,050.00');
@@ -130,9 +130,24 @@
     document.getElementById('desk-withdrawals').hidden=location.pathname !== '/portfolio';
     document.querySelector('[data-testid=account-tab-active-positions]').click();
   }
-  document.querySelectorAll('nav a').forEach(link => link.onclick = e => {
-    e.preventDefault();history.pushState({},'',link.pathname);route();
-  });
+  if(location.pathname==='/portfolio' && sessionStorage.getItem('testPayout')) {
+    const payoutPanel=document.createElement('section');
+    payoutPanel.innerHTML='<div class="sticky top-14">Leverage 0x Position Margin $0.00 Order Margin $0.00</div><button type="button" data-testid="withdraw-open">领取利润</button>';
+    document.body.append(payoutPanel);
+    payoutPanel.querySelector('button').onclick=()=>{
+      const dialog=document.createElement('div');
+      dialog.setAttribute('role','dialog');
+      dialog.innerHTML='<h2>领取利润</h2><p data-testid="claim-profit-available">$40.00</p><label>收款人<span>主账户</span><input data-slot="input"></label>'+
+        '<input name="amount" data-slot="form-control" value="40"><input data-testid="claim-profit-amount-slider-percentage">'+
+        '<div><p>您将收到</p><span>$32.00</span></div><button type="submit" data-testid="claim-profit-submit">提交</button>';
+      document.body.append(dialog);
+      dialog.querySelector('button').onclick=()=>{
+        sessionStorage.setItem('testPayoutDebited',String(1+Number(sessionStorage.getItem('testPayoutDebited'))));
+        dialog.innerHTML='<h2>Profit Claim Request Submitted</h2><p>$32.00 is being transferred to your main account and will arrive in 24 hours.</p><button type="button">Got It</button>';
+        dialog.querySelector('button').onclick=()=>dialog.remove();
+      };
+    };
+  }
   route();
   function trace(event,value) {
     if(sessionStorage.getItem('scanTrace')===null) return;

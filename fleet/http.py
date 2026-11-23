@@ -93,7 +93,8 @@ def make_server(bind, port, app, token, plugin_token=None):
                 return app.resolve(ident(keys[1]), body)
             if is_bridge:
                 if keys == ["status"] and method == "GET":
-                    return app.status()
+                    since = parse_qs(urlsplit(self.path).query).get("since", [None])[0]
+                    return app.status(ident(since) if since else None)
                 if keys == ["status"] and method == "PUT":
                     return app.refresh_cards(body)
                 if keys in (["ledger"], ["logs"]) and method == "GET":
@@ -113,7 +114,9 @@ def make_server(bind, port, app, token, plugin_token=None):
                 if len(keys) == 5 and keys[0] == "nodes" and keys[2] == "updates" and keys[4] == "cancel" and method == "POST":
                     return app.deployment(ident(keys[1]),ident(keys[3]),"cancel",body)
                 if keys == ["state"] and method == "GET":
-                    return app.state(query.get("node_id"))
+                    return app.state(query.get("node_id"), ident(query["since"]) if query.get("since") else None)
+                if keys == ["position-metrics"] and method == "GET":
+                    return app.position_metrics(query.get("node_id"))
                 if keys == ["strategy","defaults"] and method == "PUT":
                     return app.save_defaults(body)
                 if len(keys) == 3 and keys[:2] == ["strategy","presets"] and method == "PUT":

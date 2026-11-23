@@ -438,7 +438,11 @@ async function pollWork(owner,cfg,meta,url) {
     if (!data.arrived && (directory || !onPath(url,path))) {
       return startRoute(owner,url,path,{...data,arrived:true,owner:publicBinding(owner)});
     }
-    await chrome.storage.session.set({['lease.'+cmd.id]:{...owner,action:cmd.action}});
+    const lease = {...owner,action:cmd.action};
+    if (cmd.action==='profit.withdraw' || cmd.action==='history.read') {
+      Object.assign(lease,{command:cmd,run_until:data.run_until,stage:data.continuation?.stage || 'trade'});
+    }
+    await chrome.storage.session.set({['lease.'+cmd.id]:lease});
     return data;
   }
   const {cardRequest} = await chrome.storage.local.get('cardRequest');
@@ -458,11 +462,25 @@ async function pollWork(owner,cfg,meta,url) {
   }
   return data;
 }
+async function continueCommand(owner, url, {id,continuation}) {
+  const lease = (await chrome.storage.session.get('lease.'+id))['lease.'+id];
+  if (lease?.session_id !== owner.session_id || lease.pageId !== owner.pageId || lease.tabId !== owner.tabId ||
+      !lease.command || Date.now() >= lease.run_until*1000 || (await binding())?.session_id !== owner.session_id)
+    throw Error('跨页指令租约已失效');
+  const withdraw = lease.action==='profit.withdraw';
+  const toPortfolio = lease.stage==='trade' && continuation?.stage==='portfolio' && onPath(url,DESTINATIONS.trade);
+  const toTrade = withdraw && lease.stage==='portfolio' && continuation?.stage==='return' && onPath(url,DESTINATIONS.portfolio);
+  if (withdraw && owner.mode!=='execute' || !(toPortfolio || toTrade)) throw Error('不允许此指令跳转步骤');
+  return startRoute(owner,url,toPortfolio ? DESTINATIONS.portfolio : DESTINATIONS.trade,
+    {command:lease.command,owner:publicBinding(owner),run_until:lease.run_until,arrived:true,continuation});
+}
+let pendingMetricRisks = new Map();
 async function reportCards(owner,cfg,payload) {
   const bound = await binding();
   if (bound?.session_id !== owner.session_id || bound.pageId !== owner.pageId) throw Error('提交清单的页面已更换');
   const cards = payload.cards;
   const data = await post('report',payload,cfg);
+  pendingMetricRisks.clear();
   try {
     await chrome.storage.local.set({cardCache:{worker_id:owner.worker_id,items:cards.items,risks:data.risks,
       portfolios:data.portfolios || {},floors:data.floors || {},open_locks:data.open_locks || {},observed_at:cards.observed_at}});
@@ -477,6 +495,23 @@ async function reportCards(owner,cfg,payload) {
   if (cards.full && cards.purchase_request && (await chrome.storage.local.get('cardRequest')).cardRequest===cards.purchase_request)
     await chrome.storage.local.remove('cardRequest');
   return data;
+}
+async function reportMetrics(owner,cfg,payload) {
+  // The complete DOM sample stays in the browser. Only the numeric changes cross the bridge.
+  const {localItems, ...wire} = payload;
+  const current = await binding();
+  if (current?.session_id !== owner.session_id || current.pageId !== owner.pageId) throw Error('监控页面已更换');
+  const ack = await post('report',wire,cfg);
+  for (const [name,risk] of Object.entries(ack.risks || {})) pendingMetricRisks.set(name,risk);
+  if (localItems) {
+    const {cardCache} = await chrome.storage.local.get('cardCache');
+    if (cardCache?.worker_id === owner.worker_id) {
+      Object.assign(cardCache.risks, Object.fromEntries(pendingMetricRisks));
+      await chrome.storage.local.set({cardCache:{...cardCache,items:localItems,observed_at:ack.observed_at}});
+    }
+    pendingMetricRisks.clear();
+  }
+  return {observed_at:ack.observed_at};
 }
 async function handle(message, sender) {
   if (sender.id !== chrome.runtime.id) throw Error('无效的消息来源');
@@ -516,7 +551,7 @@ async function handle(message, sender) {
     error: String(message.diagnostic || '').replace(/\s+/g, ' ').slice(0, 500)
   };
   const op = message.type;
-  if (!['intent', 'preflight', 'poll', 'report', 'heartbeat'].includes(op)) throw Error('未知插件接口');
+  if (!['intent', 'preflight', 'poll', 'report', 'heartbeat','continue'].includes(op)) throw Error('未知插件接口');
   if (['intent','preflight'].includes(op) && (!message.session_id || owner.mode !== 'execute')) throw Error('执行授权已撤销');
   const payload = {
     ...message.data,
@@ -524,7 +559,9 @@ async function handle(message, sender) {
   };
   let data;
   if (op === 'poll') data = await exclusive(() => pollWork(owner,cfg,meta,sender.url));
+  else if (op === 'continue') data = await exclusive(() => continueCommand(owner,sender.url,message.data));
   else if (op === 'report' && payload.cards) data = await exclusive(() => reportCards(owner,cfg,payload));
+  else if (op === 'report' && payload.metrics) data = await exclusive(() => reportMetrics(owner,cfg,payload));
   else data = await post(op,payload,cfg);
   if (data.risk && (payload.observation || payload.portfolio)) {
     await exclusive(async () => {

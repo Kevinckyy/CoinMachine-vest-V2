@@ -214,6 +214,16 @@ try {
   assert.equal(data.accounts[1].card.pnl,111.50);
   assert.equal(data.accounts[1].card.drawdown_limit,300);
   assert.equal(data.accounts[1].card.daily_limit,145.96);
+  await vest.evaluate(`(() => {const ps=[...document.querySelectorAll('#deskAccounts .grid > a:last-of-type p')];
+    ps.find(p=>p.textContent.includes('(+10.77%)')).textContent='-$12.75 (-1.20%)';
+    ps.find(p=>p.textContent==='回撤').nextElementSibling.textContent='$36.50 / $300';
+    ps.find(p=>p.textContent==='每日亏损').nextElementSibling.textContent='$4.25 / $145.96';})()`);
+  const quote=await until(async()=>{
+    const rows=(await api('position-metrics?node_id=lab')).items;
+    return rows.length===1 && rows[0].pnl===-12.75 && rows[0];
+  },'live PnL and both loss metrics reach the center on the fast channel',5500);
+  assert.deepEqual([quote.drawdown,quote.daily_loss],[36.5,4.25]);
+  assert.ok(!('snapshot' in quote) && !('side' in quote));
   await vest.evaluate("sessionStorage.setItem('partialDirectory','1')");
   const partial=await api('nodes/lab/accounts/refresh','POST',{});
   await until(async()=>{
@@ -443,6 +453,16 @@ try {
   await until(async()=>!(await api('state?node_id=spare')).strategy.enabled,'explicit node stop');
   await ui.evaluate("document.querySelector('[data-node=lab] a').click()");
   await until(()=>ui.evaluate("location.hash==='#strategy/lab' && document.getElementById('content').textContent.includes('Alpha') && document.getElementById('content').textContent.includes('Beta')"),'node details pool and open position');
+  const displayed = await ui.evaluate(`(() => {
+    const beta=state.accounts.find(a=>a.name==='Beta');
+    const el=document.createElement('div');
+    el.innerHTML=positions([{...beta,card:{...beta.card,pnl:-8.25,daily_loss:7.50,drawdown:36},
+      card_at:1900000000,tracked_position_id:'display-test',position_detail:{position_id:'display-test',symbol:'NQ-PERP',
+        side:'sell',quantity:2,entry_price:25980.5,take_profit:180,stop_loss:'omitted',submitted_at:1800000000}}]);
+    return [...el.querySelectorAll('tbody td')].map(td=>td.textContent);
+  })()`);
+  assert.deepEqual(displayed.slice(1,9),['NQ-PERP','做空','2','25,980.50','-8.25','36.00 / 300.00','7.50 / 145.96','180.00 / 未设置']);
+  assert.notEqual(displayed[9],displayed[10]);
   // Serve a synthetic cooldown to a separate dashboard tab. Its clock deliberately differs from the browser.
   const cooldown=await tab(), sample=await api('state?node_id=lab'), startTime=Date.now();
   const serverNow=()=>1700000000+(Date.now()-startTime)/1000;
@@ -553,6 +573,20 @@ try {
   assert.equal(accountCache.risks.Alpha.equity,1038);
   assert.equal(accountCache.floors.Alpha.floor,970);
   await vest.evaluate("sessionStorage.removeItem('tradeSelector')");
+  await vest.evaluate("sessionStorage.setItem('testPayout','yes')");
+  const readLive=randomUUID();
+  await api('commands/'+readLive,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'account.read',params:{}});
+  await until(async()=>(await api('commands/'+readLive)).status==='succeeded','read funded test account before its claim');
+  const claim=randomUUID();
+  await api('commands/'+claim,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'profit.withdraw',
+    params:{amount:40,all_available:true}});
+  const claimed=await until(async()=>{
+    const c=await api('commands/'+claim);
+    if(c.status!=='succeeded')throw Error(c.status+' '+c.error);
+    return c;
+  },'full claim across directly loaded documents with no navigation bar',45000);
+  assert.deepEqual([claimed.result.amount,claimed.result.expected_received,claimed.result.balance_after],[40,32,1960]);
+  assert.equal(await vest.evaluate("sessionStorage.getItem('testPayoutDebited')"),'1');
   await ui.evaluate("document.querySelector('[data-value=nodes]').click();document.querySelector('[data-op=deployUpdate]').click()");
   await ui.evaluate(`(() => {const f=document.getElementById('dialogForm'); for(const box of f.querySelectorAll('[name=target]')) box.checked=box.value==='lab'; f.elements.revision.value=${JSON.stringify(second)}; f.requestSubmit();})()`);
   await until(async()=>{

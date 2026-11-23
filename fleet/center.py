@@ -9,7 +9,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
-from . import account_pool, daily_floor, ledger, reporting, strategy_config, strategy_payout, updates
+from . import account_pool, daily_floor, ledger, positions, reporting, status_delta, strategy_config, strategy_payout, updates
 from .trading_day import entry_day_window
 
 from .protocol import (NODE_TTL, OBS_TTL, PENDING, PORTFOLIO_SCAN, RUN_TTL, TERMINAL, WORKER_TTL, WRITE, Problem, boolean,
@@ -96,6 +96,7 @@ class Center:
     def __init__(self, path, clock=time.time, transport=remote):
         self.db = Database(path)
         self.clock, self.transport = clock, transport
+        self.state_feeds = {}
         manifest = Path(__file__).resolve().parents[1] / "extension" / "manifest.json"
         self.plugin_version = json.loads(manifest.read_text(encoding="utf-8"))["version"] if manifest.is_file() else ""
         self.db.conn.executescript("""
@@ -215,7 +216,7 @@ class Center:
                                                and a["observed_at"] and now - a["observed_at"] <= OBS_TTL)}
         return nodes, workers, accounts
 
-    def state(self, node_id=None):
+    def state(self, node_id=None, since=None):
         with self.db.tx() as db:
             nodes, workers, accounts = self._inventory(db, node_id)
             require(not node_id or node_id in nodes, "找不到该节点", 404)
@@ -224,13 +225,23 @@ class Center:
             unknown = db.execute("SELECT COUNT(*) FROM commands WHERE status='unknown'"+(" AND node=?" if node_id else ""), args).fetchone()[0]
             strategies = [json.loads(r[0]) for r in db.execute("SELECT data FROM node_strategy"+cond+" ORDER BY node", args)]
             for a in accounts.values():
+                a["position_detail"] = positions.detail(db, a)
                 a["candidate"] = False
             for s in strategies:
                 for cmd in self._strategy_candidates(db,s,(nodes,workers,accounts),"buy"):
                     accounts[cmd["node_id"],cmd["worker_id"],cmd["account"]]["candidate"] = True
-            return dict(now=self.clock(), plugin_version=self.plugin_version, nodes=list(nodes.values()), workers=list(workers.values()),
+            result = dict(now=self.clock(), plugin_version=self.plugin_version, nodes=list(nodes.values()), workers=list(workers.values()),
                         accounts=list(accounts.values()), strategies=strategies, strategy=strategies[0] if len(strategies)==1 else None,
                         strategy_settings=strategy_config.library(db), unknown_count=unknown, commands=[summary(r) for r in recent])
+            if since is None:
+                return result
+            if node_id not in self.state_feeds:
+                self.state_feeds[node_id] = status_delta.StatusFeed(keep=4)
+            return self.state_feeds[node_id].response(result, since)
+
+    def position_metrics(self, node_id=None):
+        with self.db.read() as db:
+            return positions.metrics(db, node_id)
 
     def history(self, status="", offset=0, node_id=None):
         if status:
@@ -414,11 +425,16 @@ class Center:
                 continue
             insert(db,cmd,"pending",self.clock())
 
-    def sync(self, nid):
+    def sync(self, nid, *, metrics_only=False):
         with self.db.tx() as db:
             node = dict(db.execute("SELECT * FROM nodes WHERE id=?", (nid,)).fetchone())
         try:
-            snap = self.transport(node, "GET", "/v1/status")
+            previous = json.loads(node["snapshot"])
+            cursor = previous.get("status_cursor")
+            if metrics_only and (not cursor or node["error"]):
+                return
+            response = self.transport(node, "GET", "/v1/status?since="+(ident(cursor) if cursor else "initial"))
+            snap = status_delta.unpack(previous, response)
             require(snap.get("version") == 1 and snap.get("node_id") == nid and
                     isinstance(snap.get("workers"), list) and isinstance(snap.get("accounts"), list),
                     "节点 ID 或协议版本不匹配", 502)
@@ -440,7 +456,8 @@ class Center:
             require(not node["instance_id"] or node["instance_id"] == instance, "节点数据库身份已改变，请核对并使用新的节点 ID 登记", 409)
             with self.db.tx() as db:
                 updated = db.execute("""UPDATE nodes SET snapshot=?,instance_id=?,last_seen=?,error=''
-                                      WHERE id=? AND revision=?""", (dump(snap), instance, self.clock(), nid, node["revision"]))
+                                      WHERE id=? AND revision=? AND snapshot=?""",
+                                     (dump(snap), instance, self.clock(), nid, node["revision"], node["snapshot"]))
                 if not updated.rowcount:
                     return
                 updates.confirm(db,nid,snap,self.clock(),WORKER_TTL)
@@ -457,6 +474,8 @@ class Center:
                         message = w.get("error") or ("浏览器在线 · "+mode if live else "浏览器离线")
                         reporting.log(db, nid, self.clock(), "browser", message,
                                       "warning" if w.get("error") or not live else "info", worker=w["worker_id"])
+                if metrics_only:
+                    return
                 self._queue_closed_history(db,nid,snap)
                 todo = [r[0] for r in db.execute("""SELECT id FROM commands WHERE node=? AND
                         status IN ('pending','sending','queued','running','unknown') ORDER BY created,id""", (nid,))]
@@ -1016,8 +1035,11 @@ class Center:
 
     def run(self, stop: threading.Event):
         active = {}
+        control_due = {}
+        decision_due = 0
         with ThreadPoolExecutor(max_workers=12, thread_name_prefix="vest-node") as pool:
             while not stop.is_set():
+                started = time.monotonic()
                 for nid, task in list(active.items()):
                     if task.done():
                         del active[nid]
@@ -1029,9 +1051,14 @@ class Center:
                     nodes = [r[0] for r in db.execute("SELECT id FROM nodes")]
                 for nid in nodes:
                     if nid not in active:
-                        active[nid] = pool.submit(self.sync, nid)
-                try:
-                    self.decide()
-                except Exception:
-                    logging.exception("策略调度失败")
-                stop.wait(2)
+                        metrics_only = started < control_due.get(nid, 0)
+                        active[nid] = pool.submit(self.sync, nid, metrics_only=metrics_only)
+                        if not metrics_only:
+                            control_due[nid] = started + 2
+                if started >= decision_due:
+                    decision_due = started + 2
+                    try:
+                        self.decide()
+                    except Exception:
+                        logging.exception("策略调度失败")
+                stop.wait(max(0, 1 - (time.monotonic() - started)))

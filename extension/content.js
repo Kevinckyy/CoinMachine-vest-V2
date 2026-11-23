@@ -10,7 +10,7 @@
     job = null,
     lastContact = 0,
     diagnostic = '';
-  let nextCards = 0, membership,
+  let nextCards = 0, directory = null, monitoring = false,
     working = false,
     heartbeatBusy = false;
   let runUntil = 0;
@@ -19,6 +19,8 @@
     session = null;
     lastContact = 0;
     nextCards = 0;
+    directory = null;
+    monitoring = false;
   }
   function onFleetMessage(message, sender, reply) {
     if (sender.id !== chrome.runtime.id) return;
@@ -53,6 +55,7 @@
     if (!value.bound) throw Error('标签页已解除绑定');
     lastContact = Date.now();
     guard();
+    return value.data;
   }
   const page = globalThis.VestPage.create({
     guard,
@@ -78,24 +81,38 @@
   });
   async function observe(data, force = false, scanId) {
     if (location.pathname.replace(/\/$/,'') !== '/accounts' || data.moving) return;
-    const full = force || data.refresh_cards !== undefined;
-    if (!full && Date.now() < nextCards) return;
-    nextCards = Date.now()+8000;
-    if (membership === undefined) {
-      const {cardCache} = await chrome.storage.local.get('cardCache');
-      membership = cardCache?.worker_id===session.worker_id ? VestCards.membership(cardCache.items) : null;
-    }
+    const generation = data.refresh_cards ?? data.card_generation ?? 0;
+    const full = force || data.refresh_cards !== undefined || !directory || directory.generation !== generation;
+    const directoryDue = full || Date.now() >= nextCards;
+    if (!directoryDue && !monitoring) return;
     let reading;
     try {
-      reading = await VestCards.read(full,guard);
+      // A single sample suffices for prices. Confirm directory changes on two stable DOM samples.
+      const sample = !full && VestCards.sample(false);
+      if (sample && VestCards.membership(sample) === directory.signature) {
+        reading = {items:sample, observed_at:Date.now()/1000};
+      } else if (sample || directoryDue) {
+        reading = await VestCards.read(full,guard);
+      } else return;
     } catch (err) {
       if (scanId) await ipc('result',{id:scanId,ok:false,result:{},error:'拉取账户列表失败：'+brief(err).slice(0,460)});
       throw err;
     }
     const signature = VestCards.membership(reading.items);
-    await report({cards:{...reading,generation:data.refresh_cards ?? data.card_generation ?? 0,
-      full:full || membership!==signature,purchase_request:data.purchase_request,...(scanId ? {scan_id:scanId} : {})}});
-    membership = signature;
+    const changedList = signature !== directory?.signature;
+    if (full || changedList || !directory.supportsMetrics) {
+      const ack = await report({cards:{...reading,generation,full:full || changedList,
+        purchase_request:data.purchase_request,...(scanId ? {scan_id:scanId} : {})}});
+      directory = {signature,generation,baseline:VestCards.index(reading.items),supportsMetrics:ack?.supports_metrics===true};
+    } else {
+      const items = VestCards.changes(reading.items,directory.baseline,directoryDue);
+      await report({metrics:{items,base_at:directory.observedAt,observed_at:reading.observed_at,generation,directory:directoryDue},
+        ...(directoryDue ? {localItems:reading.items} : {})});
+      for (const patch of items) Object.assign(directory.baseline.get(patch.name),patch);
+    }
+    directory.observedAt = reading.observed_at;
+    monitoring = directory.supportsMetrics && reading.items.some(a=>a.active_positions>0);
+    if (directoryDue || changedList) nextCards = Date.now()+8000;
     diagnostic = '';
     if (!force) return;
     const counts = new Map();
@@ -104,6 +121,7 @@
     return {source:'accounts',full:true,count:inventory.length,inventory};
   }
   async function cycle() {
+    const started = performance.now();
     let cadence = 1500;
     try {
       const value = await ipc('poll', {}, null);
@@ -120,6 +138,7 @@
       runUntil = (value.data.run_until || 0) * 1000;
       if (!job) {
         await observe(value.data);
+        if (monitoring && location.pathname.replace(/\/$/,'') === '/accounts') cadence = 1000;
         return;
       }
       if (job.session_id !== cycleSession.session_id || job.worker_id !== cycleSession.worker_id) throw Error('指令目标与当前浏览器不一致');
@@ -140,7 +159,12 @@
       let result = {},
         error = '';
       try {
-        result = job.action==='accounts.list' ? await observe(value.data,true) : await page.execute(job);
+        result = job.action==='accounts.list' ? await observe(value.data,true) : await page.execute(job,value.data.continuation);
+        if (result?.continuation) {
+          guard(job.action==='profit.withdraw');
+          await ipc('continue',{id:job.id,continuation:result.continuation});
+          return;
+        }
       } catch (err) {
         error = brief(err);
         if (err.snapshot) result = {
@@ -165,7 +189,7 @@
     } finally {
       working = false;
       job = cycleSession = null;
-      if (chrome.runtime.id) setTimeout(cycle, cadence);
+      if (chrome.runtime.id) setTimeout(cycle, cadence === 1000 ? Math.max(0,cadence-(performance.now()-started)) : cadence);
     }
   }
   setInterval(async () => {

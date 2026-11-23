@@ -3,7 +3,7 @@ import json
 import os
 import time
 import uuid
-from . import cards, daily_floor, ledger, portfolio, reporting, strategy_payout, updates
+from . import cards, daily_floor, ledger, portfolio, reporting, status_delta, strategy_payout, updates
 
 from .protocol import (PHASES, PORTFOLIO_SCAN, PRIMARY, RUN_TTL, TERMINAL, WRITE, Problem, boolean, choice,
                        dump, ident, make_command, number, obj, plugin_version_parts, request, require, string, validate_target)
@@ -82,6 +82,7 @@ def verify_financial_receipt(cmd, result):
 class Bridge:
     def __init__(self, path, node_id, clock=time.time):
         self.db = Database(path)
+        self.status_feed = status_delta.StatusFeed()
         self.node_id, self.clock = ident(node_id), clock
         self.release = os.environ.get("VEST_FLEET_RELEASE", "")
         self.launch_id = os.environ.get("VEST_FLEET_LAUNCH_ID", "")
@@ -151,7 +152,7 @@ class Bridge:
                 finish(db, row["id"], "unknown" if uncertain else "failed", now,
                        "执行回执超时，需核对平台" if uncertain else "执行超时，未签发资金操作许可")
 
-    def status(self):
+    def status(self, since=None):
         with self.db.tx() as db:
             self._expire(db, self.clock())
             workers = []
@@ -165,14 +166,16 @@ class Bridge:
                         FROM commands WHERE worker=? AND action=? ORDER BY created DESC,id DESC LIMIT 1""",
                                   (row["worker_id"], PORTFOLIO_SCAN)).fetchone()
                 workers.append({**worker_view(row), "portfolio_scan": dict(scan) if scan else None})
-            return {"version": 1, "open_policy_version":2, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
+            snap = {"version": 1, "open_policy_version":2, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
                     "launch_id": self.launch_id,
                     "ledger_seq": db.execute("SELECT COALESCE(MAX(seq),0) FROM book").fetchone()[0],
                     "log_seq": db.execute("SELECT COALESCE(MAX(id),0) FROM node_logs").fetchone()[0],
                     "card_generation":db.execute("SELECT generation FROM card_request").fetchone()[0],
                     "workers": workers,
-                    "accounts": [{**account_view(r),"daily_floor":daily_floor.view(db,r["worker_id"],r["name"],self.clock())}
+                    "accounts": [{**account_view(r), "tracked_position_id":(json.loads(r["tracked_position"] or "{}") or {}).get("id"),
+                                  "daily_floor":daily_floor.view(db,r["worker_id"],r["name"],self.clock())}
                                  for r in db.execute("SELECT * FROM accounts ORDER BY worker_id,name")]}
+            return self.status_feed.response(snap, since)
 
     def refresh_cards(self, body):
         require(body.get("instance_id")==self.instance_id,"节点数据库身份不匹配",409)
@@ -414,6 +417,9 @@ class Bridge:
                 insert(db, cmd, "queued", now)
                 return {"id": key}
             if op == "report":
+                if "metrics" in body:
+                    require(body.get("page","").rstrip("/")=="/accounts","需要活跃账户页面",409)
+                    return cards.update(db, wid, sid, body["metrics"], now, metrics=True)
                 if "cards" in body:
                     require(body.get("page","").rstrip("/")=="/accounts","需要活跃账户页面",409)
                     reading = obj(body["cards"])
@@ -571,13 +577,13 @@ class Bridge:
         intents = cmd["intents"]
         if stage in intents:
             return {"authorize_click": False}
+        proof = obj(body.get("proof", {}))
         if stage=="open":
             require(db.execute("SELECT 1 FROM open_preflight WHERE id=? AND session=?",(cmd["id"],sid)).fetchone(),
                     "开仓前需要先完成交易页风控核对",409)
             checked = self._preflight(db,cmd,wid,sid,body,now)
             if not checked["approved"]:
                 return {**checked,"authorize_click":False}
-            proof = obj(body.get("proof"))
             number(proof.get("quantity"),"实际 Vest 数量",0.000001,1e12)
             if "stop_loss" not in proof or proof["stop_loss"]!=checked["stop_loss"] or proof.get("take_profit")!=checked["take_profit"]:
                 if body.get("allow_refill") is True:
@@ -591,15 +597,17 @@ class Bridge:
             proof["remaining_drawdown"] = checked["remaining_drawdown"]
             if cmd["phase"] == "live":
                 proof["initial_balance"] = target(db,cmd)[1]["initial_balance"]
+        if stage == "withdraw" and cmd["params"].get("all_available"):
+            require(proof.get("amount") == proof.get("available") == cmd["params"]["amount"]
+                    and proof.get("recipient") == "main", "页面可领总额或收款账户已变化", 409)
         if stage == "withdraw" and cmd.get("strategy_payout"):
             strategy_payout.check_origin(db,cmd,target(db,cmd)[1])
-            strategy_payout.check_quote(cmd,obj(body.get("proof")),now)
+            strategy_payout.check_quote(cmd,proof,now)
         if stage == "protect" and row["action"] == "order.open":
             require("open" in intents, "尚未提交开仓", 409)
         else:
             require(now < cmd["expires_at"], "指令已过期，禁止提交", 409)
             validate_target(cmd, *target(db, cmd), now)
-        proof = obj(body.get("proof", {}))
         require(len(dump(proof)) < 16000, "操作依据过大")
         intents[stage] = {"time": now, "proof": proof}
         db.execute("UPDATE commands SET intents=?,updated=? WHERE id=?", (dump(intents), now, row["id"]))

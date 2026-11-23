@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | GET | `/healthz` | 无密钥健康检查，只返回角色和版本 |
 | GET | `/v1/state?node_id=cloud-01` | `nodes,workers,accounts,strategies,strategy_settings,unknown_count,commands`。可省略节点取全网数据。一个节点范围内另返回 `strategy`，多节点时该字段为 `null` |
+| GET | `/v1/position-metrics?node_id=cloud-01` | 活动账户的最新卡片数值，包括浮盈、回撤、日损及上限、持仓数和采样时间 `at`。省略节点时返回所有节点。页面可每秒读取。其余控制台状态可用 `/v1/state?since=initial` 建立基线，后续携带返回的 `status_cursor` 读取变化 |
 | GET | `/v1/nodes/{node_id}/accounts` | 节点独立目录及持仓快照，返回 `accounts` |
 | POST | `/v1/nodes/{node_id}/accounts/refresh` | 全量拉取账户列表。正文 `{}`，返回新的 `generation`。在线浏览器读取活动卡片，离线浏览器重连后补读 |
 | POST | `/v1/nodes/{node_id}/accounts/read-all` | 全量读取账户信息。正文 `{}`，为该节点支持该指令的在线浏览器各创建一条指令，返回 `commands`（指令 ID）和 `skipped`（需升级的浏览器 ID）。重复点击复用同一会话仍在执行或待领取的中心指令 |
@@ -98,13 +99,17 @@ Content-Type: application/json
 | `order.open` | 必填 | `{"side":"buy","micro":1,"stop_buffer":20}` | 已确认成交和原生保护的持仓快照。开仓许可凭据含下单时核定的爆仓线、缓冲和实际止损金额 |
 | `order.close` | 必填 | `{"position_id":"页面持仓ID"}` | 全量平仓后的空仓快照 |
 | `position.protect` | 必填 | `{"position_id":"页面持仓ID","stop_loss":100,"take_profit":250}` | 已核验的实际保护状态，至少指定一项金额 |
-| `profit.withdraw` | 必填 | `{"amount":50}` | 核验后的源账户余额、申请金额、预计到账额与主账户收款对象 |
+| `profit.withdraw` | 必填 | `{"amount":50}` | 核验后的源账户余额、申请金额、预计到账额与主账户收款对象。可加 `"all_available":true`，仅在页面可领总额恰好等于申请金额时提交 |
 
 开仓方向为 `buy` 或 `sell`。`micro` 是正整数，也可用 `size_percent` 指定 25、50、75 或 100 百分档。两者选一。`stop_buffer` 为净值缓冲 M，省略时使用该节点对应阶段的设置（初始 20 USD）。止损金额等于实读净值减去实读爆仓线，再减去缓冲，精确到美分。Live 开仓可传固定金额 `take_profit` 或 `reward_ratio` 配合 `min_take_profit`。盈亏比的风险基数是本单止损金额，免止损时使用净值至爆仓线的距离。平仓和修改保护会核对持仓 ID、方向、数量、品种和均价。
 
 目录中的 `card,card_at` 对应活动卡片，`risk,risk_at` 保留风控读数及上次交易页实读时间。`in_pool` 表示允许策略选用，`candidate` 表示当前可以进入下单前核验。`open_locked` 表示当前日内开仓锁，`open_lock.reason,until` 给出原因和到期时间。`daily_floor.floor` 是平台实读值，`observed_at` 是其读取时间，`source` 为 `platform` 或 `pending`。每次开仓核验都需要本次交易页的 `snapshot.daily_floor`。日切或已确认提现后的底线等待读取。插件当前会话的 `card_session,card_generation,cards_full_at` 可用于检查全量刷新进度。
 
 `GET /v1/state` 的 `plugin_version` 为中心所附插件版本。每个 worker 的 `plugin_version` 为浏览器上报版本，`version_status` 为 `current,behind,ahead,unknown` 之一。节点 `GET /v1/status` 也返回各 worker 的版本，受管安装的 Git 提交保存在 `release`。开仓需要节点 `open_policy_version=2` 和插件 1.6.0 或更高版本。
+
+从 1.7.0 起，稳定清单通过 `/v1/plugin/report` 的 `metrics` 上报。批次含 `generation,base_at,observed_at,directory,items`，每行只含账户名和变化的数字。持仓期间每秒读取活动卡片，常规清单核对时一并更新其他账户的变化值。基线过期、成员变动或强制拉取时重新传送清单。中心使用 `GET /v1/status?since=initial` 取得节点基线，随后携带返回的 `status_cursor`，按 `changes` 中的路径和值更新同一基线。
+
+活动账户的 `position_detail` 按节点、浏览器、账户和持仓 ID 关联已核实的成交。保护金额使用真实成交数量与原生触发价核算，确认未设置的字段为 `"omitted"`，未知为 `null`。`submitted_at` 记录浏览器获得本次下单许可的时间。多笔持仓只有账户合计时，卡片数值按账户展示一次。
 
 全量读取的 `result.stage` 依次为 `list`、`cache`、`portfolio`、`done`。清单确认前失败会停在对应步骤。每个账户保存完整名称、卡片 ID、状态及读数或错误。金额单位为 USD，`daily_loss/daily_limit` 和 `drawdown/drawdown_limit` 为当前值和上限，`equity` 为账户价值，`health` 为百分数。缺失值为 `null` 并列入 `missing`。页面明确显示无日损上限时记录 `daily_unlimited=true`。部分读取时指令状态为 `failed`，已读结果仍可查询。节点目录中的 `accounts[].portfolio` 保存每户最近一次详情，`workers[].portfolio_scan` 提供最近一次进度，包括插件本地发起的读取。
 
