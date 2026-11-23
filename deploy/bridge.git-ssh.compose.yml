@@ -1,0 +1,4 @@
+services:
+  bridge:
+    volumes:
+      - ${VEST_GIT_SSH_DIR:?set VEST_GIT_SSH_DIR}:/root/.ssh:ro

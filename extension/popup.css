@@ -1,0 +1,95 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 320px;
+  margin: 0;
+  padding: 20px;
+  background: #f6f8fb;
+  color: #182b39;
+  font: 13px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;
+}
+
+header,.buttons {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+header strong {
+  font-size: 16px;
+  color: #075b54;
+}
+
+header span {
+  font-size: 11px;
+  background: #dceae6;
+  border-radius: 5px;
+  padding: 2px 7px;
+}
+
+h1 {
+  font-size: 23px;
+  margin: 18px 0 4px;
+}
+
+p,output {
+  color: #526673;
+}
+
+p {
+  margin: 0 0 15px;
+}
+
+label {
+  display: block;
+  font-weight: 600;
+  margin: 10px 0;
+}
+
+input,button {
+  font: inherit;
+}
+
+input {
+  margin-top: 3px;
+  display: block;
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #bccbd2;
+  border-radius: 5px;
+}
+
+button {
+  background: #fff;
+  border: 1px solid #b9cbd0;
+  border-radius: 5px;
+  padding: 8px 11px;
+  cursor: pointer;
+}
+
+.buttons button {
+  flex: 1;
+}
+
+#execute {
+  background: #08665e;
+  color: white;
+  border-color: #08665e;
+}
+
+.link {
+  border: 0;
+  background: none;
+  color: #586c77;
+  padding: 8px 0;
+}
+
+output {
+  display: block;
+  border-top: 1px solid #d5dfe3;
+  padding-top: 8px;
+  overflow-wrap: anywhere;
+}

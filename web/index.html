@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#142b2a"><title>Vest Fleet · 控制中心</title>
+  <link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script><script src="/reports.js" defer></script>
+</head>
+<body>
+  <section id="login" class="login">
+    <form id="loginForm" class="login-card" method="post">
+      <div class="brand"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>Vest Fleet</div>
+      <h1>登录控制中心</h1><p>使用中心管理密钥查看节点、管理账户和下达指令。</p>
+      <label>管理密钥<input type="password" name="token" autocomplete="current-password" required autofocus></label>
+      <p id="loginError" class="error" role="alert"></p><button class="primary" id="loginSubmit" disabled>进入工作台</button>
+    </form>
+  </section>
+  <div id="app" class="shell" hidden>
+    <aside>
+      <div class="brand"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>Vest Fleet</div>
+      <nav aria-label="主导航" id="navigation"></nav>
+      <div class="aside-foot"><span class="signal"></span> 分布式控制中心</div>
+    </aside>
+    <main>
+      <header class="topbar"><div>控制中心 <span class="slash">/</span> <strong id="crumb">运行总览</strong></div>
+        <div class="top-actions"><span id="syncStatus" role="status"></span><button id="refresh" title="重新读取中心状态">刷新</button><button id="logout">退出</button></div>
+      </header>
+      <div class="workspace">
+        <div id="banner" class="banner" role="alert" hidden></div>
+        <div id="heading" class="page-heading"></div>
+        <div id="content"></div>
+      </div>
+    </main>
+  </div>
+  <dialog id="dialog"><form id="dialogForm"><header class="dialog-head"><h2 id="dialogTitle"></h2><button id="dismiss" type="button" aria-label="关闭">×</button></header>
+    <section id="dialogBody"></section><p id="dialogError" class="error" role="alert"></p>
+    <footer id="dialogFoot"></footer></form></dialog>
+  <div class="toast" id="toast" role="status" hidden></div>
+</body></html>

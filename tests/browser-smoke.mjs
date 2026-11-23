@@ -1,0 +1,273 @@
+// Two real services and a real unpacked extension. All Vest documents are fulfilled locally.
+import assert from 'node:assert/strict';
+import {execFileSync,spawn} from 'node:child_process';
+import {createHash, generateKeyPairSync, randomBytes, randomUUID} from 'node:crypto';
+import {existsSync} from 'node:fs';
+import {cp, mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {createServer} from 'node:net';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
+import {fileURLToPath,pathToFileURL} from 'node:url';
+
+const root=fileURLToPath(new URL('../',import.meta.url));
+const browser=process.env.VEST_TEST_BROWSER || [
+  'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  'C:/Program Files/Google/Chrome/Application/chrome.exe','/usr/bin/chromium','/usr/bin/google-chrome'
+].find(existsSync);
+if (!browser) throw Error('Set VEST_TEST_BROWSER to a Chromium or Edge executable');
+const tmp=await mkdtemp(path.join(tmpdir(),'vest-fleet-smoke-'));
+const services=[], sockets=[];
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function until(fn,label,timeout=25000) {
+  const end=Date.now()+timeout;
+  let reason='';
+  while (Date.now()<end) {
+    try {const v=await fn();if(v)return v;} catch(err){reason=err.message;}
+    await sleep(180);
+  }
+  throw Error('Timeout: '+label+' '+reason);
+}
+async function port() {
+  const s=createServer();
+  await new Promise(r=>s.listen(0,'127.0.0.1',r));
+  const n=s.address().port;await new Promise(r=>s.close(r));return n;
+}
+function launch(file,args,env={}) {
+  const child=spawn(file,args,{cwd:root,windowsHide:true,env:{...process.env,...env},stdio:'ignore'});
+  services.push(child);return child;
+}
+async function cdp(url) {
+  const ws=new WebSocket(url);
+  await new Promise((ok,no)=>{ws.onopen=ok;ws.onerror=no;});sockets.push(ws);
+  let id=0;const pending=new Map(),events=new Map();
+  ws.onmessage=e=>{
+    const p=JSON.parse(e.data);
+    if(p.id && pending.has(p.id)) {
+      const {ok,no,timer}=pending.get(p.id);pending.delete(p.id);clearTimeout(timer);
+      p.error?no(Error(p.error.message)):ok(p.result);
+    } else if(events.has(p.method)) events.get(p.method)(p.params).catch(err=>{console.error(err.message);});
+  };
+  const send=(method,params={})=>new Promise((ok,no)=>{
+    const key=++id, timer=setTimeout(()=>{pending.delete(key);no(Error('CDP timeout '+method));},7000);
+    pending.set(key,{ok,no,timer});ws.send(JSON.stringify({id:key,method,params}));
+  });
+  return {send,on:(name,cb)=>events.set(name,cb),evaluate:async expression=>{
+    const res=await send('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});
+    if(res.exceptionDetails)throw Error(res.exceptionDetails.exception?.description||res.exceptionDetails.text);
+    return res.result.value;
+  }};
+}
+const token=()=>randomBytes(30).toString('hex');
+const admin=token(), nodeToken=token(), pluginToken=token(), spareToken=token();
+const centerPort=await port(), bridgePort=await port(), secondPort=await port();
+const centerURL='http://127.0.0.1:'+centerPort, bridgeURL='http://127.0.0.1:'+bridgePort;
+let browserCdp;
+async function api(uri,method='GET',body) {
+  const r=await fetch(centerURL+'/v1/'+uri,{method,headers:{Authorization:'Bearer '+admin,'Content-Type':'application/json'},
+    body:body===undefined?undefined:JSON.stringify(body)});
+  const result=await r.json();if(!r.ok)throw Error(result.error);return result;
+}
+try {
+  const python=process.env.VEST_TEST_PYTHON || 'python';
+  launch(python,['-m','fleet','center','--port',String(centerPort),'--db',path.join(tmp,'center.db')],{VEST_ADMIN_TOKEN:admin});
+  launch(python,['-m','fleet','bridge','--node-id','spare','--port',String(secondPort),'--db',path.join(tmp,'second.db')],
+    {VEST_NODE_TOKEN:spareToken,VEST_PLUGIN_TOKEN:token()});
+  const repo=path.join(tmp,'source'), stateDir=path.join(tmp,'node-state');
+  await mkdir(repo);
+  await cp(path.join(root,'fleet'),path.join(repo,'fleet'),{recursive:true,filter:p=>!p.includes('__pycache__')});
+  const sourceExt=path.join(repo,'extension'), ext=path.join(stateDir,'extension');
+  await cp(path.join(root,'extension'),sourceExt,{recursive:true});
+  // Redirect Git only for this test process. Both published commits live in this temporary repository.
+  const env={GIT_CONFIG_GLOBAL:path.join(tmp,'gitconfig'),GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_COUNT:'1',
+    GIT_CONFIG_KEY_0:'url.'+pathToFileURL(repo).href+'.insteadOf',GIT_CONFIG_VALUE_0:'https://github.com/Kevinckyy/CoinMachine-vest-V2.git'};
+  function git(...args) {
+    return execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@localhost',...args],
+      {cwd:repo,encoding:'utf8',windowsHide:true,env:{...process.env,...env}}).trim();
+  }
+  const background=path.join(sourceExt,'background.js');
+  await writeFile(background,(await readFile(background,'utf8')).replace('127.0.0.1:8877','127.0.0.1:'+bridgePort));
+  const pub=generateKeyPairSync('rsa',{modulusLength:2048}).publicKey.export({type:'spki',format:'der'});
+  const eid=createHash('sha256').update(pub).digest('hex').slice(0,32).replace(/[0-9a-f]/g,x=>'abcdefghijklmnop'[parseInt(x,16)]);
+  const manifestPath=path.join(sourceExt,'manifest.json');
+  const manifest={...JSON.parse(await readFile(manifestPath,'utf8')),key:pub.toString('base64')};
+  await writeFile(manifestPath,JSON.stringify(manifest));
+  git('init','-q','-b','main');git('add','fleet','extension');git('commit','-qm','first release');
+  const first=git('rev-parse','HEAD');
+  await writeFile(manifestPath,JSON.stringify({...manifest,description:'Read-only local release fixture'}));
+  git('add','extension/manifest.json');git('commit','-qm','second release');
+  const second=git('rev-parse','HEAD');
+  const agent=path.join(root,'deploy','node_agent.py');
+  execFileSync(python,['-B',agent,'init','--state',stateDir,'--revision',first],
+    {env:{...process.env,...env},windowsHide:true});
+  launch(python,['-B',agent,'run','--state',stateDir,'--db',path.join(tmp,'bridge.db'),'--port',String(bridgePort)],
+    {...env,VEST_NODE_ID:'lab',VEST_CENTER_URL:centerURL,VEST_NODE_TOKEN:nodeToken,VEST_PLUGIN_TOKEN:pluginToken});
+  await until(async()=>(await fetch(centerURL+'/healthz')).ok&&(await fetch(bridgeURL+'/healthz')).ok,'local managed bridge');
+  const profile=path.join(tmp,'browser');
+  launch(browser,['--headless=new','--remote-debugging-port=0','--user-data-dir='+profile,'--no-first-run',
+    '--disable-extensions-except='+ext,'--load-extension='+ext,'--no-proxy-server',
+    '--host-resolver-rules=MAP * 127.0.0.1','--disable-background-networking','--disable-sync',
+    '--disable-component-update','--disable-gpu','about:blank']);
+  const debugPort=await until(async()=>Number((await readFile(path.join(profile,'DevToolsActivePort'),'utf8')).split('\n')[0]),'browser');
+  const debug='http://127.0.0.1:'+debugPort;
+  browserCdp=await cdp((await (await fetch(debug+'/json/version')).json()).webSocketDebuggerUrl);
+  async function tab() {
+    const {targetId}=await browserCdp.send('Target.createTarget',{url:'about:blank'});
+    const target=await until(async()=>(await (await fetch(debug+'/json/list')).json()).find(t=>t.id===targetId),'tab');
+    return {...await cdp(target.webSocketDebuggerUrl),targetId};
+  }
+  const ui=await tab();
+  await ui.send('Emulation.setDeviceMetricsOverride',{width:1400,height:950,deviceScaleFactor:1,mobile:false});
+  await ui.send('Page.navigate',{url:centerURL});
+  await until(()=>ui.evaluate("typeof document.querySelector('#loginForm')?.onsubmit === 'function' && document.querySelector('#loginSubmit')?.disabled === false"),'login UI');
+  await ui.evaluate(`document.querySelector('#loginForm input').value=${JSON.stringify(admin)};document.querySelector('#loginForm').requestSubmit()`);
+  await until(async()=>{
+    const info=await ui.evaluate("({ready:!document.getElementById('app').hidden,error:document.getElementById('loginError').textContent || document.getElementById('banner').textContent})");
+    if(!info.ready)throw Error(info.error || 'waiting for authenticated state');
+    return true;
+  },'dashboard');
+  await ui.evaluate("document.querySelector('[data-op=addNode]').click()");
+  await ui.evaluate(`(() => {const f=document.getElementById('dialogForm');Object.entries(${JSON.stringify({id:'lab',label:'本地测试节点',url:bridgeURL,token:nodeToken})}).forEach(([k,v])=>f.elements[k].value=v);f.requestSubmit();})()`);
+  await until(async()=>(await api('state')).nodes[0]?.online,'registered node');
+  const vest=await tab(), fixture=await readFile(path.join(root,'tests','vest-readonly.html'));
+  await vest.send('Fetch.enable',{patterns:[{urlPattern:'https://next.vestmarkets.com/*'}]});
+  vest.on('Fetch.requestPaused',p=>vest.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:p.resourceType==='Document'?200:404,
+    responseHeaders:[{name:'Content-Type',value:'text/html; charset=utf-8'}],body:p.resourceType==='Document'?fixture.toString('base64'):''}));
+  await vest.send('Page.navigate',{url:'https://next.vestmarkets.com/trade/NQ-PERP'});
+  await until(()=>vest.evaluate("!!document.querySelector('[data-testid=account-selector-trigger]')"),'synthetic Vest page');
+  const popup=await tab();
+  await popup.send('Page.navigate',{url:'chrome-extension://'+eid+'/popup.html'});
+  await until(()=>popup.evaluate("!!document.querySelector('#readonly')?.onclick && document.getElementById('mode').textContent==='未绑定'"),'installed extension popup');
+  await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
+  await popup.evaluate(`document.getElementById('label').value='本地浏览器';document.getElementById('token').value=${JSON.stringify(pluginToken)};document.getElementById('readonly').click()`);
+  await until(async()=>{
+    const info=await popup.evaluate("({mode:document.getElementById('mode').textContent,detail:document.getElementById('status').textContent})");
+    if(info.mode!=='只读')throw Error(info.detail);
+    return true;
+  },'bound active Vest tab',9000);
+  await until(async()=>{
+    const data=await api('state');
+    if(!data.accounts.length || data.accounts.some(a=>!a.fresh))throw Error(JSON.stringify({workers:data.workers.map(w=>[w.mode,w.error,w.page]), accounts:data.accounts.map(a=>[a.name,a.read_error,a.fresh])}));
+    return data.accounts.length===2 && data.accounts.every(a=>a.fresh);
+  },'extension account discovery');
+  const data=await api('state'),worker=data.workers[0];
+  assert.equal(worker.mode,'readonly');
+  assert.deepEqual(data.accounts.map(a=>[a.name,a.snapshot.equity]),[['Alpha',1050],['Beta',2000]]);
+  const report=await until(async()=>{
+    const data=await api('analytics?node_id=lab');return data.summary.settled===3 && data;
+  },'persisted native position history');
+  assert.deepEqual([report.summary.wins,report.summary.losses,report.summary.flat,report.summary.realized_pnl],[1,1,1,13.25]);
+  assert.deepEqual(report.nodes[0].stages.map(s=>s.realized_pnl),[20.5,-7.25,0]);
+  await until(async()=>(await api('analytics?section=order')).total===2,'native orders from both accounts');
+  const payouts=await until(async()=>{
+    const p=await api('analytics?section=payout');return p.total===2 && p;
+  },'read-only portfolio payout history');
+  assert.equal(payouts.summary.total_paid,40);
+  assert.equal(payouts.summary.total_withdrawn,0);
+  assert.deepEqual([...new Set(payouts.items.map(i=>i.account))],['Beta']);
+  await browserCdp.send('Target.activateTarget',{targetId:ui.targetId});
+  await ui.evaluate("document.getElementById('refresh').click();document.querySelector('[data-value=accounts]').click()");
+  await until(()=>ui.evaluate("!!document.querySelector('[data-op=account]')"),'account management');
+  await ui.evaluate("document.querySelector('[data-op=account]').click();const f=document.getElementById('dialogForm');f.elements.alias.value='一号账户';f.requestSubmit()");
+  await until(async()=>(await api('state')).accounts[0].alias==='一号账户','saved account alias');
+  await until(()=>ui.evaluate("!document.getElementById('dialog').open"),'metadata dialog closed');
+  await ui.evaluate("document.querySelector('[data-op=accountCmd]').click();document.getElementById('dialogForm').requestSubmit()");
+  const receipt=await until(async()=>{
+    const c=(await api('state')).commands[0];
+    if(c?.status==='failed')throw Error(c.error);
+    return c?.status==='succeeded'&&await api('commands/'+c.id);
+  },'read command receipt');
+  assert.equal(receipt.result.observation.name,'Alpha');assert.equal(receipt.result.observation.snapshot.equity,1050);
+  await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
+  const syncId=randomUUID();
+  await api('commands/'+syncId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Alpha',action:'history.read',params:{}});
+  const sync=await until(async()=>{
+    const c=await api('commands/'+syncId);
+    if(c.status!=='succeeded') throw Error(c.status+' '+c.error+' '+JSON.stringify(c.result));
+    return c;
+  },'explicit read-only history sync',45000);
+  assert.equal(sync.result.tables.position.rows_read,1);
+  assert.equal(sync.result.tables.order.rows_read,2);
+  assert.equal(sync.result.tables.order.bottom_seen,true);
+  await until(async()=>(await api('analytics?section=order')).total===3,'older orders retained after scrolling');
+  await browserCdp.send('Target.activateTarget',{targetId:ui.targetId});
+  await api('nodes/spare','PUT',{label:'备用节点',url:'http://127.0.0.1:'+secondPort,token:spareToken});
+  await until(async()=>(await api('state?node_id=spare')).nodes[0].online,'second local bridge');
+  await ui.evaluate("document.getElementById('refresh').click()");
+  await until(()=>ui.evaluate("document.querySelector('#nodeScope')?.options.length===2"),'node switcher');
+  await ui.evaluate("const scope=document.getElementById('nodeScope');scope.value='spare';scope.dispatchEvent(new Event('change'))");
+  assert.equal(await ui.evaluate("document.querySelectorAll('[data-op=account]').length"),0);
+  await ui.evaluate("document.querySelector('[data-value=strategy]').click();document.querySelector('[data-op=strategyConfig]').click();const sf=document.getElementById('dialogForm');sf.elements.batch_size.value='3';sf.requestSubmit()");
+  await until(async()=>(await api('state?node_id=spare')).strategy.config.batch_size===3,'node-only strategy settings');
+  assert.equal((await api('state?node_id=lab')).strategy.config.batch_size,1);
+  await until(()=>ui.evaluate("!document.getElementById('dialog').open"),'settings saved');
+  await ui.evaluate("document.querySelector('[data-value=logs]').click()");
+  await until(()=>ui.evaluate("document.querySelector('#logTable')?.textContent.includes('更新策略参数')"),'per-node runtime logs');
+  await ui.evaluate("document.querySelector('[data-value=analytics]').click()");
+  await until(()=>ui.evaluate("document.querySelector('#reportResults')?.textContent.includes('13.25')"),'analytics UI');
+  await ui.evaluate("const rf=document.getElementById('reportFilters');Object.entries({node_id:'lab',account:'Beta',phase:'2/2',from_date:'2026-11-23',to_date:'2026-11-23',start_time:'22:00',end_time:'02:00'}).forEach(([k,v])=>rf.elements[k].value=v);rf.requestSubmit()");
+  await until(()=>ui.evaluate("document.querySelector('.report-metrics .count')?.textContent==='-7.25'"),'filtered overnight stage report');
+  await ui.evaluate("document.querySelector('[data-op=resetReport]').click()");
+  await until(()=>ui.evaluate("document.querySelector('.report-metrics .count')?.textContent==='13.25'"),'reset filters');
+  await ui.evaluate("document.querySelector('[data-op=reportSection][data-value=order]').click()");
+  await until(()=>ui.evaluate("document.getElementById('reportResults').textContent.includes('abcd...0002')"),'platform order history table');
+  await ui.evaluate("document.querySelector('[data-op=reportSection][data-value=payout]').click()");
+  await until(()=>ui.evaluate("document.getElementById('reportResults').textContent.includes('已退款')"),'platform payout details');
+  await ui.send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  assert.equal(await ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
+  await ui.send('Emulation.setDeviceMetricsOverride',{width:1400,height:950,deviceScaleFactor:1,mobile:false});
+  const id=randomUUID();
+  await api('commands/'+id,'PUT',{node_id:'lab',worker_id:worker.worker_id,action:'page.navigate',params:{destination:'portfolio'}});
+  await until(async()=>(await api('commands/'+id)).status==='succeeded','verified page navigation');
+  assert.equal(await vest.evaluate('location.pathname'),'/portfolio');
+  const returnId=randomUUID();
+  await until(async()=>{
+    const w=(await api('state?node_id=lab')).workers[0];
+    return w.page==='/portfolio' && w.session_id!==worker.session_id;
+  },'new session on portfolio');
+  await api('commands/'+returnId,'PUT',{node_id:'lab',worker_id:worker.worker_id,action:'page.navigate',params:{destination:'trade'}});
+  await until(async()=>(await api('commands/'+returnId)).status==='succeeded','return to the trading page for account reads');
+  await until(async()=>{
+    const state=await api('state?node_id=lab');
+    return state.workers[0].page.startsWith('/trade/') && state.accounts.every(a=>a.fresh);
+  },'trade page before update');
+  await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
+  await popup.evaluate("document.getElementById('execute').click()");
+  const beforeUpdate=await until(async()=>{
+    const w=(await api('state?node_id=lab')).workers[0];
+    return w.mode==='execute' && w;
+  },'prior profile mode on the isolated fixture');
+  await ui.evaluate("document.querySelector('[data-value=nodes]').click();document.querySelector('[data-op=deployUpdate]').click()");
+  await ui.evaluate(`(() => {const f=document.getElementById('dialogForm'); for(const box of f.querySelectorAll('[name=target]')) box.checked=box.value==='lab'; f.elements.revision.value=${JSON.stringify(second)}; f.requestSubmit();})()`);
+  await until(async()=>{
+    const data=await api('state?node_id=lab'), node=data.nodes[0], browser=data.workers.find(w=>w.worker_id===worker.worker_id);
+    if(node.update?.state!=='succeeded' || browser?.release!==second)
+      throw Error([node.update?.state,node.update?.detail,node.release,browser?.release,browser?.error].join(' '));
+    assert.equal(browser.mode,'readonly');
+    assert.notEqual(browser.session_id,beforeUpdate.session_id);
+    return node.release===second && node.update.confirmed.includes(worker.worker_id);
+  },'center release installed and confirmed by the reloaded MV3 worker',95000);
+  const afterReload=randomUUID();
+  await api('commands/'+afterReload,'PUT',{node_id:'lab',worker_id:worker.worker_id,action:'accounts.list',params:{}});
+  await until(async()=>{
+    const command=await api('commands/'+afterReload);
+    if(command.status!=='succeeded')throw Error(command.status+' '+command.error);
+    return true;
+  },'bound read command after automatic upgrade');
+  assert.equal((await api('state?node_id=spare')).nodes[0].update,null);
+  await ui.evaluate("document.querySelector('[data-value=overview]').click();document.getElementById('refresh').click()");
+  await until(()=>ui.evaluate("document.querySelector('#content').textContent.includes('本地测试节点')"),'overview data');
+  assert.equal(await ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
+  if(process.env.VEST_TEST_SCREENSHOT) {
+    const {data}=await ui.send('Page.captureScreenshot',{format:'png'});
+    await writeFile(process.env.VEST_TEST_SCREENSHOT,Buffer.from(data,'base64'));
+  }
+  await ui.send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  assert.equal(await ui.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
+  console.log('PASS: two bridges, read-only MV3, history, analytics, filters, isolated strategies and logs, receipts, navigation, center-issued Git update, actual extension reload, post-update read and responsive layout');
+} finally {
+  if(browserCdp) await browserCdp.send('Browser.close').catch(()=>{});
+  for(const ws of sockets)ws.close();
+  for(const child of services)if(child.exitCode===null)child.kill();
+  if(path.dirname(tmp)===path.resolve(tmpdir()) && path.basename(tmp).startsWith('vest-fleet-smoke-'))
+    await rm(tmp,{recursive:true,force:true,maxRetries:10,retryDelay:200});
+}

@@ -1,0 +1,30 @@
+name: vest-bridge
+services:
+  bridge:
+    image: python:3.12-slim
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-B", "-m", "fleet", "bridge", "--host", "0.0.0.0", "--db", "/data/bridge.sqlite3"]
+    environment:
+      VEST_NODE_ID: ${VEST_NODE_ID:?set VEST_NODE_ID}
+      VEST_NODE_TOKEN: ${VEST_NODE_TOKEN:?set VEST_NODE_TOKEN}
+      VEST_PLUGIN_TOKEN: ${VEST_PLUGIN_TOKEN:?set VEST_PLUGIN_TOKEN}
+    volumes:
+      - ../fleet:/app/fleet:ro
+      - bridge-data:/data
+    ports: ["127.0.0.1:8877:8877"]
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [bridge]
+    environment:
+      VEST_DOMAIN: ${VEST_DOMAIN:?set VEST_DOMAIN}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./bridge.Caddyfile:/etc/caddy/Caddyfile:ro
+      - tls-data:/data
+      - caddy-config:/config
+volumes:
+  bridge-data:
+  tls-data:
+  caddy-config:

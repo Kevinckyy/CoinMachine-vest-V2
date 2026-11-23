@@ -1,0 +1,9 @@
+{$VEST_DOMAIN} {
+    @control path /v1/status /v1/ledger /v1/logs /v1/commands/*
+    handle @control {
+        reverse_proxy bridge:8877
+    }
+    handle {
+        respond 404
+    }
+}

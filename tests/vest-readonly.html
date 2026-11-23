@@ -1,0 +1,82 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>本地账户读取测试</title></head>
+<body><button data-testid="account-selector-trigger" aria-expanded="false"><span class="truncate">Alpha</span><span>Evaluation</span><span>1/2</span></button>
+<nav><a href="/portfolio">Portfolio</a><a href="/trade/NQ-PERP">Trade</a></nav>
+<p data-testid="account-value">$1,050.00</p><p data-testid="account-upnl">$0.00</p><p data-testid="book-mark">$20,000</p>
+<p data-testid="account-health">90%</p>
+<button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active positions</button>
+<div id="positions"><p>No positions yet</p></div>
+<button data-testid="account-tab-positions-history" aria-selected="false" aria-controls="closed">Positions history</button>
+<button data-testid="account-tab-order-history" aria-selected="false" aria-controls="orders">Order history</button>
+<div id="closed" hidden></div><div id="orders" hidden></div>
+<button role="tab" id="desk-withdrawals" aria-controls="payouts" aria-selected="false" hidden>Payout history</button>
+<div id="payouts" hidden></div>
+<script>
+  const trigger = document.querySelector('button');
+  const accounts = [['Alpha','eval','Evaluation','1/2','$1,050.00'],['Beta','funded','Funded','Live','$2,000.00']];
+  let menu;
+  const td = (key, html) => '<td data-testid="td-' + key + '">' + html + '</td>';
+  const market = '<a href="/trade/NQ-PERP"><p>NQ</p><p>Long 2x</p></a>';
+  const clock = value => '<time datetime="' + value + '">' + value + '</time>';
+  const payout = (name,id,net,status) => '<tr>' + td('accountId','<button><span class="truncate">'+name+'</span></button>') +
+    td('id',id) + td('createdAt',clock('2026-11-23T13:00:00Z')) + td('updatedAt',clock('2026-11-23T15:00:00Z')) +
+    td('executedAt',clock('2026-11-23T15:00:00Z')) + td('requestedAmount','$50.00') + td('traderAmount',net) + td('status',status) + '</tr>';
+  document.getElementById('payouts').innerHTML='<table><tbody>'+payout('Beta','ab...123','$40.00','Completed')+
+    payout('Beta','ef...345','$15.00','已退款')+payout('Other','cd...234','$30.00','Completed')+'</tbody></table>';
+  function showHistory(name) {
+    const stage = title => '<tr><td colspan="8"><div data-testid="positions-history-step-test"><span>' + title + '</span></div></td></tr>';
+    const position = (ref, pnl) => '<tr>' + td('symbol',market) + td('quantity','2') + td('openPrice','$20,000') + td('closePrice','$20,010') +
+      td('openDate',clock('2026-11-23T13:00:00Z')) + td('closeDate',clock('2026-11-23T15:00:00Z')) +
+      td('pnl','<span data-testid="position-history-pnl-' + ref + '">' + pnl + '</span>') + '</tr>';
+    document.getElementById('closed').innerHTML = '<table><tbody>' + (name === 'Alpha' ? stage('Step 1 Evaluation') + position('p-a','+$20.50') :
+      stage('第 2 阶段评估') + position('p-b','-$7.25') + stage('Live') + position('p-c','$0.00')) + '</tbody></table>';
+    const orders = document.getElementById('orders');
+    orders.innerHTML = '<div style="height:75px;overflow-y:auto"><table><tbody><tr>' + td('symbol',market) + td('type','Market') +
+      td('size','2 / 2') + td('executedPrice','$20,000') + td('createdAt','11/23/2026 10:00:00') +
+      td('updatedAt','11/23/2026 10:01:00') + td('id','abcd...'+(name === 'Alpha' ? '0001' : '0002')) +
+      td('status','Filled') + '</tr></tbody></table><div aria-hidden="true" style="height:140px"></div></div>';
+    if(name==='Alpha') orders.firstElementChild.onscroll = e => {
+      if(e.target.scrollTop<5 || orders.querySelectorAll('tr').length>1) return;
+      const older=orders.querySelector('tr').cloneNode(true);
+      older.querySelector('[data-testid=td-id]').textContent='old1...0033';
+      older.querySelector('[data-testid=td-createdAt]').textContent='11/22/2026 10:00:00';
+      orders.querySelector('tbody').append(older);
+    };
+  }
+  showHistory('Alpha');
+  document.querySelectorAll('button[aria-controls]').forEach(tab => tab.onclick = () => {
+    for (const el of document.querySelectorAll('button[aria-controls]')) {
+      el.setAttribute('aria-selected',String(tab === el));
+      document.getElementById(el.getAttribute('aria-controls')).hidden = el !== tab;
+    }
+  });
+  function route() {
+    document.getElementById('desk-withdrawals').hidden=location.pathname !== '/portfolio';
+    document.querySelector('[data-testid=account-tab-active-positions]').click();
+  }
+  document.querySelectorAll('nav a').forEach(link => link.onclick = e => {
+    e.preventDefault();history.pushState({},'',link.pathname);route();
+  });
+  route();
+  function closeMenu() {
+    menu?.remove(); menu=null; trigger.setAttribute('aria-expanded','false');
+  }
+  function openMenu() {
+    if (menu) return;
+    menu=document.createElement('div');menu.setAttribute('role','menu');
+    menu.onkeydown=e=>{if(e.key==='Escape')closeMenu();};
+    accounts.forEach(([name,code,category,phase,equity])=>{
+      const item=document.createElement('button');item.dataset.testid='account-item-'+code;
+      item.innerHTML='<span class="truncate">'+name+'</span><span>'+category+'</span><span>'+phase+'</span>';
+      item.onclick=()=>{
+        trigger.innerHTML=item.innerHTML;
+        document.querySelector('[data-testid="account-value"]').textContent=equity;
+        showHistory(name);
+        closeMenu();
+      };
+      menu.append(item);
+    });
+    document.body.append(menu);trigger.setAttribute('aria-expanded','true');
+  }
+  trigger.onkeydown=e=>{if(e.key==='ArrowDown')openMenu();if(e.key==='Escape')closeMenu();};
+  trigger.onclick=()=>{if(menu)closeMenu();else openMenu();};
+</script></body></html>

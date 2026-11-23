@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><link rel="stylesheet" href="popup.css"><title>Vest Fleet 节点连接</title></head>
+<body>
+<header><strong>Vest Fleet</strong><span id="mode">读取中</span></header>
+<h1>浏览器执行器</h1>
+<p>绑定当前 Vest 标签页后，节点桥会同步这个浏览器里的账户。</p>
+<label>浏览器名称<input id="label" maxlength="80" placeholder="例如 上海 · 浏览器 01"></label>
+<label>插件密钥<input id="token" type="password" autocomplete="off" placeholder="节点的 VEST_PLUGIN_TOKEN"></label>
+<div class="buttons"><button id="readonly">绑定为只读</button><button id="execute">允许执行指令</button></div>
+<button id="disconnect" class="link">断开绑定</button>
+<output id="status" role="status"></output>
+<script src="popup.js"></script>
+</body></html>
