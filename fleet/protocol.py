@@ -187,10 +187,11 @@ def validate_target(cmd, worker, account, now):
         risk = account.get("risk") or {}
         lock = account.get("open_lock") or {}
         if lock:
-            require(now >= lock["until"],"账户开仓锁定至美东 20:00 · "+lock["reason"],409)
-        recheck = lock and (account.get("risk_at") or 0) < lock["until"]
+            require(now >= lock["until"],("等待读数重试" if lock.get("kind")=="read_retry" else "账户开仓锁定至美东 20:00")+" · "+lock["reason"],409)
+        retry = lock.get("kind")=="read_retry"
+        recheck = lock and (retry or (account.get("risk_at") or 0) < lock["until"])
         if recheck:
-            require(card_candidate and account["card_at"] >= lock["until"],"等待日切后的活动账户清单",409)
+            require(card_candidate and (retry or account["card_at"] >= lock["until"]),"等待更新活动账户清单",409)
             card = account["card"]
             risk = {**card,"position_open":card.get("active_positions") != 0}
         issue = risk_error(risk,complete=not recheck and bool(account.get("risk_at") and now-account["risk_at"]<60))

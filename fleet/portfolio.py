@@ -38,6 +38,8 @@ def listed(db, row, reading, now):
     require(row["status"] == "running" and scan["stage"] in ("list", "cache") and reading["full"] is True,
             "须先为本次指令全量拉取账户列表", 409)
     require(reading["observed_at"] >= row["claimed"] - 0.001, "清单早于本次指令，请重新拉取", 409)
+    require(reading.get("source_at",reading["observed_at"]) >= row["created"]-0.001,
+            "平台清单早于本次指令，请重新拉取",409)
     seen = set()
     targets = []
     for card in reading["items"]:

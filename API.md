@@ -91,7 +91,7 @@ Content-Type: application/json
 
 | `action` | `account` | `params` | 成功返回的 `result` |
 | --- | --- | --- | --- |
-| `accounts.list` | 省略 | `{}` | 全量拉取账户列表，从 `/accounts` 的活动卡片更新缓存，返回 `inventory` 和 `count` |
+| `accounts.list` | 省略 | `{}` | 全量拉取账户列表，按平台账户 ID 更新活动清单并合并 `/accounts` 卡片读数，返回 `inventory` 和 `count` |
 | `accounts.read_all` | 省略 | `{}` | 全量读取账户信息，先全量拉取列表并确认本地缓存，再在 `/portfolio` 逐户读取并回传。返回 `listed_at,total,read,partial,failed,accounts` |
 | `account.read` | 必填 | `{}` | `observation`，含余额、净值、浮盈亏、风险指标和时间 |
 | `positions.read` | 必填 | `{}` | `observation.snapshot`，含明确的持仓状态、ID、方向、数量、均价和原生保护价 |
@@ -105,9 +105,9 @@ Content-Type: application/json
 
 开仓方向为 `buy` 或 `sell`。`micro` 是正整数，也可用 `size_percent` 指定 25、50、75 或 100 百分档。两者选一。`stop_buffer` 为净值缓冲 M，省略时使用该节点对应阶段的设置（初始 20 USD）。需要设置止损时，止损金额取净值至今日底线的距离与剩余最大回撤的较小值，再减去 M，向下取整至美分。开仓许可记录 `equity`、`daily_floor.floor`、`max_drawdown_floor`、`floor_gap`、`distance_to_max_floor` 和 `remaining_max_drawdown`。Live 开仓可传固定金额 `take_profit` 或 `reward_ratio` 配合 `min_take_profit`。盈亏比的风险基数是本单止损金额，免止损时使用净值至爆仓线的距离。平仓和修改保护会核对持仓 ID、方向、数量、品种和均价。
 
-目录中的 `card,card_at` 对应活动卡片，`risk,risk_at` 保留风控读数及上次交易页实读时间。`in_pool` 表示允许策略选用，`candidate` 表示当前可以进入下单前核验。`open_locked` 表示当前日内开仓锁，`open_lock.reason,until` 给出原因和到期时间。`daily_floor.floor` 是平台实读值，`observed_at` 是其读取时间，`source` 为 `platform` 或 `pending`。每次开仓核验都需要本次交易页的 `snapshot.daily_floor`。日切或已确认提现后的底线等待读取。插件当前会话的 `card_session,card_generation,cards_full_at` 可用于检查全量刷新进度。
+目录中的 `card,card_at` 对应活动卡片，`risk,risk_at` 保留风控读数及上次交易页实读时间。`in_pool` 表示允许策略选用，`candidate` 表示当前可以进入下单前核验。`open_locked` 表示当前开仓锁，`open_lock.reason,until` 给出原因和到期时间。`open_lock.kind` 的 `risk` 表示风控锁，`read_retry` 表示 45 秒后可重试的读取失败。`daily_floor.floor` 是平台实读值，`observed_at` 是其读取时间，`source` 为 `platform` 或 `pending`。每次开仓核验都需要交易页的 `snapshot.reference_card_id,reference_at,daily_floor,max_drawdown_floor`。日切或已确认提现后的底线等待读取。插件当前会话的 `card_session,card_generation,cards_full_at` 可用于检查全量刷新进度。
 
-`GET /v1/state` 的 `plugin_version` 为中心所附插件版本。每个 worker 的 `plugin_version` 为浏览器上报版本，`version_status` 为 `current,behind,ahead,unknown` 之一。节点 `GET /v1/status` 也返回各 worker 的版本，受管安装的 Git 提交保存在 `release`。开仓需要节点 `open_policy_version=3` 和插件 1.8.0 或更高版本。
+`GET /v1/state` 的 `plugin_version` 为中心所附插件版本。每个 worker 的 `plugin_version` 为浏览器上报版本，`version_status` 为 `current,behind,ahead,unknown` 之一。节点 `GET /v1/status` 也返回各 worker 的版本，受管安装的 Git 提交保存在 `release`。开仓需要节点 `open_policy_version=4` 和插件 1.9.0 或更高版本。
 
 从 1.7.0 起，稳定清单通过 `/v1/plugin/report` 的 `metrics` 上报。批次含 `generation,base_at,observed_at,directory,items`，每行只含账户名和变化的数字。持仓期间每秒读取活动卡片，常规清单核对时一并更新其他账户的变化值。基线过期、成员变动或强制拉取时重新传送清单。中心使用 `GET /v1/status?since=initial` 取得节点基线，随后携带返回的 `status_cursor`，按 `changes` 中的路径和值更新同一基线。
 

@@ -169,7 +169,7 @@ function strategyDetail(node) {
   const queue = (s.planned || []).map(item => item.ref);
   const olderWorkers = state.workers.filter(w => w.node_id === node.id && w.online && w.mode === 'execute' && !w.supports_open_policy);
   const versionNote = olderWorkers.length ? '<p class="form-note">'+esc(olderWorkers.map(w => w.label).join('、'))+
-    ' 需要更新节点桥并加载 1.8.0 或更高版本插件，才能核对每日亏损底线与最大回撤线。</p>' : '';
+    ' 需要更新节点桥并加载 1.9.0 或更高版本插件，才能核对每日亏损底线与最大回撤线。</p>' : '';
   const controls = '<div class="buttons">'+strategyControls(node,s)+'</div>';
   const summary = '<div class="panel-body"><div class="row"><h3>'+esc(poolNames[c.pool_strategy])+'</h3>'+strategyStatus(node,s)+'</div>'+
     '<div class="summary"><div><small>批次</small><strong>'+s.batch+'</strong></div><div><small>每批账户</small><strong>'+c.batch_size+'</strong></div>'+
@@ -187,7 +187,7 @@ function strategyDetail(node) {
     else if (!a.in_pool && !canJoinPool(a)) unavailable = '当前账户状态无法入池';
     const poolButton = '<button type="button" class="link" data-op="'+(a.in_pool ? 'leavePool' : 'joinPool')+'" data-value="'+esc(key)+'"'+
       (unavailable ? ' disabled title="'+esc(unavailable)+'"' : '')+'>'+label+'</button>';
-    const status = active ? '执行中' : a.open_locked ? '开仓风控锁定' : a.candidate ? '可候选' : a.in_pool ? '入池待选' : a.live_default_locked ? 'Live 默认锁定' :
+    const status = active ? '执行中' : a.open_locked ? openLockLabel(a) : a.candidate ? '可候选' : a.in_pool ? '入池待选' : a.live_default_locked ? 'Live 默认锁定' :
       a.ambiguous ? '同名待确认' : a.excluded ? '主账户' : !a.enabled ? '已停用' : '未入池';
     return '<tr><td class="cell"><strong>'+esc(a.alias || a.name)+'</strong><small>'+esc((a.alias ? a.name+' · ' : '')+workerLabel(node.id,a.worker_id))+'</small></td>'+
       '<td>'+esc(stageNames[a.phase] || '待确认')+'</td><td class="cell">'+tag(status,active ? 'info' : a.open_locked ? 'warn' : a.candidate ? 'good' : '')+openLockDetail(a)+'</td>'+

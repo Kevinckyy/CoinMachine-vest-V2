@@ -7,7 +7,7 @@ from .trading_day import entry_day_window
 
 
 CENT = Decimal("0.01")
-OPEN_POLICY_VERSION = 3
+OPEN_POLICY_VERSION = 4
 
 
 def decimal(value):

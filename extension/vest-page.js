@@ -559,7 +559,19 @@
         trigger.dispatchEvent(new PointerEvent('pointerout',{...opts,relatedTarget:document.body}));
       }
     }
-    async function riskReferences(name) {
+    async function riskReferences(identity, expectedId) {
+      const {name,phase} = identity;
+      const source = await hooks.nativeAccounts();
+      const row = source?.rows.find(item=>item.id===source.selected);
+      if (expectedId && row?.id!==expectedId || row && row.phase!==phase)
+        return {reference_error:'交易页未确认当前平台账户身份或阶段'};
+      const age = Date.now()/1000-source?.at;
+      const proof = {reference_card_id:row?.id,reference_at:source?.at,reference_source:'active_accounts'};
+      if (row && age>=0 && age<=330 && (row.daily_floor!=null || row.daily_unlimited) && row.max_drawdown_floor!=null)
+        return {...proof,daily_floor:row.daily_floor,daily_unlimited:row.daily_unlimited,
+          max_drawdown_floor:row.max_drawdown_floor,daily_reset_equity:row.daily_reset_equity};
+      if (expectedId) return proof;
+      // Read-only diagnostics may still use the visible tooltip when native fields are unavailable.
       const daily = await readRiskTooltip(riskTrigger('daily-loss',/^(?:max\.? daily loss|daily loss|最大日亏损|每日亏损)$/i),name,root => {
         const result = {};
         for (const el of [root,...root.querySelectorAll('p,span,div')]) {
@@ -577,7 +589,10 @@
         const value = match && core.parseMoney(match[1] || match[2]);
         return value!=null ? {max_drawdown_floor:value} : null;
       });
-      return {...daily,...maximum};
+      const after = await hooks.nativeAccounts();
+      if (after?.selected!==source?.selected || observerIdentity().signature!==identity.signature)
+        return {reference_error:'交易页未确认当前平台账户身份或阶段'};
+      return {...proof,reference_source:'tooltip',reference_at:Date.now()/1000,...daily,...maximum};
     }
     function bannerUnrealized() {
       // The desktop second-row banner has no account-upnl test ID. Read its
@@ -920,7 +935,7 @@
         await observerCloseSelector(assertLive);
       }
     }
-    async function read(name, category, verifyMenu = false) {
+    async function read(name, category, verifyMenu = false, expectedId) {
       const identity = await waitForAccountIdentity(observerAssertPage);
       const selected = {
         name,
@@ -944,7 +959,7 @@
         position_open: null,
         observed_at: account.observed_at
       };
-      const reference = await riskReferences(name);
+      const reference = await riskReferences(id,expectedId);
       if (observerIdentity().signature!==id.signature) throw Error('读取期间账户或阶段已变化');
       const restricted = ['default', 'main', 'primary', 'master', 'closed', 'failed'].includes(selected.category);
       return {
@@ -991,7 +1006,7 @@
       observerAssertPage();
       const identity = observerIdentity();
       if (identity.name !== config.accountName) throw Error('提交前交易账户已变化');
-      const reference = await riskReferences(identity.name);
+      const reference = await riskReferences(identity,config.platformId);
       const latest = observerValues(identity.name,true);
       if (observerIdentity().signature !== identity.signature) throw Error('读取最新风控期间账户或阶段变化');
       return {name:identity.name,category:identity.category,phase:identity.phase,
@@ -1005,7 +1020,7 @@
       if (job.size_percent) job.quantity = await selectPositionSize(job);
       else await setInput('quantity', core.nqVestToInput(job.quantity, 'micro'));
       if (job.stop_loss != null && job.stop_loss<job.quantity*0.25) {
-        const reading = await read(config.accountName,config.accountCategory);
+        const reading = await read(config.accountName,config.accountCategory,false,config.platformId);
         const checked = await hooks.preflight(reading,job.quantity);
         job.stop_loss = checked.stop_loss;
         job.take_profit = checked.take_profit ?? job.take_profit;
@@ -1238,7 +1253,7 @@
     async function execute(cmd, continuation) {
       if (continuation) return continueCommand(cmd,continuation);
       if (cmd.action==='profit.available') return continueCommand(cmd,{stage:'portfolio'});
-      const observation = await read(cmd.account, null, true);
+      const observation = await read(cmd.account, null, true,cmd.expected_risk?.card_id);
       let approved;
       if (cmd.action === 'order.open') approved = await hooks.preflight(observation);
       else await hooks.report({observation});
@@ -1265,6 +1280,7 @@
       const identity = observerIdentity();
       if (cmd.phase && identity.phase !== cmd.phase) throw Error('指令阶段与页面不一致');
       config = {
+        platformId: cmd.expected_risk?.card_id,
         accountId: cmd.account,
         accountName: cmd.account,
         accountCategory: observation.category,

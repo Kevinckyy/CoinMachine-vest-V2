@@ -60,6 +60,7 @@
   const page = globalThis.VestPage.create({
     guard,
     report,
+    nativeAccounts,
     preflight: async (observation,quantity) => {
       guard(true);
       const value = await ipc('preflight',{id:job.id,observation,quantity});
@@ -79,6 +80,11 @@
       return value.data;
     }
   });
+  async function nativeAccounts() {
+    const reply=await ipc('native.accounts');
+    guard();
+    return reply.bound ? reply.data : null;
+  }
   async function observe(data, force = false, scanId) {
     if (location.pathname.replace(/\/$/,'') !== '/accounts' || data.moving) return;
     const generation = data.refresh_cards ?? data.card_generation ?? 0;
@@ -88,11 +94,15 @@
     let reading;
     try {
       // A single sample suffices for prices. Confirm directory changes on two stable DOM samples.
-      const sample = !full && VestCards.sample(false);
-      if (sample && VestCards.membership(sample) === directory.signature) {
-        reading = {items:sample, observed_at:Date.now()/1000};
+      const cards = !full && VestCards.sample(false);
+      const source = !full && directoryDue ? await nativeAccounts() : null;
+      const cached = directoryDue ? source : directory?.source;
+      const sample = cards && cached && VestCards.nativeItems(cached,cards,directory?.byId);
+      if (sample && Date.now()/1000-cached.at<=330 && VestCards.membership(sample) === directory.signature) {
+        reading = {items:sample,observed_at:Date.now()/1000,source_at:cached.at,source:cached};
+        if (source) directory.source=source;
       } else if (sample || directoryDue) {
-        reading = await VestCards.read(full,guard);
+        reading = await VestCards.read(full,guard,nativeAccounts,directory?.byId,data.directory_since || 0);
       } else return;
     } catch (err) {
       if (scanId) await ipc('result',{id:scanId,ok:false,result:{},error:'拉取账户列表失败：'+brief(err).slice(0,460)});
@@ -101,9 +111,11 @@
     const signature = VestCards.membership(reading.items);
     const changedList = signature !== directory?.signature;
     if (full || changedList || !directory.supportsMetrics) {
-      const ack = await report({cards:{...reading,generation,full:full || changedList,
+      const {source,...cardReading}=reading;
+      const ack = await report({cards:{...cardReading,generation,full:full || changedList,
         purchase_request:data.purchase_request,...(scanId ? {scan_id:scanId} : {})}});
-      directory = {signature,generation,baseline:VestCards.index(reading.items),supportsMetrics:ack?.supports_metrics===true};
+      directory = {signature,generation,source,byId:new Map(reading.items.map(x=>[x.id,x])),
+        baseline:VestCards.index(reading.items),supportsMetrics:ack?.supports_metrics===true};
     } else {
       const items = VestCards.changes(reading.items,directory.baseline,directoryDue);
       await report({metrics:{items,base_at:directory.observedAt,observed_at:reading.observed_at,generation,directory:directoryDue},
@@ -117,8 +129,8 @@
     if (!force) return;
     const counts = new Map();
     for (const item of reading.items) counts.set(item.name,(counts.get(item.name) || 0)+1);
-    const inventory = reading.items.map(({name,category,phase})=>({name,category,phase,ambiguous:counts.get(name)>1}));
-    return {source:'accounts',full:true,count:inventory.length,inventory};
+    const inventory = reading.items.map(({id,name,category,phase})=>({id,name,category,phase,ambiguous:counts.get(name)>1}));
+    return {source:'accounts',source_at:reading.source_at,full:true,count:inventory.length,inventory};
   }
   async function cycle() {
     const started = performance.now();

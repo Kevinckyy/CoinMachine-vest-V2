@@ -81,12 +81,17 @@ def exit_list_excludes(check, opened, worker, accounts):
             or not isinstance(rows,list) or type(result.get("count")) is not int or result["count"] != len(rows)
             or any(not isinstance(r,dict) or not isinstance(r.get("name"),str) or not r["name"] for r in rows)):
         return False
+    original_id = (opened.get("expected_risk") or {}).get("card_id")
+    if "source_at" in result:
+        if type(result["source_at"]) not in (int,float) or result["source_at"]<check["created_at"] or any(not r.get("id") for r in rows):
+            return False
+        if original_id:
+            return all(r["id"]!=original_id for r in rows)
     matches = [r for r in rows if r["name"] == opened["account"]]
     if not matches:
         return True
     # The platform can reuse a name. The full read and the corresponding card must identify a replacement.
     a = accounts.get((opened["node_id"],opened["worker_id"],opened["account"]))
-    original_id = (opened.get("expected_risk") or {}).get("card_id")
     return bool(len(matches) == 1 and not matches[0].get("ambiguous") and a and not a["ambiguous"]
                 and a["card_fresh"] and a["card_at"] >= check["claimed_at"] and original_id
                 and a["card"].get("id") and a["card"]["id"] != original_id)
@@ -109,6 +114,8 @@ class Center:
                 enabled INTEGER NOT NULL,in_pool INTEGER NOT NULL,account_ref TEXT NOT NULL DEFAULT '',PRIMARY KEY(node,worker,name));
             CREATE TABLE IF NOT EXISTS node_strategy(node TEXT PRIMARY KEY REFERENCES nodes(id), data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS directory_refresh(node TEXT PRIMARY KEY REFERENCES nodes(id),generation INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS platform_accounts(node TEXT,worker TEXT,platform_id TEXT,config_name TEXT NOT NULL,
+                PRIMARY KEY(node,worker,platform_id), UNIQUE(node,worker,config_name));
             CREATE TABLE IF NOT EXISTS ledger_cursor(node TEXT PRIMARY KEY REFERENCES nodes(id), seq INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS log_cursor(node TEXT PRIMARY KEY REFERENCES nodes(id), seq INTEGER NOT NULL);
         """)
@@ -125,6 +132,8 @@ class Center:
                 db.execute("ALTER TABLE account_config ADD COLUMN account_ref TEXT NOT NULL DEFAULT ''")
             if "live_unlocked" not in {r["name"] for r in db.execute("PRAGMA table_info(account_config)")}:
                 db.execute("ALTER TABLE account_config ADD COLUMN live_unlocked INTEGER NOT NULL DEFAULT 0")
+            for row in db.execute("SELECT id,snapshot FROM nodes"):
+                self._remember_accounts(db,row["id"],json.loads(row["snapshot"])["accounts"])
             self._migrate_strategies(db)
             db.execute("""UPDATE node_strategy SET data=json_set(json_remove(data,'$.config.stop_loss'),
                       '$.config.stop_buffer',20) WHERE json_extract(data,'$.config.stop_buffer') IS NULL""")
@@ -174,10 +183,25 @@ class Center:
             reporting.log(db, key, self.clock(), "node", "更新服务器配置" if prior else "登记服务器")
         return {"id": key}
 
+    @staticmethod
+    def _remember_accounts(db, node, accounts):
+        for account in accounts:
+            platform_id = (account.get("card") or {}).get("id")
+            if not platform_id or not account["present"] or account["ambiguous"]:
+                continue
+            worker, name = account["worker_id"], account["name"]
+            if db.execute("SELECT 1 FROM platform_accounts WHERE node=? AND worker=? AND platform_id=?",(node,worker,platform_id)).fetchone():
+                continue
+            while db.execute("SELECT 1 FROM platform_accounts WHERE node=? AND worker=? AND config_name=?",(node,worker,name)).fetchone():
+                name = uid()
+            db.execute("INSERT INTO platform_accounts VALUES(?,?,?,?)",(node,worker,platform_id,name))
+
     def _inventory(self, db, nid=None):
         now = self.clock()
         args = (nid,) if nid else ()
         configs = {(r["node"], r["worker"], r["name"]): r for r in db.execute("SELECT * FROM account_config" + (" WHERE node=?" if nid else ""), args)}
+        identities = {(r["node"],r["worker"],r["platform_id"]): r["config_name"] for r in
+                      db.execute("SELECT * FROM platform_accounts" + (" WHERE node=?" if nid else ""),args)}
         nodes, workers, accounts = {}, {}, {}
         for row in db.execute("SELECT * FROM nodes" + (" WHERE id=?" if nid else "") + " ORDER BY label,id", args):
             nid = row["id"]
@@ -197,11 +221,13 @@ class Center:
                 actual,target = plugin_version_parts(w.get("plugin_version")),plugin_version_parts(self.plugin_version)
                 status = "unknown" if not actual or not target else "current" if actual==target else "behind" if actual<target else "ahead"
                 workers[nid, w["worker_id"]] = {**w, "node_id": nid, "online": online and now - w["last_seen"] < WORKER_TTL,
-                                                "supports_open_policy":nodes[nid]["open_policy_version"]>=daily_floor.OPEN_POLICY_VERSION and actual>=(1,8,0,0),
+                                                "supports_open_policy":nodes[nid]["open_policy_version"]>=daily_floor.OPEN_POLICY_VERSION and actual>=(1,9,0,0),
                                                 "plugin_version":w.get("plugin_version",""),"version_status":status}
             for a in snap["accounts"]:
                 key = (nid, a["worker_id"], a["name"])
-                cfg = configs.get(key)
+                platform_id = (a.get("card") or {}).get("id")
+                config_name = identities.get((*key[:2],platform_id),a["name"])
+                cfg = configs.get((*key[:2],config_name))
                 worker = workers[key[:2]]
                 card_fresh = bool(a.get("card") and a["present"] and worker["online"] and
                                   worker["session_id"]==a["listed_session"] and now-a["card_at"]<=OBS_TTL)
@@ -211,7 +237,8 @@ class Center:
                                  "note": cfg["note"] if cfg else "", "enabled": bool(cfg["enabled"]) if cfg else True,
                                  "live_default_locked":bool(live_locked),"open_locked":bool(a.get("open_lock") and now < a["open_lock"]["until"]),
                                  "in_pool": bool(eligible and not live_locked and (cfg["enabled"] and cfg["in_pool"] if cfg else a.get("card"))),
-                                 "account_ref": cfg["account_ref"] if cfg else "", "card_fresh":card_fresh,
+                                 "account_ref": (cfg["account_ref"] if cfg else "") or (config_name if config_name!=a["name"] else ""),
+                                 "card_fresh":card_fresh,
                                  "fresh": card_fresh or bool(worker["online"] and a.get("read_session") == a.get("listed_session") == worker["session_id"]
                                                and a["present"] and not a["read_error"]
                                                and a["observed_at"] and now - a["observed_at"] <= OBS_TTL)}
@@ -297,6 +324,10 @@ class Center:
         with self.db.tx() as db:
             a = self._inventory(db, route[0])[2].get(route)
             require(a, "找不到该账户", 404)
+            require(a["present"] and not a["ambiguous"],"账户已移出或名称不唯一，无法修改设置",409)
+            identity = db.execute("SELECT config_name FROM platform_accounts WHERE node=? AND worker=? AND platform_id=?",
+                                  (*route[:2],(a.get("card") or {}).get("id"))).fetchone()
+            config_name = identity[0] if identity else route[2]
             alias, note = string(body.get("alias", a["alias"]), "别名", 80, True), string(body.get("note", a["note"]), "备注", 500, True)
             enabled, pool = boolean(body.get("enabled", a["enabled"])), boolean(body.get("in_pool", a["in_pool"]))
             ref = string(body.get("account_ref", a["account_ref"]), "交易账户标识", empty=True)
@@ -305,7 +336,7 @@ class Center:
                        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(node,worker,name) DO UPDATE SET alias=excluded.alias,
                        note=excluded.note,enabled=excluded.enabled,in_pool=excluded.in_pool,account_ref=excluded.account_ref,
                        live_unlocked=CASE WHEN ? THEN excluded.live_unlocked ELSE account_config.live_unlocked END""",
-                       (*route,alias,note,enabled,pool,ref,a["phase"]=="live" and pool,a["phase"]=="live" and "in_pool" in body))
+                       (*route[:2],config_name,alias,note,enabled,pool,ref,a["phase"]=="live" and pool,a["phase"]=="live" and "in_pool" in body))
             reporting.log(db, route[0], self.clock(), "account", "更新账户设置", worker=route[1], account=route[2])
             for row in db.execute("SELECT * FROM commands WHERE node=? AND worker=? AND account=?", route).fetchall():
                 if ref != a["account_ref"] and row["action"] in WRITE:
@@ -331,12 +362,13 @@ class Center:
             require(worker.get("strategy_version")==1,"Live 策略和免止损规则需要节点桥及 1.5.0 或更高版本插件",409)
         if req["action"]=="order.open" and a:
             require(worker["supports_open_policy"],
-                    "开仓风控需要支持两条底线的节点桥及 1.8.0 或更高版本插件",409)
+                    "开仓风控需要支持两条底线的节点桥及 1.9.0 或更高版本插件",409)
             require(a["phase"]=="live" or req["params"].get("take_profit") is None and "reward_ratio" not in req["params"],
                     "考核账户开仓不设止盈",409)
             budget = daily_floor.stop_decision(a.get("risk") or {},a.get("daily_floor"),req["params"])["stop_loss"]
             last_lock = a.get("open_lock") or {}
-            reread = last_lock and last_lock["until"] <= self.clock() and (a.get("risk_at") or 0) < last_lock["until"]
+            reread = last_lock and last_lock["until"] <= self.clock() and (last_lock.get("kind")=="read_retry" or
+                        (a.get("risk_at") or 0) < last_lock["until"])
             if budget is not None and not reread:
                 require(budget>0 and budget>=req["params"].get("micro",0)*2*0.25,"净值缓冲后的止损余量不足",409)
                 size = (a.get("risk") or {}).get("size_minimum")
@@ -435,6 +467,10 @@ class Center:
             if metrics_only and (not cursor or node["error"]):
                 return
             response = self.transport(node, "GET", "/v1/status?since="+(ident(cursor) if cursor else "initial"))
+            def directory(snapshot):
+                return {(a["worker_id"],a["name"],(a.get("card") or {}).get("id")) for a in snapshot["accounts"]
+                        if a["present"] and not a["ambiguous"]}
+            old_directory = directory(previous)
             snap = status_delta.unpack(previous, response)
             require(snap.get("version") == 1 and snap.get("node_id") == nid and
                     isinstance(snap.get("workers"), list) and isinstance(snap.get("accounts"), list),
@@ -461,6 +497,8 @@ class Center:
                                      (dump(snap), instance, self.clock(), nid, node["revision"], node["snapshot"]))
                 if not updated.rowcount:
                     return
+                if old_directory!=directory(snap):
+                    self._remember_accounts(db,nid,snap["accounts"])
                 updates.confirm(db,nid,snap,self.clock(),WORKER_TTL)
                 if not node["last_seen"] or node["error"] or self.clock()-node["last_seen"] >= NODE_TTL:
                     reporting.log(db, nid, self.clock(), "connection", "节点已连接")

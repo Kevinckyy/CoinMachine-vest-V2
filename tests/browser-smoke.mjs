@@ -157,9 +157,20 @@ try {
   await ui.evaluate(`(() => {const f=document.getElementById('dialogForm');Object.entries(${JSON.stringify({id:'lab',label:'本地测试节点',url:bridgeURL,token:nodeToken})}).forEach(([k,v])=>f.elements[k].value=v);f.requestSubmit();})()`);
   await until(async()=>(await api('state')).nodes[0]?.online,'registered node');
   const vest=await tab(), fixture=await readFile(path.join(root,'tests','vest-readonly.html'));
-  await vest.send('Fetch.enable',{patterns:[{urlPattern:'https://next.vestmarkets.com/*'}]});
-  vest.on('Fetch.requestPaused',p=>vest.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:p.resourceType==='Document'?200:404,
-    responseHeaders:[{name:'Content-Type',value:'text/html; charset=utf-8'}],body:p.resourceType==='Document'?fixture.toString('base64'):''}));
+  const gateway='https://api-gateway.hz.vestmarkets.com';
+  let activeAccountRequests=0;
+  await vest.send('Fetch.enable',{patterns:[{urlPattern:'https://next.vestmarkets.com/*'},{urlPattern:gateway+'/*'}]});
+  vest.on('Fetch.requestPaused',async p=>{
+    if (p.request.url===gateway+'/v3/capital/accounts/active') {
+      activeAccountRequests++;
+      const body=await vest.evaluate('JSON.stringify({accounts:nativeRows})');
+      return vest.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:200,
+        responseHeaders:[{name:'Content-Type',value:'application/json'},{name:'Access-Control-Allow-Origin',value:'https://next.vestmarkets.com'}],
+        body:Buffer.from(body).toString('base64')});
+    }
+    return vest.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:p.resourceType==='Document'?200:404,
+      responseHeaders:[{name:'Content-Type',value:'text/html; charset=utf-8'}],body:p.resourceType==='Document'?fixture.toString('base64'):''});
+  });
   await vest.send('Page.navigate',{url:'https://next.vestmarkets.com/trade/NQ-PERP'});
   await until(()=>vest.evaluate("!!document.querySelector('[data-testid=account-selector-trigger]')"),'synthetic Vest page');
   async function openUnboundPopup() {
@@ -209,7 +220,7 @@ try {
   const attachedId=await popup.evaluate(`(async()=>{
     const [tab]=await chrome.tabs.query({url:'https://next.vestmarkets.com/*'});
     const [frame]=await chrome.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},
-      files:chrome.runtime.getManifest().content_scripts[0].js});
+      files:chrome.runtime.getManifest().content_scripts.find(group=>group.world!=='MAIN').js});
     return frame.result;
   })()`);
   assert.equal(attachedId,existingPage.pageId);
@@ -217,6 +228,7 @@ try {
   assert.equal(data.accounts[1].card.pnl,111.50);
   assert.equal(data.accounts[1].card.drawdown_limit,300);
   assert.equal(data.accounts[1].card.daily_limit,145.96);
+  const requestsBeforeMonitoring=activeAccountRequests;
   await vest.evaluate(`(() => {const ps=[...document.querySelectorAll('#deskAccounts .grid > a:last-of-type p')];
     ps.find(p=>p.textContent.includes('(+10.77%)')).textContent='-$12.75 (-1.20%)';
     ps.find(p=>p.textContent==='回撤').nextElementSibling.textContent='$36.50 / $300';
@@ -226,6 +238,7 @@ try {
     return rows.length===1 && rows[0].pnl===-12.75 && rows[0];
   },'live PnL and both loss metrics reach the center on the fast channel',5500);
   assert.deepEqual([quote.drawdown,quote.daily_loss],[36.5,4.25]);
+  assert.equal(activeAccountRequests,requestsBeforeMonitoring);
   assert.ok(!('snapshot' in quote) && !('side' in quote));
   await vest.evaluate("sessionStorage.setItem('partialDirectory','1')");
   const partial=await api('nodes/lab/accounts/refresh','POST',{});
@@ -322,6 +335,8 @@ try {
   assert.equal(receipt.result.observation.snapshot.daily_reset_equity,1000);
   assert.equal(receipt.result.observation.snapshot.daily_floor,970);
   assert.equal(receipt.result.observation.snapshot.max_drawdown_floor,750);
+  assert.equal(receipt.result.observation.snapshot.reference_source,'active_accounts');
+  assert.equal(receipt.result.observation.snapshot.reference_card_id,'Alpha');
   await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
   const syncId=randomUUID();
   await api('commands/'+syncId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Alpha',action:'history.read',params:{}});

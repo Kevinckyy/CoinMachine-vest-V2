@@ -341,6 +341,10 @@ class Bridge:
         snap = obj(data.get("snapshot"))
         require(len(dump(snap)) <= 16000, "读数过大")
         observed = number(snap.get("observed_at"), "读取时间", now - 180, now + 10)
+        reference_at = number(snap.get("reference_at",observed), "底线读取时间", 0, now+10)
+        if snap.get("reference_card_id"):
+            require(snap["reference_card_id"] == json.loads(row["card"] or "{}").get("id") and not row["ambiguous"],
+                    "风控底线不属于当前账户",409)
         if row["observed_at"] and observed < row["observed_at"]:
             return
         for key in ("equity", "balance", "unrealized_pnl"):
@@ -381,8 +385,13 @@ class Bridge:
             tracked_position=?,excluded=MAX(excluded,?) WHERE worker_id=? AND name=?""",
             (dump(snap), category, phase, observed, dump(tracked) if tracked else None, category.lower() in PRIMARY, wid, name))
         risk = cards.from_trade(snap)
-        daily_floor.capture(db,wid,name,observed,risk["daily_limit"],
+        daily_floor.capture(db,wid,name,reference_at,risk["daily_limit"],
                             snap.get("daily_reset_equity"),snap.get("daily_floor"))
+        lock = json.loads(row["open_lock"] or "{}")
+        if (not preflight and lock.get("kind")=="read_retry" and snap.get("reference_card_id")
+                and reference_at>=max(now-330,entry_day_window(now)["start"]) and snap.get("daily_floor") is not None
+                and snap.get("max_drawdown_floor") is not None and not cards.risk_error(risk,complete=True)):
+            db.execute("UPDATE accounts SET open_lock=NULL WHERE worker_id=? AND name=?",(wid,name))
         if not preflight:
             previous = json.loads(row["risk"] or "{}")
             for field in cards.AMOUNTS:
@@ -427,6 +436,8 @@ class Bridge:
                 if "cards" in body:
                     require(body.get("page","").rstrip("/")=="/accounts","需要活跃账户页面",409)
                     reading = obj(body["cards"])
+                    if reading.get("full") and plugin_version_parts(body.get("plugin_version")) >= (1,9,0,0):
+                        require(reading.get("source_at") is not None,"完整活动账户清单缺少平台读取时间",409)
                     ack = cards.update(db, wid, sid, reading, now)
                     if "scan_id" in reading:
                         row = portfolio.owned(db, reading["scan_id"], wid, sid)
@@ -474,7 +485,7 @@ class Bridge:
                     validate_target(cmd, *target(db, cmd), now)
                     check_reservations(db, cmd, now)
                     if cmd["action"]=="order.open":
-                        require(plugin_version_parts(body.get("plugin_version")) >= (1,8,0,0), "开仓前请重新加载 1.8.0 或更高版本插件",409)
+                        require(plugin_version_parts(body.get("plugin_version")) >= (1,9,0,0), "开仓前请重新加载 1.9.0 或更高版本插件",409)
                     if cmd["action"] == "profit.available" or (cmd.get("strategy_payout") or {}).get("quote_id"):
                         require(plugin_version_parts(body.get("plugin_version")) >= (1,7,1,0),
                                 "读取页面可领额需要 1.7.1 或更高版本插件",409)
@@ -506,7 +517,6 @@ class Bridge:
         snap = obj(obs.get("snapshot"))
         day = entry_day_window(now)
         number(snap.get("observed_at"),"交易页核对时间",max(cmd["claimed_at"]-1,now-15,day["start"]),min(now+5,day["end"]))
-        risk = cards.from_trade(snap)
         _, account = target(db,cmd)
         expected = cmd.get("expected_risk",{})
         require(account and account["present"] and not account["ambiguous"],"账户已消失或名称不唯一",409)
@@ -517,6 +527,23 @@ class Bridge:
             result = {"reselect":True,"changed":["card_id"],"reason":reason}
             finish(db,cmd["id"],"cancelled",now,reason,result)
             return {**result,"approved":False}
+        reference_at = snap.get("reference_at")
+        identity_verified = bool(card_id and snap.get("reference_card_id")==card_id)
+        recent = (snap.get("reference_source")=="active_accounts" and type(reference_at) in (int,float)
+                  and max(now-330,day["start"]) <= reference_at <= min(now+5,day["end"]))
+        if not identity_verified:
+            issue = "交易页未确认当前平台账户身份或阶段"
+            lock = account.get("open_lock") or {}
+            if lock.get("until",0)<=now or lock.get("kind")=="read_retry":
+                lock = {"kind":"read_retry","until":now+45,"reason":issue,"card_id":card_id}
+                db.execute("UPDATE accounts SET open_lock=? WHERE worker_id=? AND name=?",(dump(lock),wid,cmd["account"]))
+            result = {"reselect":True,"approved":False,"reason":issue,"open_lock":lock}
+            finish(db,cmd["id"],"cancelled",now,issue,result)
+            return result
+        if not recent:
+            snap = {key:value for key,value in snap.items() if key not in ("daily_floor","max_drawdown_floor","daily_reset_equity","reference_at")}
+            obs = {**obs,"snapshot":snap}
+        risk = cards.from_trade(snap)
         actual = {**risk,"phase":obs.get("phase"),"category":obs.get("category"),"card_id":card_id}
         current = {**(account["risk"] or {}),"phase":account["phase"],"category":account["category"],"card_id":card_id}
         changed = sorted(k for k in actual if current.get(k)!=actual[k])
@@ -535,12 +562,14 @@ class Bridge:
         if qty is None and "micro" in cmd["params"]:
             qty = cmd["params"]["micro"]*2
         min_stop = number(qty,"实际 Vest 数量",0.000001,1e12)*0.25 if qty is not None else None
-        if (stop["remaining_drawdown"] is None or snap.get("daily_floor") != floor["floor"] or
-                snap["observed_at"] != floor["observed_at"]):
+        if risk["daily_unlimited"]:
+            issue = issue or "该账户无每日亏损底线，当前止损策略不适用"
+        elif (not recent or stop["remaining_drawdown"] is None or snap.get("daily_floor") != floor["floor"] or
+                reference_at != floor["observed_at"]):
             issue = issue or "交易页未读到本交易日的爆仓线"
         elif stop["remaining_max_drawdown"] is None:
             issue = issue or "交易页未读到已用回撤和最大回撤上限"
-        elif ("omit_floor_gap_below" in cmd["params"] or "omit_stop_below" in cmd["params"]) and stop["distance_to_max_floor"] is None:
+        elif stop["distance_to_max_floor"] is None:
             issue = issue or "交易页未读到最大回撤线，无法核对免止损条件"
         elif stop["distance_to_max_floor"] is not None and stop["distance_to_max_floor"] <= 0:
             issue = issue or "账户价值已触及最大回撤线"
@@ -552,10 +581,11 @@ class Bridge:
             db.execute("UPDATE accounts SET risk=? WHERE worker_id=? AND name=?",(dump(risk),wid,cmd["account"]))
         lock = account.get("open_lock")
         reason = ""
-        if lock and now < lock["until"]:
+        if lock and now < lock["until"] and lock.get("kind")!="read_retry":
             reason = lock["reason"]
         elif issue:
-            lock = {"until":day["end"],"reason":issue,"card_id":card_id}
+            transient = issue in cards.READ_FAILURES
+            lock = {"kind":"read_retry" if transient else "risk","until":now+45 if transient else day["end"],"reason":issue,"card_id":card_id}
             db.execute("UPDATE accounts SET open_lock=? WHERE worker_id=? AND name=?",(dump(lock),wid,cmd["account"]))
             reason = issue
         elif cmd["phase"] != actual["phase"]:

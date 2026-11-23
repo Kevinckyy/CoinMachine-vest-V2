@@ -87,6 +87,11 @@
   }
   if(sessionStorage.getItem('purchased')) accounts.push(['Gamma','eval','Evaluation','1/2','$1000.00']);
   if(sessionStorage.getItem('scanReplacement')) accounts.splice(1,1,['Gamma','eval','Evaluation','1/2','$1,275.00']);
+  sessionStorage.setItem('vest-active-account:fixture','Alpha');
+  const nativeRows=accounts.map(([name,code],index)=>({id:name,attempt_index:index,status:2,step:1,steps_total:2,
+    stage:code==='eval'?1:2,account_type:code==='eval'?2:3,max_daily_loss_pct:'0.03',daily_reset_balance:'1000',
+    daily_loss_floor:name==='Beta'?'4719.37':'970',max_drawdown_limit:'750'}));
+  fetch('https://api-gateway.hz.vestmarkets.com/v3/capital/accounts/active');
   renderCards();
   if(onAccounts && sessionStorage.getItem('partialDirectory')) {
     const grid=document.querySelector('#deskAccounts .grid');
@@ -173,6 +178,7 @@
       const item=document.createElement('button');item.dataset.testid='account-item-'+code;
       item.innerHTML='<span class="truncate">'+name+'</span><span>'+category+'</span><span>'+phase+'</span>';
       item.onclick=()=>{
+        sessionStorage.setItem('vest-active-account:fixture',name);
         trace('select',name);
         trigger.innerHTML=item.innerHTML;
         document.querySelector('[data-testid="account-value"]').textContent=tradeEquity(name,equity);

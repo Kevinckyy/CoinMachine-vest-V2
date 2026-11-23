@@ -283,6 +283,9 @@ function positionCount(a) {
   if (a.card && (a.card_at || 0) >= (a.observed_at || 0)) return a.card.active_positions;
   return a.snapshot.position_open === true ? 1 : a.snapshot.position_open === false ? 0 : null;
 }
+function openLockLabel(a) {
+  return a.open_lock?.kind==='read_retry' ? '等待读数重试' : '开仓风控锁定';
+}
 function openLockDetail(a) {
   return a.open_locked ? '<small>'+esc(a.open_lock.reason)+' · '+time(a.open_lock.until)+' 后重新核验</small>' : '';
 }
@@ -386,7 +389,7 @@ function renderAccounts() {
       <td>${pnl}</td><td>${positionCount(a) ?? '—'}</td>
       <td>${risk.daily_unlimited ? '无限额' : money(risk.daily_loss)+' / '+money(risk.daily_limit)}</td><td>${money(risk.drawdown)} / ${money(risk.drawdown_limit)}</td>
       <td>${money(risk.equity)}</td><td class="cell">${money(a.daily_floor?.floor)}<small>${a.daily_floor?.source === 'platform' ? '页面已读取' : '等待页面读取'}</small></td>
-      <td>${risk.health == null ? '—' : esc(risk.health)+'%'}</td><td class="cell">${a.open_locked ? '开仓风控锁定' : a.candidate ? '可候选' : a.in_pool ? '入池待选' : '—'}${openLockDetail(a)}</td>
+      <td>${risk.health == null ? '—' : esc(risk.health)+'%'}</td><td class="cell">${a.open_locked ? openLockLabel(a) : a.candidate ? '可候选' : a.in_pool ? '入池待选' : '—'}${openLockDetail(a)}</td>
       <td class="cell">${time(Math.max(a.card_at || 0,a.observed_at || 0,a.portfolio?.observed_at || 0))}${a.portfolio ? '<small>详情 '+time(a.portfolio.observed_at)+(a.portfolio.missing.length ? ' · 字段不全' : '')+'</small>' : ''}</td><td><div class="actions">${btn('account','管理','link',key)}${btn('accountCmd','指令','link',key)}</div></td></tr>`;
   });
   const node = state.nodes.find(n=>n.id===selectedNode);

@@ -63,20 +63,33 @@
     return items;
   }
   const membership = items => JSON.stringify(items.map(x => [x.name,x.id,x.category,x.phase]).sort((a,b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
-  async function read(full, guard) {
+  function nativeItems(snapshot, cards, previous) {
+    const byId = new Map(cards.filter(c=>c.id).map(c=>[c.id,c]));
+    const activeIds = new Set(snapshot.rows.map(row=>row.id));
+    if (byId.size!==cards.length || cards.some(card=>!activeIds.has(card.id))) return null;
+    return snapshot.rows.map(row=>{
+      const card=byId.get(row.id);
+      return {...card,id:row.id,name:card?.name || previous?.get(row.id)?.name || row.name,
+        phase:row.phase,category:row.category,active_positions:card?.active_positions ?? null};
+    });
+  }
+  async function read(full, guard, native, previous, since=0) {
     const deadline = Date.now() + (full ? 12000 : 1500);
     let prior;
     do {
       guard();
-      const items = sample();
-      if (items) {
+      const cards = sample();
+      const source = cards && await native();
+      if (cards && source && source.at >= since && Date.now()/1000-source.at<=330) {
+        const items=nativeItems(source,cards,previous);
+        if (!items) { prior=undefined; await new Promise(resolve=>setTimeout(resolve,220)); continue; }
         const signature = membership(items);
-        if (prior === signature) return {items, observed_at:Date.now()/1000};
+        if (prior === signature) return {items,observed_at:Date.now()/1000,source_at:source.at,source};
         prior = signature;
       } else prior = undefined;
       await new Promise(resolve => setTimeout(resolve,220));
     } while (Date.now() < deadline);
-    throw Error('未读到完整的活跃账户卡片，请检查登录状态、筛选和页面加载情况');
+    throw Error('未读到完整的活动账户清单，请等待页面加载');
   }
   const monitorFields = ['active_positions','pnl','drawdown','drawdown_limit','daily_loss','daily_limit'];
   const directoryFields = [...monitorFields,'pnl_percent','equity','health'];
@@ -98,5 +111,5 @@
     }
     return result;
   }
-  globalThis.VestCards = {read,sample,membership,index,changes};
+  globalThis.VestCards = {read,sample,membership,index,changes,nativeItems};
 })();

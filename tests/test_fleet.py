@@ -38,6 +38,7 @@ class FleetTest(unittest.TestCase):
             self.report(nid, inventory=[dict(name="Shared", category="eval", phase="1/2"),
                                         dict(name="Only-" + nid, category="eval", phase="1/2"),
                                         dict(name="Main", category="default")])
+            self.card_report(nid)
             self.observe(nid, "Shared")
             self.observe(nid, "Only-" + nid)
             self.center.sync(nid)
@@ -79,6 +80,10 @@ class FleetTest(unittest.TestCase):
                 self.assertTrue(checked["approved"],checked)
                 body["proof"] = {"quantity":2,**body.get("proof",{}),"stop_loss":checked["stop_loss"]}
             body["observation"] = obs
+        if op in ("intent","preflight") and body.get("observation"):
+            obs = body["observation"]
+            body["observation"] = {**obs,"snapshot":{"reference_at":obs["snapshot"]["observed_at"],"reference_source":"active_accounts",
+                                   "reference_card_id":"card-"+obs["name"],**obs["snapshot"]}}
         return self.nodes[nid].plugin(op, {**self.plugin_meta, **body})
 
     def report(self, nid, **body):
@@ -95,9 +100,9 @@ class FleetTest(unittest.TestCase):
     def card_report(self, nid, items=None, full=True):
         bridge = self.nodes[nid]
         if items is None:
-            items = [{"name":a["name"],"category":a["category"],"phase":a["phase"],"active_positions":0}
+            items = [{"name":a["name"],"id":"card-"+a["name"],"category":a["category"],"phase":a["phase"],"active_positions":0}
                      for a in bridge.status()["accounts"] if a["present"]]
-        return self.plugin(nid,"report",page="/accounts",cards=dict(items=items,full=full,observed_at=self.time,
+        return self.plugin(nid,"report",page="/accounts",cards=dict(items=items,full=full,observed_at=self.time,source_at=self.time,
                            generation=bridge.status()["card_generation"]))
 
     def start_ready(self,nid):
@@ -126,7 +131,7 @@ class FleetTest(unittest.TestCase):
 
     def scan_directory(self, key, names, **changes):
         return self.report("east", page="/accounts", cards={
-            "generation": 0, "full": True, "observed_at": self.time,
+            "generation": 0, "full": True, "observed_at": self.time,"source_at":changes.get("observed_at",self.time),
             "items": [self.card(name) for name in names], "scan_id": key, **changes})
 
     def test_portfolio_requires_new_directory_and_local_cache_before_each_scan(self):
@@ -179,7 +184,8 @@ class FleetTest(unittest.TestCase):
 
     def test_portfolio_skips_ambiguous_missing_and_partial_accounts(self):
         key = self.start_portfolio_scan()
-        self.scan_directory(key, ["Twice", "Missing", "Partial", "Unlimited", "Twice"])
+        names = ["Twice","Missing","Partial","Unlimited","Twice"]
+        self.scan_directory(key,names,items=[self.card(n) for n in names[:-1]]+[self.card("Twice",id="other-id")])
         self.assertEqual(self.plugin("east","poll",cached_scan=key)["scan"]["target"]["name"], "Missing")
         for name, detail in [("Missing", {"error":"选择器中无此账户"}),
                 ("Partial", {"values":{"health":40,"equity":0,"observed_at":self.time}}),
@@ -439,12 +445,15 @@ class FleetTest(unittest.TestCase):
         self.assertEqual([c["account"] for c in state["commands"]],["New"])
         self.assertEqual({a["name"] for a in state["accounts"] if a["in_pool"]},{"New"})
         self.time += 1
-        self.card_report("east",[new,new],full=False)
+        self.card_report("east",[new,{**new,"id":"other-id"}],full=False)
         self.center.sync("east")
         by_name = {a["name"]:a for a in self.center.state("east")["accounts"]}
         self.assertTrue(by_name["New"]["ambiguous"])
         self.assertFalse(by_name["New"]["in_pool"])
-        self.assertFalse(by_name["Shared"]["present"])
+        self.assertTrue(by_name["Shared"]["present"])
+        self.card_report("east",[new])
+        self.center.sync("east")
+        self.assertFalse(next(a for a in self.center.state("east")["accounts"] if a["name"]=="Shared")["present"])
         self.assertTrue(next(a for a in self.center.state("west")["accounts"] if a["name"]=="Shared")["present"])
 
     def test_unclassified_new_card_is_read_once_before_using_stage_policy(self):
@@ -578,6 +587,49 @@ class FleetTest(unittest.TestCase):
                 self.assertFalse(check["approved"])
                 self.assertTrue(check["open_lock"])
                 self.assertFalse(self.nodes["east"].get(key)["intents"])
+
+    def test_platform_identity_and_stale_floor_retry_without_a_day_lock(self):
+        for name,proof in (("Other",{"reference_card_id":"wrong"}),("Stale",{"reference_at":self.time-331})):
+            self.card_report("east",[self.card(name)])
+            self.center.sync("east")
+            self.center.submit(name,self.req(name=name,action="order.open",params=dict(side="buy",micro=1)))
+            self.center.sync("east")
+            self.plugin("east","poll")
+            reading=self.reading(name)
+            reading["snapshot"].update(proof)
+            result=self.plugin("east","preflight",id=name,observation=reading)
+            self.assertEqual(result["open_lock"]["kind"],"read_retry")
+            self.assertLess(result["open_lock"]["until"]-self.time,60)
+            self.assertFalse(self.nodes["east"].get(name)["intents"])
+            verified=self.reading(name)
+            verified["snapshot"].update(reference_card_id="card-"+name,reference_at=self.time)
+            self.report("east",observation=verified)
+            self.assertIsNone(next(a for a in self.nodes["east"].status()["accounts"] if a["name"]==name)["open_lock"])
+
+    def test_rename_preserves_settings_and_lock_while_reused_name_starts_clean(self):
+        self.card_report("east",[self.card("Original")])
+        self.center.sync("east")
+        self.center.submit("unhealthy",self.req(name="Original",action="order.open",params=dict(side="buy",micro=1)))
+        self.center.sync("east")
+        self.plugin("east","poll")
+        reading=self.reading("Original")
+        reading["snapshot"]["account_health"]=12
+        check=self.plugin("east","preflight",id="unhealthy",observation=reading)
+        self.assertEqual(check["open_lock"]["kind"],"risk")
+        self.center.account_config(dict(node_id="east",worker_id="browser",account="Original",enabled=False,note="keep"))
+        self.card_report("east",[self.card("Renamed",id="card-Original"),self.card("Original",id="new-id")])
+        self.center.sync("east")
+        rows={a["name"]:a for a in self.center.state("east")["accounts"]}
+        self.assertEqual((rows["Renamed"]["note"],rows["Renamed"]["enabled"],rows["Renamed"]["open_locked"]),("keep",False,True))
+        self.assertEqual((rows["Original"]["note"],rows["Original"]["in_pool"],rows["Original"]["open_lock"]),("",True,None))
+        self.assertNotEqual(rows["Original"]["account_ref"],rows["Renamed"]["account_ref"])
+
+    def test_out_of_order_native_list_cannot_remove_an_account(self):
+        self.card_report("east",[self.card("Keep")])
+        self.time+=1
+        with self.assertRaisesRegex(Problem,"过期的平台账户清单"):
+            self.report("east",page="/accounts",cards=dict(generation=0,full=True,items=[],source_at=self.time-2,observed_at=self.time))
+        self.assertTrue(next(a for a in self.nodes["east"].status()["accounts"] if a["name"]=="Keep")["present"])
 
     def test_default_gap_exemption_rechecks_both_lines_before_click(self):
         self.center.strategy("config",dict(live_take_profit_mode="ratio",live_reward_ratio=1,
@@ -1198,9 +1250,9 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(check["action"],"accounts.list")
         self.time += 1
         self.card_report("east",cards,full=full)
-        rows = [{k:c[k] for k in ("name","phase","category")} for c in cards]
+        rows = [{k:c[k] for k in ("id","name","phase","category")} for c in cards]
         self.plugin("east","result",id=check["id"],ok=True,
-                    result=dict(source="accounts",full=full,count=len(rows),inventory=rows))
+                    result=dict(source="accounts",source_at=self.time,full=full,count=len(rows),inventory=rows))
         self.center.sync("east")
         self.center.decide()
 
@@ -1235,7 +1287,7 @@ class FleetTest(unittest.TestCase):
         fills = [self.fill_exam_order() for _ in range(2)]
         self.time += 1
         next_cards = [self.card("Three"),self.card("Four")]
-        self.card_report("east",next_cards,full=False)
+        self.card_report("east",next_cards)
         self.center.sync("east")
         self.center.decide()
         self.center.db.close()
@@ -1304,7 +1356,7 @@ class FleetTest(unittest.TestCase):
         self.center.sync("east")
         opened = self.fill_exam_order()
         self.time += 1
-        self.card_report("east",[],full=False)
+        self.card_report("east",[])
         self.center.sync("east")
         self.center.decide()
         self.finish_exit_list([self.card("Visible",active_positions=1)])
