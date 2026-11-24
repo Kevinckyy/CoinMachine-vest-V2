@@ -399,7 +399,13 @@ function nodesView() {
   const rows = state.nodes.map(n => `<tr><td class="cell"><strong>${esc(n.label)}</strong><small>${esc(n.id)}</small></td><td>${tag(n.online ? '在线' : '离线', n.online ? 'good' : '')}<small class="record-note"> ${esc([n.error,n.history_error,n.log_error].filter(Boolean).join(' · '))}</small></td><td class="num">${esc(n.url)}</td><td class="num">${time(n.last_seen)}</td><td><div class="actions">${btn('nodeAccounts', '账户', 'link', n.id)}${btn('nodeStrategy', '策略', 'link', n.id)}${btn('nodeLogs', '日志', 'link', n.id)}${btn('editNode', '编辑', 'link', n.id)}</div></td></tr>`);
   const workers = state.workers.map(w => {
     const comparison = {current:'与中心一致',behind:'待更新',ahead:'高于中心版本',unknown:'待确认'}[w.version_status] || '待确认';
-    return `<tr><td class="cell"><strong>${esc(w.label)}</strong><small>${esc(nodeLabel(w.node_id))}</small></td><td>${tag(w.online ? '在线' : '离线', w.online ? 'good' : '')}</td><td>${tag(w.mode === 'execute' ? '执行' : '只读', w.mode === 'execute' ? 'info' : '')}</td><td>${esc(w.page) || '—'}<small> ${esc(w.error)}</small></td><td class="cell">${esc(w.plugin_version || '未上报')} · ${comparison}<small>中心版本 ${esc(state.plugin_version || '未知')}${w.release ? ' · '+version(w.release) : ''}</small></td><td class="num">${time(w.last_seen)}</td><td>${btn('workerCmd', '下达指令', 'link', JSON.stringify([w.node_id, w.worker_id]))}</td></tr>`;
+    const mode = w.mode === 'execute' || w.pending_mode === 'execute' ? 'readonly' : 'execute';
+    const label = w.pending_mode === 'execute' ? '撤回执行授权' : mode === 'execute' ? '切为执行' : '切为只读';
+    const reason = !w.online || !w.page ? '等待浏览器在线并绑定页面' : !w.mode_control ? '需升级桥和插件至 1.12.0' : '';
+    const pending = w.pending_mode ? '<small>等待插件确认'+(w.pending_mode==='execute'?'执行':'只读')+'</small>' : '';
+    const control = reason ? '<small>'+reason+'</small>' : w.pending_mode === 'readonly' ? '' :
+      btn('workerMode',label,'link',JSON.stringify([w.node_id,w.worker_id,w.session_id,mode]));
+    return `<tr><td class="cell"><strong>${esc(w.label)}</strong><small>${esc(nodeLabel(w.node_id))}</small></td><td>${tag(w.online ? '在线' : '离线', w.online ? 'good' : '')}</td><td class="cell">${tag(w.mode === 'execute' ? '执行' : '只读', w.mode === 'execute' ? 'info' : '')}${pending}${control}</td><td>${esc(w.page) || '—'}<small> ${esc(w.error)}</small></td><td class="cell">${esc(w.plugin_version || '未上报')} · ${comparison}<small>中心版本 ${esc(state.plugin_version || '未知')}${w.release ? ' · '+version(w.release) : ''}</small></td><td class="num">${time(w.last_seen)}</td><td>${btn('workerCmd', '下达指令', 'link', JSON.stringify([w.node_id, w.worker_id]))}</td></tr>`;
   });
   const releases = state.nodes.map(n => {
     const job = n.update;
@@ -674,6 +680,12 @@ const operations = {
   leavePool: key => setPoolMembership(key,false),
   send: () => commandForm(),
   workerCmd: value => commandForm(JSON.parse(value)),
+  workerMode: async value => {
+    const [node,worker,session_id,mode] = JSON.parse(value);
+    const reply = await api('nodes/'+node+'/workers/'+worker+'/mode','PUT',{session_id,mode});
+    notify(reply.pending_mode ? '已送达节点，等待插件确认' : '节点已确认当前权限');
+    await refresh();
+  },
   accountCmd: value => commandForm(JSON.parse(value)),
   strategyConfig: id => strategyConfig(id),
   strategyDefaults: () => strategyEditor('defaults'),

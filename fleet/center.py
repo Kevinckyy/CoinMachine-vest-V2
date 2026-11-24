@@ -296,6 +296,25 @@ class Center:
         with self.db.tx() as db:
             return updates.agent(db, nid, op, body, self.clock())
 
+    def worker_mode(self, nid, wid, body):
+        fields(body,("mode","session_id"))
+        mode = choice(body.get("mode"),{"readonly","execute"},"浏览器模式")
+        sid = ident(body.get("session_id"))
+        with self.db.tx() as db:
+            node = db.execute("SELECT * FROM nodes WHERE id=?",(nid,)).fetchone()
+            require(node,"找不到该节点",404)
+            node = dict(node)
+            worker = next((w for w in json.loads(node["snapshot"])["workers"] if w["worker_id"]==wid),None)
+            now = self.clock()
+            require(worker and not node["error"] and now-(node["last_seen"] or 0) < NODE_TTL
+                    and now-worker["last_seen"] < WORKER_TTL and worker.get("page"),"节点或浏览器离线、未绑定",409)
+            require(worker["session_id"]==sid,"浏览器会话已变化，请刷新后重试",409)
+            require(worker.get("mode_control"),"请升级节点桥和插件至 1.12.0",409)
+            if mode == "execute":
+                require(not updates.active(db,nid),"节点更新期间不能切换为执行模式",409)
+        return self.transport(node,"PUT","/v1/status",{"instance_id":node["instance_id"],
+                              "mode_request":{"worker_id":wid,"session_id":sid,"mode":mode}})
+
     def deployment(self, nid, key, op, body):
         with self.db.tx() as db:
             if op == "create":
@@ -362,6 +381,7 @@ class Center:
         route = (req["node_id"], req["worker_id"])
         node, worker = nodes.get(route[0]), workers.get(route)
         require(node and node["online"] and worker and worker["online"], "节点或浏览器离线", 409)
+        require(req["action"] not in WRITE or not worker.get("pending_mode"),"浏览器权限正在切换",409)
         require(not updates.active(db,route[0]), "节点正在等待或执行软件更新", 409)
         require(not node["agent_release"] or node["agent_release"] == node["release"], "等待同步节点桥的新版本", 409)
         require(not node["release"] or worker.get("release") == node["release"], "浏览器尚未加载当前节点版本", 409)

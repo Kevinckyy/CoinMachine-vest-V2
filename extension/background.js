@@ -30,6 +30,7 @@ function publicBinding({
   session_id,
   worker_id,
   mode,
+  mode_ticket,
   label,
   generation
 }) {
@@ -42,6 +43,7 @@ function publicBinding({
     session_id,
     worker_id,
     mode,
+    ...(mode_ticket ? {mode_ticket} : {}),
     label,
     generation
   };
@@ -54,9 +56,9 @@ async function revoke(previous) {
     }).catch(() => {});
   }
 }
-async function rotate(old, cfg, tabId, pageId, mode) {
+async function rotate(old, cfg, tabId, pageId, mode, ticket) {
   await revoke(old);
-  const generation = Math.max((cfg.generation || 0) + 1, Date.now());
+  const generation = Math.max((cfg.generation || 0) + 1, (old?.generation || 0) + 1, Date.now());
   const next = {
     tabId,
     pageId,
@@ -64,6 +66,7 @@ async function rotate(old, cfg, tabId, pageId, mode) {
     session_id: crypto.randomUUID(),
     generation,
     label: cfg.label,
+    ...(ticket ? {mode_ticket:ticket} : {}),
     mode
   };
   await chrome.storage.local.set({
@@ -77,6 +80,34 @@ async function rotate(old, cfg, tabId, pageId, mode) {
     binding: next
   });
   return next;
+}
+
+async function confirmRemoteMode(owner, cfg, page) {
+  try {
+    await post('heartbeat',{...publicBinding(owner),page},cfg);
+  } catch (err) {
+    const safe = await rotate(owner,cfg,owner.tabId,owner.pageId,'readonly');
+    await post('heartbeat',{...publicBinding(safe),page},cfg).catch(()=>{});
+    throw err;
+  }
+  const confirmed = {...owner};
+  delete confirmed.mode_ticket;
+  await chrome.storage.session.set({binding:confirmed});
+  return confirmed;
+}
+
+// Called under the binding lock. A delayed reply can apply only to its original document and session.
+async function applyRemoteMode(owner,cfg,offer) {
+  const current = await binding();
+  if (current?.session_id !== owner.session_id || current.pageId !== owner.pageId)
+    throw Error('浏览器授权已变化');
+  const tab = await chrome.tabs.get(owner.tabId);
+  if (!tab.url || new URL(tab.url).origin !== VEST || (await identifyPage(owner.tabId))?.pageId !== owner.pageId)
+    throw Error('绑定页面已变化');
+  if (!['readonly','execute'].includes(offer.mode) || !offer.ticket) throw Error('远程权限请求无效');
+  await chrome.storage.session.remove('manualView');
+  const next = await rotate(owner,cfg,owner.tabId,owner.pageId,offer.mode,offer.ticket);
+  return confirmRemoteMode(next,cfg,new URL(tab.url).pathname);
 }
 async function post(op, payload, cfg) {
   const response = await fetch(BASE + op, {
@@ -250,6 +281,7 @@ async function context(message, sender) {
     }
   }
   if (message.session_id && message.session_id !== owner.session_id) throw Error('浏览器授权已变化');
+  if (owner.mode_ticket) owner = await confirmRemoteMode(owner,cfg,new URL(sender.url).pathname);
   return {
     owner,
     cfg
@@ -513,6 +545,7 @@ async function pollWork(owner,cfg,meta,url,documentId,historyPending,noticeKind)
     data = await post('poll',{...meta,notice_kind:noticeKind,manual_view:manual,cached_scan:saved.cachedScan?.sid===owner.session_id ? saved.cachedScan.id : null},cfg);
     archiveSupported=data.archive_version===1;
   }
+  if (data.mode_request) return data;
   if (archiveSupported && documentId && historyPending) {
     try {await stageArchive(owner,documentId);}
     catch (err) {await chrome.storage.session.set({archiveError:'历史归档等待保存：'+err.message});}
@@ -712,6 +745,10 @@ async function handle(message, sender) {
   else if (op === 'report' && payload.cards) data = await exclusive(() => reportCards(owner,cfg,payload));
   else if (op === 'report' && payload.metrics) data = await exclusive(() => reportMetrics(owner,cfg,payload));
   else data = await post(op,payload,cfg);
+  if ((op === 'poll' || op === 'heartbeat') && data.mode_request) {
+    const next = await exclusive(()=>applyRemoteMode(owner,cfg,data.mode_request));
+    return {bound:true,session:publicBinding(next),data:{command:null}};
+  }
   if (op==='notice.reserve' && data.authorize && payload.kind==='live')
     await chrome.storage.session.set({noticeRedirect:{sid:owner.session_id,from:owner.pageId,expires:Date.now()+20000}});
   if (op==='notice.complete') {

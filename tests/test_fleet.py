@@ -50,6 +50,57 @@ class FleetTest(unittest.TestCase):
         for bridge in self.nodes.values():
             bridge.db.close()
 
+    def test_center_switches_only_the_bound_online_browser(self):
+        def switch(mode,session="session-1"):
+            return self.center.worker_mode("east","browser",{"mode":mode,"session_id":session})
+        def change(offer,session,generation):
+            return self.plugin("east","heartbeat",mode=offer["mode"],mode_ticket=offer["ticket"],
+                               session_id=session,generation=generation)
+        self.assertEqual(switch("readonly"),{"mode":"execute","pending_mode":"readonly"})
+        offer = self.plugin("east","poll")["mode_request"]
+        self.assertEqual(self.plugin("east","heartbeat")["mode_request"],offer)
+        self.assertNotIn("mode_request",self.plugin("west","poll"))
+        with self.assertRaisesRegex(Problem,"权限正在切换"):
+            self.plugin("east","notice.reserve")
+        with self.assertRaisesRegex(Problem,"权限正在切换"):
+            self.plugin("east","intent",stage="close",id="old-lease")
+        self.center.sync("east")
+        worker = self.center.state("east")["workers"][0]
+        self.assertEqual((worker["mode"],worker["pending_mode"]),("execute","readonly"))
+        change(offer,"second",2)
+        self.center.sync("east")
+        self.assertEqual(self.center.state("east")["workers"][0]["mode"],"readonly")
+        with self.assertRaisesRegex(Problem,"会话已变化"):
+            switch("execute")
+        switch("execute","second")
+        readonly = dict(mode="readonly",session_id="second",generation=2)
+        grant = self.plugin("east","poll",**readonly)["mode_request"]
+        switch("readonly","second")
+        with self.assertRaisesRegex(Problem,"远程授权已过期"):
+            change(grant,"stale",3)
+        switch("execute","second")
+        grant = self.plugin("east","heartbeat",**readonly)["mode_request"]
+        self.time += 26
+        with self.assertRaisesRegex(Problem,"远程授权已过期"):
+            change(grant,"stale",3)
+        with self.assertRaisesRegex(Problem,"离线"):
+            switch("execute","second")
+        self.plugin("east","heartbeat",**readonly)
+        self.center.sync("east")
+        switch("execute","second")
+        grant = self.plugin("east","poll",**readonly)["mode_request"]
+        change(grant,"third",3)
+        self.center.sync("east")
+        worker = self.center.state("east")["workers"][0]
+        self.assertEqual((worker["mode"],worker["session_id"],worker["pending_mode"]),("execute","third",None))
+        self.plugin("east","heartbeat",mode="readonly",session_id="local",generation=4)
+        self.center.sync("east")
+        switch("execute","local")
+        old_grant = self.plugin("east","poll",mode="readonly",session_id="local",generation=4)["mode_request"]
+        self.plugin("east","heartbeat",mode="readonly",session_id="reloaded",generation=5)
+        with self.assertRaisesRegex(Problem,"远程授权已过期"):
+            change(old_grant,"late",6)
+
     def transport(self, node, verb, path, data=None):
         bridge = self.nodes[node["id"]]
         if path.startswith("/v1/status?since="):

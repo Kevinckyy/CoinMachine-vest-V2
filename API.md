@@ -17,6 +17,7 @@
 | GET | `/v1/nodes/{node_id}/logs?level=warning&offset=0` | 该节点的运行事件。可选 `level=info/warning/error`，返回 `total,items`，每页 50 条。事件的 `source` 为 `local`（中心）或 `bridge` |
 | GET | `/v1/analytics` | 分节点、分阶段的盈亏、出金和历史明细，筛选参数见下文 |
 | PUT | `/v1/nodes/{node_id}` | 登记或更新 `{label,url,token}`。更新时可省略密钥 |
+| PUT | `/v1/nodes/{node_id}/workers/{worker_id}/mode` | 对已绑定的在线浏览器提交 `{session_id,mode}`，模式为 `readonly` 或 `execute`。返回桥接收时的 `mode,pending_mode`，通过中心状态中对应浏览器的 `mode` 和新会话核验结果。待确认的执行请求有效期为 25 秒，绑定变更会清除旧请求。此功能要求中心、桥与插件均为 1.12.0 或更高版本。 |
 | POST | `/v1/accounts/config` | 通过 `node_id,worker_id,account` 定位，更新 `alias,note,enabled,in_pool,account_ref` 中指定的字段 |
 | PUT | `/v1/commands/{id}` | 用调用方生成的唯一 ID 创建指令，重复提交相同内容返回原记录 |
 | GET | `/v1/commands?node_id=cloud-01&status=unknown&offset=0` | 可按节点和状态筛选，按创建时间倒序，每页 50 条，返回 `total,items` |

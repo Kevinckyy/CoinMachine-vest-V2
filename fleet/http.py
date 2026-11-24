@@ -117,6 +117,8 @@ def make_server(bind, port, app, token, plugin_token=None):
                     return app.deployment(ident(keys[1]),ident(keys[3]),"cancel",body)
                 if keys == ["state"] and method == "GET":
                     return app.state(query.get("node_id"), ident(query["since"]) if query.get("since") else None)
+                if len(keys)==5 and keys[0]=="nodes" and keys[2]=="workers" and keys[4]=="mode" and method=="PUT":
+                    return app.worker_mode(ident(keys[1]),ident(keys[3]),body)
                 if keys == ["position-metrics"] and method == "GET":
                     return app.position_metrics(query.get("node_id"))
                 if keys == ["strategy","defaults"] and method == "PUT":

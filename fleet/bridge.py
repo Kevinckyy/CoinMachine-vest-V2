@@ -5,7 +5,7 @@ import time
 import uuid
 from . import cards, daily_floor, ledger, portfolio, reporting, status_delta, strategy_payout, updates
 
-from .protocol import (PHASES, PORTFOLIO_SCAN, PRIMARY, RUN_TTL, TERMINAL, WRITE, Problem, boolean, choice,
+from .protocol import (PHASES, PORTFOLIO_SCAN, PRIMARY, RUN_TTL, TERMINAL, WORKER_TTL, WRITE, Problem, boolean, choice,
                        dump, ident, make_command, number, obj, plugin_version_parts, request, require, string, validate_target)
 from .storage import Database, check_reservations, command, find_command, finish, insert, record
 from .trading_day import entry_day_window
@@ -100,6 +100,8 @@ class Bridge:
             CREATE TABLE IF NOT EXISTS worker_build(worker_id TEXT PRIMARY KEY,release TEXT NOT NULL,
                 portfolio_version INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS update_gate(slot INTEGER PRIMARY KEY CHECK(slot=1),owner TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS worker_mode_requests(
+                worker TEXT PRIMARY KEY, session TEXT NOT NULL, mode TEXT NOT NULL, ticket TEXT NOT NULL, expires REAL);
             CREATE TABLE IF NOT EXISTS account_notices(worker TEXT NOT NULL,platform_id TEXT NOT NULL,kind TEXT NOT NULL,
                 root TEXT NOT NULL,name TEXT NOT NULL,started REAL NOT NULL,completed REAL,PRIMARY KEY(worker,platform_id,kind));
             CREATE UNIQUE INDEX IF NOT EXISTS one_pending_notice ON account_notices(worker) WHERE completed IS NULL;
@@ -137,6 +139,7 @@ class Bridge:
             require(row["node_id"] == self.node_id, "此数据库已属于另一个节点")
             self.instance_id = row["instance_id"]
             db.execute("UPDATE workers SET last_seen=0")
+            db.execute("DELETE FROM worker_mode_requests WHERE mode='execute'")
             ledger.backfill(db)
             if "tracked_position" not in cols:
                 for a in db.execute("SELECT * FROM accounts WHERE present=1 AND ambiguous=0").fetchall():
@@ -151,6 +154,7 @@ class Bridge:
                                        (dump(track), a["worker_id"], a["name"]))
 
     def _expire(self, db, now):
+        db.execute("DELETE FROM worker_mode_requests WHERE expires<=?",(now,))
         for row in db.execute("SELECT * FROM commands WHERE status IN ('queued','running')").fetchall():
             if row["status"] == "queued" and now >= json.loads(row["body"])["expires_at"]:
                 finish(db, row["id"], "expired", now, "插件未在有效期内领取")
@@ -168,7 +172,8 @@ class Bridge:
             workers = []
             for row in db.execute("""SELECT w.*,COALESCE(b.release,'') AS release,COALESCE(b.portfolio_version,0) AS portfolio_version,
                     COALESCE(b.strategy_version,0) AS strategy_version,COALESCE(b.plugin_version,'') AS plugin_version,c.session AS card_session,
-                    c.generation AS card_generation,c.full_at AS cards_full_at FROM workers w
+                    c.generation AS card_generation,c.full_at AS cards_full_at,m.mode AS pending_mode FROM workers w
+                    LEFT JOIN worker_mode_requests m ON m.worker=w.worker_id AND m.session=w.session_id
                     LEFT JOIN worker_build b ON b.worker_id=w.worker_id LEFT JOIN card_sync c ON c.worker=w.worker_id ORDER BY label"""):
                 scan = db.execute("""SELECT id,status,error, json_extract(result,'$.stage') AS stage,
                         json_extract(result,'$.total') AS total,json_extract(result,'$.read') AS read,
@@ -176,6 +181,7 @@ class Bridge:
                         FROM commands WHERE worker=? AND action=? ORDER BY created DESC,id DESC LIMIT 1""",
                                   (row["worker_id"], PORTFOLIO_SCAN)).fetchone()
                 workers.append({**worker_view(row), "portfolio_scan": dict(scan) if scan else None,
+                                "mode_control":plugin_version_parts(row["plugin_version"]) >= (1,12,0,0),
                                 "notice_waiting":self.clock()-self.notice_seen.get(row["worker_id"],-float("inf"))<12})
             snap = {"version": 1, "open_policy_version":daily_floor.OPEN_POLICY_VERSION, "payout_quote_version":1, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
                     "launch_id": self.launch_id, "notice_until": self.notice_until,
@@ -192,6 +198,8 @@ class Bridge:
     def refresh_cards(self, body):
         require(body.get("instance_id")==self.instance_id,"节点数据库身份不匹配",409)
         with self.db.tx() as db:
+            if "mode_request" in body:
+                return self._request_mode(db,obj(body["mode_request"]))
             if "generation" in body:
                 gen = number(body["generation"],"刷新批次",1,2**53-1,True)
                 db.execute("UPDATE card_request SET generation=MAX(generation,?)",(gen,))
@@ -199,6 +207,29 @@ class Bridge:
                 self.notice_until = self.clock()+10 if boolean(body["allow_notices"]) else 0
             require("generation" in body or "allow_notices" in body,"缺少刷新或账户提示操作")
             return {"generation":db.execute("SELECT generation FROM card_request").fetchone()[0]}
+
+    def _request_mode(self, db, request):
+        wid, sid = ident(request.get("worker_id")), ident(request.get("session_id"))
+        mode = choice(request.get("mode"), {"readonly","execute"}, "浏览器模式")
+        now = self.clock()
+        row = db.execute("""SELECT w.*,b.plugin_version,b.release FROM workers w
+                            JOIN worker_build b USING(worker_id) WHERE w.worker_id=?""",(wid,)).fetchone()
+        require(row and row["session_id"] == sid and row["page"] and now-row["last_seen"] < WORKER_TTL,
+                "浏览器离线、未绑定或会话已变化",409)
+        require(plugin_version_parts(row["plugin_version"]) >= (1,12,0,0),"请升级节点桥和插件至 1.12.0",409)
+        if mode == "execute":
+            require((not self.release or row["release"] == self.release) and not db.execute("SELECT 1 FROM update_gate").fetchone(),
+                    "请等待节点与浏览器完成更新",409)
+        if row["mode"] == mode:
+            db.execute("DELETE FROM worker_mode_requests WHERE worker=?",(wid,))
+            return {"mode":mode,"pending_mode":None}
+        self._expire(db,now)
+        prior = db.execute("SELECT mode FROM worker_mode_requests WHERE worker=?",(wid,)).fetchone()
+        if not prior or prior["mode"] != mode:
+            db.execute("INSERT OR REPLACE INTO worker_mode_requests VALUES(?,?,?,?,?)",
+                       (wid,sid,mode,str(uuid.uuid4()),now+WORKER_TTL if mode=="execute" else None))
+            reporting.log(db,self.node_id,now,"browser","中心请求切换为"+("执行" if mode=="execute" else "只读"),worker=wid)
+        return {"mode":row["mode"],"pending_mode":mode}
 
     def _notice(self, db, op, wid, body, now):
         require(body["mode"]=="execute" and now < self.notice_until and not db.execute("SELECT 1 FROM update_gate").fetchone(),
@@ -341,6 +372,14 @@ class Bridge:
             require(generation > row["generation"] or generation == row["generation"]
                     and sid == row["session_id"] and mode == row["mode"], "旧浏览器会话已失效", 409)
         if not row or generation > row["generation"]:
+            if "mode_ticket" in body:
+                offer = db.execute("SELECT * FROM worker_mode_requests WHERE worker=?",(wid,)).fetchone()
+                require(row and offer and offer["session"] == row["session_id"] and offer["ticket"] == body["mode_ticket"]
+                        and sid != row["session_id"] and offer["mode"] == mode,"远程授权已过期或会话已变化",409)
+                if mode == "execute":
+                    require(not db.execute("SELECT 1 FROM update_gate").fetchone() and (not self.release or body.get("release")==self.release),
+                            "节点正在更新，执行授权已撤销",409)
+            db.execute("DELETE FROM worker_mode_requests WHERE worker=?",(wid,))
             for job in db.execute("SELECT * FROM commands WHERE worker=? AND status='queued'", (wid,)).fetchall():
                 finish(db, job["id"], "cancelled", now, "浏览器会话已更换")
             for job in db.execute("SELECT * FROM commands WHERE worker=? AND status='running' AND action=?",
@@ -478,6 +517,11 @@ class Bridge:
                 ledger.archive_rows(db,self.node_id,wid,body.get("items"))
                 return {"accepted":True}
             wid, sid = self._touch(db, body, now)
+            offer = db.execute("SELECT mode,ticket FROM worker_mode_requests WHERE worker=? AND session=?",(wid,sid)).fetchone()
+            if offer:
+                if op in ("heartbeat","poll"):
+                    return {"command":None,"mode_request":dict(offer)}
+                require(op not in ("intent","preflight","notice.reserve"),"浏览器权限正在切换",409)
             if op in ("notice.reserve","notice.complete"):
                 return self._notice(db,op,wid,body,now)
             if op == "heartbeat":

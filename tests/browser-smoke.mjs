@@ -279,6 +279,24 @@ try {
     if(!data.accounts.length || data.accounts.some(a=>!a.fresh))throw Error(JSON.stringify({workers:data.workers.map(w=>[w.mode,w.error,w.page]), accounts:data.accounts.map(a=>[a.name,a.read_error,a.fresh])}));
     return data.accounts.length===2 && data.accounts.every(a=>a.fresh);
   },'extension account discovery');
+  await browserCdp.send('Target.activateTarget',{targetId:ui.targetId});
+  await ui.evaluate("document.querySelector('[data-value=nodes]').click();document.getElementById('refresh').click()");
+  for (const mode of ['execute','readonly']) {
+    const previous=(await api('state?node_id=lab')).workers[0].session_id;
+    await until(async()=>{
+      const values=await ui.evaluate("Array.from(document.querySelectorAll('[data-op=workerMode]'),b=>JSON.parse(b.dataset.value))");
+      if (!values.some(([node,,sid,target])=>node==='lab' && sid===previous && target===mode))
+        throw Error(JSON.stringify({values,text:await ui.evaluate("document.getElementById('content').innerText.slice(-550)"),expected:mode}));
+      return true;
+    },'mode button for the confirmed session');
+    await ui.evaluate(`Array.from(document.querySelectorAll('[data-op=workerMode]')).find(b=>JSON.parse(b.dataset.value)[2]===${JSON.stringify(previous)}).click()`);
+    await until(async()=>{
+      const state=await api('state?node_id=lab'),w=state.workers[0];
+      return w.mode===mode && w.session_id!==previous && !w.pending_mode && state.accounts.every(a=>a.fresh);
+    },'center mode switch confirmed by bound browser: '+mode);
+  }
+  await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
+  await ui.evaluate("document.querySelector('[data-value=overview]').click()");
   const data=await api('state'),worker=data.workers[0];
   assert.equal(worker.mode,'readonly');
   assert.equal(worker.plugin_version,manifest.version);

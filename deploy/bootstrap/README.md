@@ -51,7 +51,7 @@ sudo bash vest-offline/recover.sh
 
 `-PublicIP` 填这台 Windows 节点的地址。首次 SSH 登录需核对中心主机指纹，按现有 SSH 方式认证。非 root SSH 用户需要能用 sudo 非交互执行 `bash /opt/vest-fleet/bootstrap/center.sh bundle ...`。可以用 `-SshPort 2222` 指定 SSH 端口。若中心的实际出站 IP 和控制台入口不同，用 `-CenterSourceIP` 指定 Windows 入站防火墙允许的源 IP。节点使用 GitHub 只读 SSH 部署密钥时加 `-Ssh`。
 
-安装器会通过 SSH 登记该节点并取得专属证书和密钥，通过 HTTPS 验证中心和桥，然后自动打开已加载插件的专用浏览器。首次登录自己的 Vest 账号，进入 `https://next.vestmarkets.com/accounts`，中心即可看到只读浏览器。在中心下达「全量拉取账户列表」验收回执。需要资金操作时，从插件明确选择「允许执行指令」。
+安装器会通过 SSH 登记该节点并取得专属证书和密钥，通过 HTTPS 验证中心和桥，然后自动打开已加载插件的专用浏览器。首次登录自己的 Vest 账号，进入 `https://next.vestmarkets.com/accounts`，中心即可看到只读浏览器。在中心下达「全量拉取账户列表」验收回执。需要执行资金操作时，在中心「服务器 → 浏览器」选择「切为执行」，或在节点插件中选择「允许执行指令」。
 
 遇到 `ssh: connect to host ... port 22: Connection timed out` 时，Windows 尚未连到中心的 SSH 监听端口。若要继续使用 SSH，可在中心用 `sudo ss -lntp` 核对实际端口，在 Windows 用 `Test-NetConnection <中心IP> -Port <SSH端口>` 验证连通性，再通过 `-SshPort` 指定该端口。`-Port` 设置的是 Windows 节点桥的 HTTPS 端口。
 
@@ -84,7 +84,7 @@ sudo bash update-nodes.sh --node cloud-01
 
 节点命令向中心提交更新。重复 `--node` 可选择多台，`--wait 300` 可调整等待时长。终端输出本次 `request_id`，响应丢失后用 `--request-id 原ID` 重试。退出码 2 表示中心仍在等待确认，可以继续在控制台查看该节点的更新记录。需要指定其他已发布版本时，两条命令均支持 `--revision 完整SHA`。
 
-Windows 受管节点的计划任务会自动执行中心指令。若需要在节点上唤醒已安装的任务并查看本地回执，在浏览器用户的 PowerShell 运行 `.\Update-VestNode.ps1 -Revision 完整SHA`，与 `release.json` 放在同一目录时可省略参数。Edge 应加载安装目录的 `node-state\extension`。中心的「服务器 → 浏览器」显示每个浏览器实际上报的插件版本；升级后的执行授权需要在插件中重新确认。
+Windows 受管节点的计划任务会自动执行中心指令。若需要在节点上唤醒已安装的任务并查看本地回执，在浏览器用户的 PowerShell 运行 `.\Update-VestNode.ps1 -Revision 完整SHA`，与 `release.json` 放在同一目录时可省略参数。Edge 应加载安装目录的 `node-state\extension`。中心「服务器 → 浏览器」显示插件实报版本。插件升级后以只读模式重连，操作者可在该行重新授予执行权限。
 
 相同地址与节点 ID 可以重跑，脚本复用原数据库、密钥和浏览器配置。中心与节点叶证书有效期 397 天，剩余不足 30 天时，重跑相应安装命令会重新签发并加载证书。中心 CA 有效期 10 年，应安全备份 `/var/lib/vest-fleet`，并在 CA 到期前安排根证书轮换。浏览器、Caddy、Python 在首次安装时下载，后续宿主运行时升级属主机维护。
 
