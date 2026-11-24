@@ -127,6 +127,10 @@ try {
   const agent=path.join(root,'deploy','node_agent.py');
   execFileSync(python,['-B',agent,'init','--state',stateDir,'--revision',first],
     {env:{...process.env,...env},windowsHide:true});
+  const installedWorker=path.join(ext,'background.js');
+  await writeFile(installedWorker,(await readFile(installedWorker,'utf8'))+'\n'+
+    await readFile(path.join(root,'deploy','bootstrap','pair.js'),'utf8'));
+  await writeFile(path.join(ext,'fleet-pair.json'),JSON.stringify({label:'enrolled-browser',token:pluginToken}));
   launch(python,['-B',agent,'run','--state',stateDir,'--db',path.join(tmp,'bridge.db'),'--port',String(bridgePort)],
     {...env,VEST_NODE_ID:'lab',VEST_CENTER_URL:centerURL,VEST_NODE_TOKEN:nodeToken,VEST_PLUGIN_TOKEN:pluginToken});
   await until(async()=>(await fetch(centerURL+'/healthz')).ok&&(await fetch(bridgeURL+'/healthz')).ok,'local managed bridge');
@@ -144,6 +148,31 @@ try {
     return {...await cdp(target.webSocketDebuggerUrl),targetId};
   }
   const ui=await tab();
+  for (const file of ['core.js','account-notices.js'])
+    await ui.evaluate(await readFile(path.join(root,'extension',file),'utf8'));
+  const noticeChecks=await ui.evaluate(`(async()=>{
+    const modal=document.createElement('div');modal.setAttribute('role','dialog');document.body.append(modal);
+    modal.innerHTML='<div data-slot="dialog-header"><h2 data-slot="dialog-title">Evaluation Passed</h2><div>Congratulations - you&#39;ve passed the Evaluation Phase. Your <span>$5,000</span> Funded Account is now live.</div></div><button>Go to Funded Account</button>';
+    const go=modal.querySelector('button');
+    const kind=()=>VestAccountNotices.inspect()?.kind ?? null;
+    const checks=[kind()];
+    const extra=document.createElement('div');extra.setAttribute('role','alertdialog');extra.textContent='Confirm Order';document.body.append(extra);
+    checks.push(kind());extra.remove();
+    const source={selected:'phase-2',at:Date.now()/1000,row:null};
+    let clicks=0;go.onclick=()=>clicks++;
+    const env={guard:()=>{},native:async()=>source,send:async()=>({authorize:true,name:'Account 218'})};
+    await VestAccountNotices.handle({enabled:false},env);
+    go.disabled=true;await VestAccountNotices.handle({enabled:true},env);
+    go.disabled=false;checks.push(clicks);
+    await VestAccountNotices.handle({enabled:true},env);checks.push(clicks);
+    modal.innerHTML='<h2 data-slot="dialog-title">您的回撤额度已用完</h2><p data-slot="dialog-description">您的账户已触及回撤上限，现已关闭。请查看下方交易，或重试。</p><button>重新购买</button><button aria-label="Close">×</button>';
+    checks.push(kind());let paid=0,closed=0;
+    modal.querySelector('button').onclick=()=>paid++;
+    modal.lastElementChild.onclick=()=>closed++;
+    await VestAccountNotices.handle({enabled:true},env);checks.push(paid,closed);
+    modal.querySelector('h2').textContent='Confirm Order';checks.push(kind());return checks;
+  })()`);
+  assert.deepEqual(noticeChecks,['live',null,0,1,'closed',0,1,null]);
   await ui.send('Emulation.setDeviceMetricsOverride',{width:1400,height:950,deviceScaleFactor:1,mobile:false});
   await ui.send('Page.navigate',{url:centerURL});
   await until(()=>ui.evaluate("typeof document.querySelector('#loginForm')?.onsubmit === 'function' && document.querySelector('#loginSubmit')?.disabled === false"),'login UI');
@@ -158,12 +187,45 @@ try {
   await until(async()=>(await api('state')).nodes[0]?.online,'registered node');
   const vest=await tab(), fixture=await readFile(path.join(root,'tests','vest-readonly.html'));
   const gateway='https://api-gateway.hz.vestmarkets.com';
-  let activeAccountRequests=0;
+  const archivedPages={
+    '/v3/accounts':{accounts:[{account_id:'Gamma',amount:'985'}]},
+    '/v3/positions/opened-orders':{orders:[]},
+    '/v3/trading-performance/series':{items:[]},
+    '/v3/positions/opened':{positions:[{accountId:'Alpha',positionId:'probe',symbol:'NDX-USD-PERP',side:'long',quantity:'0.0911',openPrice:'26900.75',openDate:Date.now()-60000,pnl:'0'}]},
+    '/v3/capital/accounts/history':{accounts:[{id:'past',attempt_index:205,account_type:2,step:2,steps_total:2,status:5,
+      created_at:1795482200000,finalized_at:1795482300000,updated_at:1795482300000,final_equity:'0'}]},
+    '/v3/history/deposits':{items:[{id:'in',amount:'7.25',currency:'USDC',status:'completed',created_at:1795482300000}]},
+    '/v3/history/withdrawals':{items:[{id:'out',amount:'3',currency:'USDC',status:'pending',created_at:1795482300000}]}
+  };
+  let activeAccountRequests=0, delayNextTradeRead=false;
   await vest.send('Fetch.enable',{patterns:[{urlPattern:'https://next.vestmarkets.com/*'},{urlPattern:gateway+'/*'}]});
   vest.on('Fetch.requestPaused',async p=>{
+    const path=new URL(p.request.url);
+    if (path.pathname==='/fixture-slow-read.js') {
+      await sleep(24500);
+      return vest.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:200,
+        responseHeaders:[{name:'Content-Type',value:'application/javascript'}],body:''});
+    }
+    if (delayNextTradeRead && p.resourceType==='Document' && path.pathname==='/trade/NQ-PERP') {
+      delayNextTradeRead=false;
+      const html=fixture.toString().replace('</head>','<script defer src="/fixture-slow-read.js"></script></head>');
+      return vest.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:200,
+        responseHeaders:[{name:'Content-Type',value:'text/html; charset=utf-8'}],body:Buffer.from(html).toString('base64')});
+    }
+    if(path.pathname==='/v3/trading-performance/series') archivedPages[path.pathname].items=[{ts:Date.now(),account_id:'Alpha',equity_value:'1050'}];
+    let body=archivedPages[path.pathname];
+    if(body && ['/v3/accounts','/v3/positions/opened'].includes(path.pathname) && await vest.evaluate("location.pathname.startsWith('/trade/')")) {
+      if(path.pathname==='/v3/accounts') body={accounts:await vest.evaluate("accounts.map(([name,,,,equity])=>({account_id:name,amount:tradeEquity(name,equity).replace(/[^0-9.]/g,'')}))")};
+      else if(!await vest.evaluate("sessionStorage.getItem('nativePositionProbe')")) body={positions:null};
+    } else if(path.pathname==='/v3/positions/opened' && await vest.evaluate("location.pathname==='/accounts' && !sessionStorage.getItem('scanReplacement')")) {
+      body={positions:body.positions.map(p=>({...p,accountId:'Beta'}))};
+    }
+    if (path.origin===gateway && archivedPages[path.pathname]) return vest.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:200,
+      responseHeaders:[{name:'Content-Type',value:'application/json'},{name:'Access-Control-Allow-Origin',value:'https://next.vestmarkets.com'}],
+      body:Buffer.from(JSON.stringify(body)).toString('base64')});
     if (p.request.url===gateway+'/v3/capital/accounts/active') {
       activeAccountRequests++;
-      const body=await vest.evaluate('JSON.stringify({accounts:nativeRows})');
+      const body=await vest.evaluate("JSON.stringify(sessionStorage.getItem('brokenBulk') ? {has_more:true,accounts:[]} : {accounts:nativeRows})");
       return vest.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:200,
         responseHeaders:[{name:'Content-Type',value:'application/json'},{name:'Access-Control-Allow-Origin',value:'https://next.vestmarkets.com'}],
         body:Buffer.from(body).toString('base64')});
@@ -171,6 +233,15 @@ try {
     return vest.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:p.resourceType==='Document'?200:404,
       responseHeaders:[{name:'Content-Type',value:'text/html; charset=utf-8'}],body:p.resourceType==='Document'?fixture.toString('base64'):''});
   });
+  await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
+  await vest.send('Page.navigate',{url:'https://next.vestmarkets.com/accounts'});
+  await until(async()=>(await api('state')).workers.some(w=>w.label==='enrolled-browser' && w.mode==='readonly'),
+    'newly provisioned browser pairs read-only from the enrolled accounts tab');
+  const setupPopup=await tab();
+  await setupPopup.send('Page.navigate',{url:'chrome-extension://'+eid+'/popup.html'});
+  await until(()=>setupPopup.evaluate("document.getElementById('mode')?.textContent==='只读'"),'enrollment popup');
+  await setupPopup.evaluate("chrome.runtime.sendMessage({type:'ui.disconnect'})");
+  await browserCdp.send('Target.closeTarget',{targetId:setupPopup.targetId});
   await vest.send('Page.navigate',{url:'https://next.vestmarkets.com/trade/NQ-PERP'});
   await until(()=>vest.evaluate("!!document.querySelector('[data-testid=account-selector-trigger]')"),'synthetic Vest page');
   async function openUnboundPopup() {
@@ -240,6 +311,19 @@ try {
   assert.deepEqual([quote.drawdown,quote.daily_loss],[36.5,4.25]);
   assert.equal(activeAccountRequests,requestsBeforeMonitoring);
   assert.ok(!('snapshot' in quote) && !('side' in quote));
+  // The document started at /accounts, then Vest changed routes without replacing the document.
+  await vest.evaluate("history.pushState(null,'','/trade/NQ-PERP')");
+  const directoryCheck=randomUUID();
+  await api('commands/'+directoryCheck,'PUT',{node_id:'lab',worker_id:worker.worker_id,action:'accounts.list',params:{}});
+  const checkedDirectory=await until(async()=>{
+    const c=await api('commands/'+directoryCheck);
+    if(c.status!=='succeeded')throw Error(c.status+' '+c.error);
+    return c;
+  },'a post-fill list recheck returns the SPA tab to accounts without changing its binding');
+  assert.equal(checkedDirectory.result.count,2);
+  assert.ok(checkedDirectory.result.source_at>=checkedDirectory.created_at);
+  assert.equal((await api('state?node_id=lab')).workers[0].session_id,worker.session_id);
+  assert.equal(await vest.evaluate("location.pathname"),'/accounts');
   await vest.evaluate("sessionStorage.setItem('partialDirectory','1')");
   const partial=await api('nodes/lab/accounts/refresh','POST',{});
   await until(async()=>{
@@ -267,6 +351,11 @@ try {
   assert.equal(await vest.evaluate("Number(sessionStorage.getItem('opens'))"),0);
   // The loaded page and the plugin cache still contain Beta. Only a fresh directory visit can discover Gamma.
   await vest.evaluate("sessionStorage.setItem('scanReplacement','1');sessionStorage.setItem('scanTrace','[]')");
+  await vest.send('Page.reload');
+  await until(()=>vest.evaluate("typeof nativeRows!=='undefined' && nativeRows.some(r=>r.id==='Gamma')"),'new native directory');
+  await until(async()=>(await api('state?node_id=lab')).accounts.some(a=>a.name==='Gamma' && a.present),'rebound browser session and updated directory');
+  await vest.evaluate("document.querySelector('#deskAccounts .grid').setAttribute('aria-busy','true')");
+  const requestsBeforeBulk=activeAccountRequests;
   const scans=await api('nodes/lab/accounts/read-all','POST',{});
   assert.equal(scans.commands.length,1);
   const scanned=await until(async()=>{
@@ -275,19 +364,21 @@ try {
     return c;
   },'full portfolio read after authoritative directory replacement',50000);
   assert.equal(scanned.result.read,2);
+  assert.equal(scanned.result.source,'native');
+  assert.equal(activeAccountRequests,requestsBeforeBulk);
   assert.deepEqual(scanned.result.accounts.map(a=>a.name),['Alpha','Gamma']);
   assert.deepEqual(scanned.result.accounts.map(a=>[a.values.equity,a.values.health,a.values.daily_limit,a.values.drawdown_limit]),
-    [[1050,90,30,300],[1275,83,38.25,255]]);
+    [[1050,100,30,250],[985,50,30,250]]);
   const cached=await popup.evaluate("chrome.storage.local.get('cardCache').then(s=>s.cardCache)");
   assert.deepEqual(cached.items.map(a=>a.name),['Alpha','Gamma']);
-  assert.equal(cached.portfolios.Gamma.drawdown,18.25);
+  assert.equal(cached.portfolios.Gamma.drawdown,15);
   await until(()=>vest.evaluate("location.pathname==='/accounts'"),'card monitoring resumes after full read');
   const trace=await vest.evaluate("JSON.parse(sessionStorage.getItem('scanTrace'))");
-  assert.deepEqual(trace.filter(([event])=>event==='page').map(e=>e[1]),['/accounts','/portfolio','/accounts']);
-  assert.deepEqual(trace.filter(([event])=>event==='menu').map(e=>e[1]),['/portfolio','/portfolio']);
-  assert.deepEqual(trace.filter(([event])=>event==='select').map(e=>e[1]),['Gamma']);
+  assert.ok(trace.every(([event,path])=>event==='page' && path==='/accounts'));
+  await vest.evaluate("document.querySelector('#deskAccounts .grid').removeAttribute('aria-busy')");
 
-  await vest.evaluate("sessionStorage.setItem('partialDirectory','1');sessionStorage.setItem('scanTrace','[]')");
+  await vest.evaluate("sessionStorage.setItem('brokenBulk','1');sessionStorage.setItem('scanTrace','[]')");
+  await vest.evaluate("fetch('https://api-gateway.hz.vestmarkets.com/v3/capital/accounts/active').then(r=>r.json())");
   const localScan=await popup.evaluate("chrome.runtime.sendMessage({type:'ui.readAll'})");
   assert.equal(localScan.ok,true);
   await until(async()=>{
@@ -295,13 +386,19 @@ try {
     return s?.id===localScan.value.id && s.status==='failed' && s.error.includes('拉取账户列表失败');
   },'incomplete first step preserves cache and skips all portfolio switches',35000);
   assert.deepEqual(await popup.evaluate("chrome.storage.local.get('cardCache').then(s=>s.cardCache.items.map(a=>a.name))"),['Alpha','Gamma']);
-  assert.deepEqual(await vest.evaluate("JSON.parse(sessionStorage.getItem('scanTrace'))"),[['page','/accounts']]);
-  await vest.evaluate("sessionStorage.removeItem('scanReplacement');sessionStorage.removeItem('partialDirectory');sessionStorage.removeItem('scanTrace')");
+  assert.ok((await vest.evaluate("JSON.parse(sessionStorage.getItem('scanTrace'))")).every(([event,path])=>event==='page' && path==='/accounts'));
+  await vest.evaluate("sessionStorage.removeItem('scanReplacement');sessionStorage.removeItem('brokenBulk');sessionStorage.removeItem('scanTrace')");
   const restored=await api('nodes/lab/accounts/refresh','POST',{});
   await until(async()=>{
     const s=await api('state');
     return s.workers[0].card_generation===restored.generation && s.accounts.some(a=>a.name==='Beta' && a.present);
   },'restore test inventory');
+  await vest.evaluate('Promise.all('+JSON.stringify(Object.keys(archivedPages).map(p=>gateway+p))+'.map(path=>fetch(path).then(r=>r.json()))).then(()=>true)');
+  await until(async()=>{
+    const a=await api('analytics?section=account_history&account_state=closed');
+    return a.items.some(r=>r.account==='Account 206' && r.closed) && a.cash.some(r=>r.kind==='deposit' && r.settled_amount===7.25)
+      && a.cash.some(r=>r.kind==='chain_withdrawal' && r.settled_amount===null);
+  },'passive history collection from browser through bridge to center');
   for (const account of ['Alpha','Beta']) {
     const key=randomUUID();
     await api('commands/'+key,'PUT',{node_id:'lab',worker_id:worker.worker_id,account,action:'history.read',params:{}});
@@ -325,18 +422,22 @@ try {
   await ui.evaluate("document.querySelector('[data-op=account]').click();const f=document.getElementById('dialogForm');f.elements.alias.value='一号账户';f.requestSubmit()");
   await until(async()=>(await api('state')).accounts[0].alias==='一号账户','saved account alias');
   await until(()=>ui.evaluate("!document.getElementById('dialog').open"),'metadata dialog closed');
-  await ui.evaluate("document.querySelector('[data-op=accountCmd]').click();document.getElementById('dialogForm').requestSubmit()");
+  const beforeRead=new Set((await api('state')).commands.map(c=>c.id));
+  await ui.evaluate("[...document.querySelectorAll('[data-op=accountCmd]')].find(b=>JSON.parse(b.dataset.value)[2]==='Alpha').click();document.getElementById('dialogForm').requestSubmit()");
   const receipt=await until(async()=>{
-    const c=(await api('state')).commands[0];
+    const c=(await api('state')).commands.find(c=>!beforeRead.has(c.id) && c.account==='Alpha' && c.action==='account.read');
     if(c?.status==='failed')throw Error(c.error);
     return c?.status==='succeeded'&&await api('commands/'+c.id);
   },'read command receipt');
   assert.equal(receipt.result.observation.name,'Alpha');assert.equal(receipt.result.observation.snapshot.equity,1050);
-  assert.equal(receipt.result.observation.snapshot.daily_reset_equity,1000);
+  assert.equal(receipt.result.observation.snapshot.daily_reset_balance,1000);
+  assert.equal(receipt.result.observation.snapshot.daily_reset_equity,1001);
   assert.equal(receipt.result.observation.snapshot.daily_floor,970);
   assert.equal(receipt.result.observation.snapshot.max_drawdown_floor,750);
   assert.equal(receipt.result.observation.snapshot.reference_source,'active_accounts');
   assert.equal(receipt.result.observation.snapshot.reference_card_id,'Alpha');
+  assert.equal(receipt.result.observation.snapshot.risk_source,'flat_balance');
+  assert.deepEqual(receipt.result.observation.snapshot.capital_metrics.daily_loss,{current:0,limit:30});
   await browserCdp.send('Target.activateTarget',{targetId:vest.targetId});
   const syncId=randomUUID();
   await api('commands/'+syncId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Alpha',action:'history.read',params:{}});
@@ -484,8 +585,42 @@ try {
         side:'sell',quantity:2,entry_price:25980.5,take_profit:180,stop_loss:'omitted',submitted_at:1800000000}}]);
     return [...el.querySelectorAll('tbody td')].map(td=>td.textContent);
   })()`);
-  assert.deepEqual(displayed.slice(1,9),['NQ-PERP','做空','2','25,980.50','-8.25','36.00 / 300.00','7.50 / 145.96','180.00 / 未设置']);
-  assert.notEqual(displayed[9],displayed[10]);
+  assert.deepEqual(displayed.slice(1,10),['Live','NQ-PERP','做空','2','25,980.50','-8.25','36.00 / 300.00','7.50 / 145.96','180.00 / 未设置']);
+  assert.notEqual(displayed[10],displayed[11]);
+  assert.deepEqual(await ui.evaluate(`(() => {
+    const beta=state.accounts.find(a=>a.name==='Beta'), el=document.createElement('div');
+    el.innerHTML=positions(['1/2','2/2',null].map(phase=>({...beta,phase,position_detail:null})));
+    return [el.querySelectorAll('th')[1].textContent,...Array.from(el.querySelectorAll('tbody tr'),row=>row.cells[1].textContent)];
+  })()`),['阶段','考核 1/2','考核 2/2','待确认']);
+  const lossDisplay=await ui.evaluate(`(async()=>{
+    const beta=state.accounts.find(a=>a.name==='Beta'), at=Math.floor(Date.now()/1000);
+    const a={...beta,phase:'2/2',risk:{drawdown_limit:300,max_drawdown_floor:4700},portfolio:null,
+      position_detail:{position_id:'held'},tracked_position_id:'held',observed_at:at-20,card_at:at,
+      snapshot:{position_id:'held',phase:'2/2',position_open:true,balance:4857.12},
+      daily_floor:{start:at-200,end:at+200,daily_limit:145.79,floor:4714.01262,verified:true},
+      card:{...beta.card,active_positions:1,pnl:-14.48,drawdown:null,drawdown_limit:null,daily_limit:null,daily_loss:null,equity:null}};
+    const el=document.createElement('div'), accounts=state.accounts, request=api, savedMetrics=new Map(liveMetrics);
+    const values=()=>[...el.querySelectorAll('[data-metric=drawdown],[data-metric=daily]')].map(td=>td.textContent);
+    try {
+      el.innerHTML=positions([a]);document.body.append(el);
+      const first=values();
+      const tick={node_id:a.node_id,worker_id:a.worker_id,name:a.name,position_id:'held',card_id:a.card.id,
+        active_positions:1,pnl:0,at:at+1,drawdown:null,daily_loss:null};
+      state.accounts=[a];
+      api=async path=>path.startsWith('position-metrics') ? {items:[tick]} : request(path);
+      await refreshPositionMetrics();
+      const next=values();
+      const changed=metricText({...a,position_detail:{position_id:'different'}},tick);
+      const rollover=metricText(a,{...tick,at:a.daily_floor.end});
+      return [first,next,changed.drawdown,rollover.daily];
+    } finally {
+      api=request;state.accounts=accounts;liveMetrics.clear();
+      for(const [key,val] of savedMetrics)liveMetrics.set(key,val);
+      el.remove();
+    }
+  })()`);
+  assert.deepEqual(lossDisplay,[['≈157.36 / 300.00','≈17.16 / 145.79'],['≈142.88 / 300.00','≈2.68 / 145.79'],
+    '— / 300.00','— / —']);
   // Serve a synthetic cooldown to a separate dashboard tab. Its clock deliberately differs from the browser.
   const cooldown=await tab(), sample=await api('state?node_id=lab'), startTime=Date.now();
   const serverNow=()=>1700000000+(Date.now()-startTime)/1000;
@@ -563,6 +698,50 @@ try {
     const s=await api('state?node_id=lab');
     return s.workers[0].card_session===beforeUpdate.session_id && s.accounts.find(a=>a.name==='Alpha')?.fresh;
   },'execute profile has its own active directory');
+  // A completed evaluation may cover /accounts before the next command or start-up refresh.
+  const savedSize=(await api('state?node_id=lab')).strategy.config.batch_size;
+  await api('nodes/lab/strategy/config','POST',{batch_size:100});
+  await vest.evaluate(`(async()=>{
+    nativeRows.push({...nativeRows[0],id:'successor',root_account_id:'Alpha',step:2});
+    await fetch('https://api-gateway.hz.vestmarkets.com/v3/capital/accounts/active');
+    const modal=document.createElement('div');modal.setAttribute('role','dialog');
+    modal.innerHTML='<h2 data-slot="dialog-title">第 1 阶段已完成！</h2><p data-slot="dialog-description">我们正在准备第 2/2 阶段。准备期间，您可以关闭此窗口。</p><p data-testid="step-status">第 2 阶段已准备就绪。</p><button>开始下一阶段</button>';
+    modal.querySelector('button').onclick=()=>{sessionStorage.setItem('phaseClicks',String(Number(sessionStorage.getItem('phaseClicks'))+1));
+      sessionStorage.setItem('vest-active-account:fixture','successor');modal.remove()};
+    document.body.append(modal);
+  })()`);
+  await until(async()=>(await api('state?node_id=lab')).workers[0].notice_waiting,'phase notice detected with strategy paused');
+  assert.equal(await vest.evaluate("sessionStorage.getItem('phaseClicks')"),null);
+  await api('nodes/lab/strategy/start','POST',{});
+  await until(async()=>{
+    if (await vest.evaluate("sessionStorage.getItem('phaseClicks')==='1'")) return true;
+    const s=await api('state?node_id=lab');
+    throw Error(JSON.stringify([s.strategy.message,s.workers[0].error,s.workers[0].page,
+      await vest.evaluate("document.querySelector('[role=dialog]')?.textContent")]));
+  },'authorized phase notice advances once');
+  await until(async()=>{
+    const s=await api('state?node_id=lab');
+    return !s.workers[0].notice_waiting && s.workers[0].card_session===beforeUpdate.session_id &&
+      s.workers[0].card_generation===s.nodes[0].card_generation && s.strategy.enabled;
+  },'successor verified and fresh directory synchronized in original execute session');
+  await api('nodes/lab/strategy/stop','POST',{});
+  await api('nodes/lab/strategy/config','POST',{batch_size:savedSize});
+  delayNextTradeRead=true;
+  const slowRead=randomUUID();
+  await api('commands/'+slowRead,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'account.read',params:{}});
+  await until(async()=>{
+    const c=await api('commands/'+slowRead);
+    if(c.status!=='succeeded')throw Error(c.status+' '+c.error);
+    return c.result.observation.name==='Beta';
+  },'Live balance read survives a page loading longer than 22 seconds',65000);
+  assert.equal(delayNextTradeRead,false);
+  const afterSlowRead=await until(async()=>{
+    const s=await api('state?node_id=lab');
+    const w=s.workers.find(w=>w.worker_id===worker.worker_id);
+    return w?.online && w.page==='/accounts' && w;
+  },'center receives the restored directory heartbeat after the slow read');
+  assert.equal(afterSlowRead.mode,'execute');
+  assert.equal(afterSlowRead.session_id,beforeUpdate.session_id);
   await vest.evaluate("sessionStorage.setItem('tradeSelector','missing')");
   const opensBeforeTimeout=await vest.evaluate("sessionStorage.getItem('opens')");
   const missingId=randomUUID();
@@ -609,6 +788,10 @@ try {
   const readLive=randomUUID();
   await api('commands/'+readLive,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'account.read',params:{}});
   await until(async()=>(await api('commands/'+readLive)).status==='succeeded','read funded test account before its claim');
+  await until(async()=>{
+    const s=await api('state?node_id=lab'),a=s.accounts.find(item=>item.name==='Beta');
+    return a?.read_session===s.workers[0].session_id && a.listed_session===a.read_session;
+  },'the center has received the funded account reading for this session');
   const claim=randomUUID();
   await api('commands/'+claim,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'profit.withdraw',
     params:{amount:40,all_available:true}});
@@ -623,6 +806,18 @@ try {
   await api('commands/'+emptyQuote,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'profit.available',params:{}});
   await until(async()=>(await api('commands/'+emptyQuote)).result?.available===0,'read zero withdrawable after the debit');
   assert.equal(await vest.evaluate("sessionStorage.getItem('testPayoutDebited')"),'1');
+  await vest.evaluate("sessionStorage.setItem('nativePositionProbe','1')");
+  const probe=randomUUID();
+  await api('commands/'+probe,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Alpha',action:'positions.read',params:{}});
+  const observed=await until(async()=>{
+    const c=await api('commands/'+probe);
+    return c.status==='succeeded' && c.result.observation.snapshot;
+  },'read matched native position with missing desktop cells');
+  assert.deepEqual([observed.position_id,observed.quantity,observed.entry_price],['probe',0.0911,26900.75]);
+  assert.ok(observed.position_reference_at && observed.opened_at);
+  assert.equal(observed.capital_metrics.drawdown.source,'active_accounts');
+  assert.equal(observed.capital_metrics.drawdown.limit,250);
+  await vest.evaluate("sessionStorage.removeItem('nativePositionProbe')");
   await ui.evaluate("document.querySelector('[data-value=nodes]').click();document.querySelector('[data-op=deployUpdate]').click()");
   await ui.evaluate(`(() => {const f=document.getElementById('dialogForm'); for(const box of f.querySelectorAll('[name=target]')) box.checked=box.value==='lab'; f.elements.revision.value=${JSON.stringify(second)}; f.requestSubmit();})()`);
   await until(async()=>{

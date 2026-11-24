@@ -10,6 +10,8 @@ const DESTINATIONS = {
   portfolio: '/portfolio'
 };
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const ROUTE_START_WINDOW = 22000;
+const READ_ROUTES = new Set(['accounts.list','accounts.read_all','account.read','positions.read','history.read','profit.available']);
 
 // Serialize binding changes and reload detection even when multiple tabs wake the MV3 worker.
 let settingsQueue = Promise.resolve();
@@ -137,7 +139,7 @@ async function setBinding(message) {
   let cfg = await settings();
   const previous = await binding();
   if (message.type === 'ui.state') {
-    const saved = await chrome.storage.session.get(['diagnostic', 'receiptError']);
+    const saved = await chrome.storage.session.get(['diagnostic', 'receiptError','archiveError']);
     const {cardCache} = await chrome.storage.local.get('cardCache');
     return {
       plugin_version: chrome.runtime.getManifest().version,
@@ -145,7 +147,7 @@ async function setBinding(message) {
       paired: !!cfg.token,
       mode: previous?.mode || 'unbound',
       worker_id: cfg.worker_id || '',
-      diagnostic: saved.receiptError || saved.diagnostic || '',
+      diagnostic: saved.receiptError || saved.archiveError || saved.diagnostic || '',
       cacheCount: cardCache && cardCache.worker_id === cfg.worker_id ? cardCache.items.length : null
     };
   }
@@ -232,11 +234,17 @@ async function context(message, sender) {
   if (current.pageId !== message.pageId) {
     const page = await identifyPage(sender.tab.id);
     if (page?.pageId !== message.pageId) throw Error('旧页面已退出');
-    const {cardRoute} = await chrome.storage.session.get('cardRoute');
-    if (cardRoute?.sid === current.session_id && cardRoute.from === current.pageId &&
-        Date.now() < cardRoute.expires && onPath(sender.url,cardRoute.path)) {
+    const {cardRoute,noticeRedirect} = await chrome.storage.session.get(['cardRoute','noticeRedirect']);
+    const liveReturn = noticeRedirect?.sid === current.session_id && noticeRedirect.from === current.pageId &&
+      Date.now() < noticeRedirect.expires && onPath(sender.url,DESTINATIONS.portfolio);
+    const expectedDocument = cardRoute?.sid === current.session_id && cardRoute.from === current.pageId &&
+      Date.now() < cardRoute.expires && onPath(sender.url,cardRoute.path) &&
+      (!cardRoute.startBy || Date.now() < cardRoute.startBy ||
+        message.documentStartedAt >= cardRoute.started && message.documentStartedAt <= cardRoute.startBy);
+    if (liveReturn || expectedDocument) {
       owner = {...current,pageId:message.pageId};
       await chrome.storage.session.set({binding:owner});
+      if (liveReturn) await chrome.storage.session.remove('noticeRedirect');
     } else {
       owner = await rotate(current, cfg, sender.tab.id, message.pageId, 'readonly');
     }
@@ -253,7 +261,8 @@ async function persistReceipt(payload, cfg) {
   await chrome.storage.local.set({
     [key]: payload
   });
-  await post('result', payload, cfg);
+  const ack = await post('result', payload, cfg);
+  await cacheObservation(payload,payload.result?.observation,ack);
   await chrome.storage.local.remove(key);
   await chrome.storage.session.remove('lease.' + payload.id);
 }
@@ -273,12 +282,17 @@ let draining;
 async function drain(cfg) {
   if (draining) return draining;
   draining = (async () => {
-    const stored = await chrome.storage.local.get(null);
+    const keys = chrome.storage.local.getKeys ? await chrome.storage.local.getKeys() : Object.keys(await chrome.storage.local.get(null));
+    if (archiveSupported) deliverArchive(keys.filter(key=>key.startsWith('archive.')),cfg)
+      .catch(err=>chrome.storage.session.set({archiveError:'历史归档等待重传：'+err.message}));
+    const pending = keys.filter(key=>key.startsWith('receipt.'));
+    const stored = pending.length ? await chrome.storage.local.get(pending) : {};
     let receiptError = '';
     for (const [key, payload] of Object.entries(stored)) {
       if (!key.startsWith('receipt.')) continue;
       try {
-        await post('result', payload, cfg);
+        const ack = await post('result', payload, cfg);
+        await cacheObservation(payload,payload.result?.observation,ack);
       } catch (err) {
         if (![400, 404, 409, 413].includes(err.status)) throw err;
         // Preserve the original evidence if a different or restored bridge cannot accept it yet.
@@ -399,10 +413,16 @@ function onPath(value,path) {
     path === DESTINATIONS.trade && actual === '/trade/NDX-USD-PERP');
 }
 async function startRoute(owner,url,path,work) {
-  const route = {sid:owner.session_id,from:owner.pageId,path,expires:Date.now()+22000,work};
+  // A Vest SPA navigation can leave MessageSender.url pointing to the original route.
+  const tab=await chrome.tabs.get(owner.tabId);
+  if (!tab.url || new URL(tab.url).origin!==VEST) throw Error('绑定标签页已离开 Vest');
+  const started=Date.now(), startBy=started+ROUTE_START_WINDOW;
+  // A document that started on time may load slowly. Read-only work can still use its original lease.
+  const expires=READ_ROUTES.has(work.command?.action) && Number.isFinite(work.run_until) ? work.run_until*1000 : startBy;
+  const route = {sid:owner.session_id,from:owner.pageId,path,started,startBy,expires,work};
   await chrome.storage.session.set({cardRoute:route});
   try {
-    if (onPath(url,path)) await chrome.tabs.reload(owner.tabId);
+    if (!tab.pendingUrl && onPath(tab.url,path) && onPath(url,path)) await chrome.tabs.reload(owner.tabId);
     else await chrome.tabs.update(owner.tabId,{url:VEST+path});
   } catch (err) {
     await chrome.storage.session.remove('cardRoute');
@@ -410,16 +430,59 @@ async function startRoute(owner,url,path,work) {
   }
   return {moving:true};
 }
-async function nativeDirectory(tabId,documentId,timingOnly=false) {
+async function nativeDirectory(tabId,documentId,scope,priorId='') {
   const target=documentId ? {tabId,documentIds:[documentId]} : {tabId,frameIds:[0]};
   const [frame]=await chrome.scripting.executeScript({world:'MAIN',target,
-    func:timing=>window.vestFleetActiveAccountsV1?.(timing) ?? null,args:[timingOnly]});
+    func:(view,id)=>window.vestFleetSnapshotsV2?.(view,id) ?? null,args:[scope,priorId]});
   return frame?.result ?? null;
+}
+const stagedArchive = new Map();
+async function stageArchive(owner,documentId) {
+  const target={tabId:owner.tabId,documentIds:[documentId]};
+  for (let i=0;i<8;i++) {
+    const [frame]=await chrome.scripting.executeScript({world:'MAIN',target,
+      func:()=>window.vestFleetReadArchiveV1?.() ?? null});
+    const batch=frame?.result;
+    if (!batch) return {more:false};
+    if (!Number.isSafeInteger(batch.seq) || !Array.isArray(batch.items) || batch.items.length>50) throw Error('历史归档批次无效');
+    const changes=[];
+    for (const item of batch.items) {
+      const id=JSON.stringify([owner.worker_id,item.kind,item.source_account_id,item.ref]);
+      const signature=JSON.stringify(item);
+      if (stagedArchive.get(id)!==signature) changes.push({id,signature,item});
+    }
+    if (changes.length) {
+      const key='archive.'+owner.pageId+'.'+batch.seq;
+      await chrome.storage.local.set({[key]:{worker_id:owner.worker_id,session_id:owner.session_id,generation:owner.generation,items:changes.map(c=>c.item)}});
+      for (const {id,signature} of changes) {
+        stagedArchive.set(id,signature);
+        if (stagedArchive.size>5000) stagedArchive.delete(stagedArchive.keys().next().value);
+      }
+    }
+    const [ack]=await chrome.scripting.executeScript({world:'MAIN',target,
+      func:seq=>window.vestFleetReadArchiveV1?.(seq),args:[batch.seq]});
+    if (!ack?.result) return {more:false};
+  }
+  return {more:true};
+}
+let archiveDelivery, archiveSupported=false;
+async function deliverArchive(keys,cfg) {
+  if (archiveDelivery || !keys.length) return;
+  archiveDelivery=true;
+  try {
+    for (const key of keys.slice(0,8)) {
+      const payload=(await chrome.storage.local.get(key))[key];
+      if (payload?.worker_id!==cfg.worker_id) continue;
+      if ((await post('archive',payload,cfg)).accepted) await chrome.storage.local.remove(key);
+    }
+    await chrome.storage.session.remove('archiveError');
+  } finally {archiveDelivery=false;}
 }
 async function directoryRoute(owner,url,work,since) {
   if (onPath(url,DESTINATIONS.accounts)) {
     for (let i=0;i<4;i++) {
       const timing=await nativeDirectory(owner.tabId,undefined,true);
+      if (work.command?.action==='accounts.read_all' && timing && timing.bulk_version!==1) break;
       const now=Date.now()/1000;
       if (timing?.at!=null && timing.at>=since && now-timing.at<=330 ||
           timing?.pending_at!=null && timing.pending_at>=since && now-timing.pending_at<=12) return null;
@@ -428,7 +491,7 @@ async function directoryRoute(owner,url,work,since) {
   }
   return startRoute(owner,url,DESTINATIONS.accounts,{...work,arrived:true,directory_since:since});
 }
-async function pollWork(owner,cfg,meta,url) {
+async function pollWork(owner,cfg,meta,url,documentId,historyPending,noticeKind) {
   if ((await binding())?.session_id !== owner.session_id) throw Error('绑定已变化');
   await drain(cfg);
   const saved = await chrome.storage.session.get(['cardRoute','cardVisit','returnCards','cachedScan']);
@@ -439,29 +502,47 @@ async function pollWork(owner,cfg,meta,url) {
       if (route.from === owner.pageId || !onPath(url,route.path)) return {moving:true};
       data = route.work;
     } else if (route.work.command) {
-      await persistReceipt({...route.work.owner,id:route.work.command.id,ok:false,error:'页面跳转未完成或授权已变化',result:{}},cfg);
+      await persistReceipt({...route.work.owner,id:route.work.command.id,ok:false,error:'页面跳转未完成或授权已变化',
+        result:READ_ROUTES.has(route.work.command.action) ? {read_retry:'navigation'} : {}},cfg);
     }
     await chrome.storage.session.remove('cardRoute');
   }
   if (!data) {
     const {manualView} = await chrome.storage.session.get('manualView');
     const manual = owner.mode==='readonly' && manualView?.tabId===owner.tabId && onPath(url,manualView.path);
-    data = await post('poll',{...meta,manual_view:manual,cached_scan:saved.cachedScan?.sid===owner.session_id ? saved.cachedScan.id : null},cfg);
+    data = await post('poll',{...meta,notice_kind:noticeKind,manual_view:manual,cached_scan:saved.cachedScan?.sid===owner.session_id ? saved.cachedScan.id : null},cfg);
+    archiveSupported=data.archive_version===1;
+  }
+  if (archiveSupported && documentId && historyPending) {
+    try {await stageArchive(owner,documentId);}
+    catch (err) {await chrome.storage.session.set({archiveError:'历史归档等待保存：'+err.message});}
   }
   if (data.update_release) return data;
   const cmd = data.command;
+  if (data.notice) return data;
   if (cmd?.action === 'page.navigate') return data;
   if (cmd) {
     const scan = cmd.action === 'accounts.read_all';
     const directory = cmd.action === 'accounts.list' || scan && data.scan?.stage === 'list';
-    const path = directory ? DESTINATIONS.accounts : scan || cmd.action==='profit.available' ? DESTINATIONS.portfolio : DESTINATIONS.trade;
+    const path = directory || scan ? DESTINATIONS.accounts : cmd.action==='profit.available' ? DESTINATIONS.portfolio : DESTINATIONS.trade;
+    if (cmd.action==='account.read' && cmd.read_card_id && data.arrived && !data.renewedBalance &&
+        Date.now()-route?.started>15000 && data.run_until*1000-Date.now()>15000) {
+      const timing=await nativeDirectory(owner.tabId,documentId,true);
+      if (timing?.trade_at>0 && Date.now()/1000-timing.trade_at>15)
+        return startRoute(owner,url,path,{...data,renewedBalance:true,owner:publicBinding(owner)});
+    }
     if (scan) await chrome.storage.session.set({returnCards:owner.session_id});
     if (directory && !data.arrived) {
-      data.directory_since=cmd.created_at;
+      data.directory_since=cmd.created_at-(scan ? 320 : 0);
       const moving=await directoryRoute(owner,url,{...data,owner:publicBinding(owner)},data.directory_since);
       if (moving) return moving;
-    } else if (!data.arrived && (cmd.action==='profit.available' || !onPath(url,path))) {
-      return startRoute(owner,url,path,{...data,arrived:true,owner:publicBinding(owner)});
+    } else if (!data.arrived) {
+      let move=cmd.action==='profit.available' || !onPath(url,path);
+      if (!move && (cmd.action==='order.open' || cmd.action==='account.read' && cmd.read_card_id)) {
+        const timing=await nativeDirectory(owner.tabId,documentId,true), now=Date.now()/1000;
+        move=!(timing?.trade_at>=now-6 && timing.at>=now-315);
+      }
+      if (move) return startRoute(owner,url,path,{...data,arrived:true,owner:publicBinding(owner)});
     }
     const lease = {...owner,action:cmd.action};
     if (cmd.action==='profit.withdraw' || cmd.action==='history.read') {
@@ -505,6 +586,17 @@ async function continueCommand(owner, url, {id,continuation}) {
     {command:lease.command,owner:publicBinding(owner),run_until:lease.run_until,arrived:true,continuation});
 }
 let pendingMetricRisks = new Map();
+async function cacheObservation(owner, item, data) {
+  if (!item || !data.risk || (await binding())?.session_id!==owner.session_id) return;
+  const {cardCache} = await chrome.storage.local.get('cardCache');
+  if (cardCache?.worker_id!==owner.worker_id) return;
+  pendingMetricRisks.delete(item.name);
+  (cardCache.risks ??= {})[item.name] = data.risk;
+  if ('daily_floor' in data) (cardCache.floors ??= {})[item.name] = data.daily_floor;
+  if ('open_lock' in data) (cardCache.open_locks ??= {})[item.name] = data.open_lock;
+  if (data.portfolio) (cardCache.portfolios ??= {})[item.name] = data.portfolio;
+  await chrome.storage.local.set({cardCache});
+}
 async function reportCards(owner,cfg,payload) {
   const bound = await binding();
   if (bound?.session_id !== owner.session_id || bound.pageId !== owner.pageId) throw Error('提交清单的页面已更换');
@@ -524,7 +616,7 @@ async function reportCards(owner,cfg,payload) {
   if (cards.scan_id) await chrome.storage.session.remove('lease.'+cards.scan_id);
   if (cards.full && cards.purchase_request && (await chrome.storage.local.get('cardRequest')).cardRequest===cards.purchase_request)
     await chrome.storage.local.remove('cardRequest');
-  return data;
+  return {supports_metrics:data.supports_metrics};
 }
 async function reportMetrics(owner,cfg,payload) {
   // The complete DOM sample stays in the browser. Only the numeric changes cross the bridge.
@@ -559,10 +651,11 @@ async function handle(message, sender) {
     const owner = (await chrome.storage.session.get(key))[key];
     if (!owner || owner.tabId !== sender.tab.id || owner.pageId !== message.pageId || owner.session_id !== message.session_id) throw Error('没有属于该页面的指令租约');
     if (owner.action !== 'accounts.list') await chrome.storage.session.set({returnCards:owner.session_id});
-    await persistReceipt({
+    const cfg = await settings();
+    await exclusive(()=>persistReceipt({
       ...message.data,
       ...publicBinding(owner)
-    }, await settings());
+    }, cfg));
     return {
       bound: true
     };
@@ -575,40 +668,58 @@ async function handle(message, sender) {
     owner,
     cfg
   } = ctx;
-  const meta = {
-    ...publicBinding(owner),
-    page: new URL(sender.url).pathname,
-    error: String(message.diagnostic || '').replace(/\s+/g, ' ').slice(0, 500)
-  };
   const op = message.type;
   if (op==='native.accounts') {
     if (message.session_id!==owner.session_id || !sender.documentId) throw Error('账户快照会话已变化');
-    return {bound:true,data:await nativeDirectory(owner.tabId,sender.documentId)};
+    const scope=message.data?.scope;
+    const view = ['selected','bulk','inventory','notice'].includes(scope) ? scope : 'directory';
+    const data=await nativeDirectory(owner.tabId,sender.documentId,view,message.data.platform_id || '');
+    if ((scope==='bulk' || scope==='inventory') && data?.rows) {
+      const {cardCache}=await chrome.storage.local.get('cardCache');
+      if (cardCache?.worker_id===owner.worker_id) {
+        const names=new Map(cardCache.items.map(item=>[item.id,item.name]));
+        for (const row of data.rows) row.name=names.get(row.id) || row.name;
+      }
+    }
+    return {bound:true,data};
   }
-  if (!['intent', 'preflight', 'poll', 'report', 'heartbeat','continue'].includes(op)) throw Error('未知插件接口');
-  if (['intent','preflight'].includes(op) && (!message.session_id || owner.mode !== 'execute')) throw Error('执行授权已撤销');
+  if (op==='archive.stage') {
+    if (message.session_id!==owner.session_id || !sender.documentId) throw Error('历史采集会话已变化');
+    return exclusive(()=>stageArchive(owner,sender.documentId));
+  }
+  if (!['intent', 'preflight', 'poll', 'report', 'heartbeat','continue','notice.reserve','notice.complete','notice.recheck'].includes(op)) throw Error('未知插件接口');
+  if (['intent','preflight','notice.reserve','notice.complete','notice.recheck'].includes(op) && (!message.session_id || owner.mode !== 'execute')) throw Error('执行授权已撤销');
+  const pageUrl=(await chrome.tabs.get(owner.tabId)).url;
+  if (!pageUrl || new URL(pageUrl).origin!==VEST) throw Error('绑定标签页已离开 Vest');
+  const meta = {...publicBinding(owner),page:new URL(pageUrl).pathname,
+    error:String(message.diagnostic || '').replace(/\s+/g,' ').slice(0,500)};
   const payload = {
     ...message.data,
     ...meta
   };
   let data;
-  if (op === 'poll') data = await exclusive(() => pollWork(owner,cfg,meta,sender.url));
-  else if (op === 'continue') data = await exclusive(() => continueCommand(owner,sender.url,message.data));
+  if (op==='notice.recheck') return exclusive(async()=>{
+    const key=JSON.stringify([owner.session_id,message.data.platform_id,message.data.started]);
+    if ((await chrome.storage.session.get('noticeRecheck')).noticeRecheck!==key &&
+        (await binding())?.session_id===owner.session_id) {
+      await chrome.storage.session.set({noticeRecheck:key});
+      await startRoute(owner,pageUrl,DESTINATIONS.accounts,{});
+    }
+    return {bound:true};
+  });
+  if (op === 'poll') data = await exclusive(() => pollWork(owner,cfg,meta,pageUrl,sender.documentId,message.data.history_pending,message.data.notice_kind));
+  else if (op === 'continue') data = await exclusive(() => continueCommand(owner,pageUrl,message.data));
   else if (op === 'report' && payload.cards) data = await exclusive(() => reportCards(owner,cfg,payload));
   else if (op === 'report' && payload.metrics) data = await exclusive(() => reportMetrics(owner,cfg,payload));
   else data = await post(op,payload,cfg);
+  if (op==='notice.reserve' && data.authorize && payload.kind==='live')
+    await chrome.storage.session.set({noticeRedirect:{sid:owner.session_id,from:owner.pageId,expires:Date.now()+20000}});
+  if (op==='notice.complete') {
+    await chrome.storage.session.remove('noticeRedirect');
+    await chrome.storage.local.set({cardRequest:Date.now()/1000});
+  }
   if (data.risk && (payload.observation || payload.portfolio)) {
-    await exclusive(async () => {
-      const {cardCache} = await chrome.storage.local.get('cardCache');
-      if ((await binding())?.session_id===owner.session_id && cardCache?.worker_id===owner.worker_id) {
-        const name = (payload.observation || payload.portfolio).name;
-        (cardCache.risks ??= {})[name] = data.risk;
-        if ('daily_floor' in data) (cardCache.floors ??= {})[name] = data.daily_floor;
-        if ('open_lock' in data) (cardCache.open_locks ??= {})[name] = data.open_lock;
-        if (data.portfolio) (cardCache.portfolios ??= {})[name] = data.portfolio;
-        await chrome.storage.local.set({cardCache});
-      }
-    });
+    await exclusive(()=>cacheObservation(owner,payload.observation || payload.portfolio,data));
   }
   if (payload.portfolio && data.status !== 'running')
     await chrome.storage.session.remove('lease.'+payload.portfolio.id);

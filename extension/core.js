@@ -59,6 +59,40 @@
     if (current === null || limit === null || limit < 0) return null;
     return { text, current, limit, percent:null };
   }
+  const eastern = new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'});
+  function capitalDay(at) {
+    const p=Object.fromEntries(eastern.formatToParts(at*1000).map(({type,value})=>[type,Number(value)]));
+    return Date.UTC(p.year,p.month-1,p.day-(p.hour<20 ? 1 : 0));
+  }
+  function nativeCapitalMetrics(row, equity, at, now, equityAt=at) {
+    if (!Number.isFinite(equity) || !Number.isFinite(at) || now<at || now-at>330 || capitalDay(at)!==capitalDay(now)
+        || !Number.isFinite(equityAt) || capitalDay(equityAt)!==capitalDay(now)) return {};
+    const result={}, cents=n=>Math.round(n*100)/100;
+    if (row.initial_capital>0 && Number.isFinite(row.max_drawdown_floor) && row.max_drawdown_floor<=row.initial_capital)
+      result.drawdown={current:cents(Math.max(0,row.initial_capital-equity)),limit:cents(row.initial_capital-row.max_drawdown_floor)};
+    if (row.daily_rate>0 && Number.isFinite(row.daily_limit) && Number.isFinite(row.daily_floor) && row.daily_reset_at>0 &&
+        row.daily_reset_at<=now && capitalDay(row.daily_reset_at)===capitalDay(now))
+      result.daily_loss={current:cents(Math.max(0,row.daily_limit-(equity-row.daily_floor))),limit:cents(row.daily_limit)};
+    return result;
+  }
+  function capitalHealth({drawdown,daily_loss},unlimited) {
+    if (!drawdown || !daily_loss && !unlimited) return null;
+    const ratio=m=>m && m.limit>0 ? Math.min(1,Math.max(0,m.current/m.limit)) : 0;
+    return Math.round(100*(1-Math.max(ratio(drawdown),ratio(daily_loss))));
+  }
+  function bulkCapitalValues(row, at, now) {
+    const sameDay=capitalDay(at)===capitalDay(now);
+    const equity=sameDay && row.equity_at && capitalDay(row.equity_at)===capitalDay(now) ? row.equity : null;
+    const metrics=nativeCapitalMetrics(row,equity,at,now);
+    const daily=metrics.daily_loss, dd=metrics.drawdown;
+    const health=capitalHealth(metrics,row.daily_unlimited);
+    return {equity,health,daily_loss:daily?.current ?? null,daily_limit:sameDay && !row.daily_unlimited ? row.daily_limit : null,
+      drawdown:dd?.current ?? null,drawdown_limit:row.initial_capital>0 && row.max_drawdown_floor!=null &&
+        row.initial_capital>=row.max_drawdown_floor ? row.initial_capital-row.max_drawdown_floor : null,
+      daily_floor:sameDay ? row.daily_floor : null,max_drawdown_floor:row.max_drawdown_floor,
+      equity_at:equity!=null ? row.equity_at : null,equity_source:equity!=null ? row.equity_source : null,
+      daily_unlimited:row.daily_unlimited,observed_at:Math.min(at,equity!=null ? row.equity_at : at)};
+  }
   function accountCategory(labels) {
     const states = { 'passed':'passed','已通过':'passed','通过':'passed',
       'failed':'failed','已失败':'failed','失败':'failed','evaluation failed':'failed','评估失败':'failed',
@@ -149,6 +183,6 @@
     return job;
   }
   root.VestBridgeCore = { defaults, parseMoney, normalized, isNqTradePath, canonicalNqPosition, CAPITAL_INDICATORS,
-    parseCapitalMetric, accountCategory, accountPhase, positionState, parseSide, sameQuantity, nqInputToVest,
+    parseCapitalMetric, nativeCapitalMetrics, capitalHealth, bulkCapitalValues, accountCategory, accountPhase, positionState, parseSide, sameQuantity, nqInputToVest,
     nqVestToInput, matchesPosition, assertExecutionAllowed, validateJob };
 })(globalThis);

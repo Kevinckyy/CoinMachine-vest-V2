@@ -17,6 +17,8 @@ from .protocol import (NODE_TTL, OBS_TTL, PENDING, PORTFOLIO_SCAN, RUN_TTL, TERM
                        plugin_version_parts, request, require, string, validate_target)
 from .storage import Database, check_reservations, command, find_command, finish, insert, record, summary
 
+BATCH_LIST_RETRY = 30
+LIVE_READ_RETRY = 30
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -117,6 +119,7 @@ class Center:
             CREATE TABLE IF NOT EXISTS platform_accounts(node TEXT,worker TEXT,platform_id TEXT,config_name TEXT NOT NULL,
                 PRIMARY KEY(node,worker,platform_id), UNIQUE(node,worker,config_name));
             CREATE TABLE IF NOT EXISTS ledger_cursor(node TEXT PRIMARY KEY REFERENCES nodes(id), seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS archive_cursor(node TEXT PRIMARY KEY REFERENCES nodes(id), seq INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS log_cursor(node TEXT PRIMARY KEY REFERENCES nodes(id), seq INTEGER NOT NULL);
         """)
         ledger.schema(self.db.conn)
@@ -311,6 +314,15 @@ class Center:
     def analytics(self, query):
         with self.db.read() as db:
             return reporting.analytics(db, query)
+
+    def import_archive(self, body):
+        nid, wid = ident(body.get("node_id")), ident(body.get("worker_id"))
+        with self.db.tx() as db:
+            node = db.execute("SELECT snapshot FROM nodes WHERE id=?",(nid,)).fetchone()
+            require(node and any(w["worker_id"]==wid for w in json.loads(node[0]).get("workers",[])),
+                    "找不到所选节点的浏览器",404)
+            ledger.archive_rows(db,nid,wid,body.get("items"))
+        return {"accepted":len(body["items"])}
 
     def _cancel(self, db, row):
         if row["status"] == "pending":
@@ -519,8 +531,16 @@ class Center:
                 todo = [r[0] for r in db.execute("""SELECT id FROM commands WHERE node=? AND
                         status IN ('pending','sending','queued','running','unknown') ORDER BY created,id""", (nid,))]
                 requested = db.execute("SELECT generation FROM directory_refresh WHERE node=?",(nid,)).fetchone()
-            if requested and "card_generation" in snap and snap["card_generation"] < requested[0]:
-                self.transport(node,"PUT","/v1/status",{"instance_id":instance,"generation":requested[0]})
+                control = {}
+                if "notice_until" in snap:
+                    state = self._strategy(db,nid)
+                    allow = bool(state["enabled"] and not state.get("draining") and snap.get("notice_waiting"))
+                    if allow and snap["notice_until"] < self.clock()+5 or not allow and snap["notice_until"]:
+                        control["allow_notices"] = allow
+                if requested and "card_generation" in snap and snap["card_generation"] < requested[0]:
+                    control["generation"] = requested[0]
+            if control:
+                self.transport(node,"PUT","/v1/status",{"instance_id":instance,**control})
             for key in todo:
                 with self.db.tx() as db:
                     row = command(db, key)
@@ -546,6 +566,8 @@ class Center:
                 reason = ""
                 try:
                     self._sync_stream(node, instance, stream, snap[high_key])
+                    if stream=="ledger" and "archive_seq" in snap:
+                        self._sync_stream(node,instance,"archive",snap["archive_seq"])
                 except (Problem, OSError, ValueError, TypeError, KeyError) as err:
                     reason = str(err)[:300]
                 if reason != node[err_col]:
@@ -563,7 +585,7 @@ class Center:
 
     def _sync_stream(self, node, instance, stream, high):
         nid = node["id"]
-        table = "ledger_cursor" if stream == "ledger" else "log_cursor"
+        table = {"ledger":"ledger_cursor","archive":"archive_cursor","logs":"log_cursor"}[stream]
         high = number(high, "节点同步序号", 0, 2**63-1, True)
         for _ in range(4):
             with self.db.tx() as db:
@@ -590,7 +612,7 @@ class Center:
                         reporting.import_event(db, nid, item)
                         continue
                     route = (nid, ident(item.get("worker")), string(item.get("account"), "历史账户"))
-                    kind = choice(item.get("kind"), {"position","order","withdrawal","payout"}, "历史类型")
+                    kind = choice(item.get("kind"), ledger.BOOK_KINDS, "历史类型")
                     ledger.save(db, route, kind, string(item.get("ref"), "历史编号", 350), obj(item.get("data")))
                 db.execute(f"""INSERT INTO {table} VALUES(?,?) ON CONFLICT(node) DO UPDATE
                            SET seq=MAX(seq,excluded.seq)""", (nid, last))
@@ -745,7 +767,8 @@ class Center:
     def _strategy_candidates(self, db, s, inventory, side):
         config = s["config"]
         for (nid,wid,name), a in inventory[2].items():
-            if nid != s["node_id"] or not a["in_pool"] or not a["fresh"] or a["phase"] not in account_pool.PHASES:
+            if (nid != s["node_id"] or not a["in_pool"] or not a["fresh"] or a["phase"] not in account_pool.PHASES
+                    or inventory[1][nid,wid].get("notice_waiting")):
                 continue
             prefix = "live_" if a["phase"] == "live" else ""
             params = {key:config[prefix+key] for key in ("size_percent","stop_buffer")}
@@ -892,13 +915,34 @@ class Center:
         if account["name"] != opened["account"]:
             s["message"] = "Live 开仓账户已更名，等待核对领取账户"
             return False
-        if claim.get("read"):
-            row = command(db,claim["read"])
-            if row["status"] not in PENDING:
-                require(row["status"] == "succeeded","Live 平仓后余额读取失败 · "+row["error"],409)
         req = dict(node_id=opened["node_id"],worker_id=opened["worker_id"],account=opened["account"])
+        node, worker = inventory[0][req["node_id"]], inventory[1][req["node_id"],req["worker_id"]]
+        for step, label in (("read","平仓后余额"),("quote","页面可领额")):
+            if not claim.get(step):
+                continue
+            last = record(command(db,claim[step]))
+            if last["status"] == "succeeded":
+                continue
+            if last["status"] in PENDING:
+                s["message"] = "等待读取 Live "+label
+                return False
+            retry = (last.get("result") or {}).get("read_retry")
+            transient = retry == "navigation" or step=="read" and retry=="balance" or last["error"] in {
+                "页面跳转未完成或授权已变化","浏览器会话已更换","浏览器会话已更换，请刷新后重新下达指令",
+                "执行超时，未签发资金操作许可","浏览器离线，请先连接插件"}
+            require(not last["intents"] and last["action"]==("account.read" if step=="read" else "profit.available") and
+                    (last["status"]=="expired" or last["status"] in ("failed","cancelled") and transient),
+                    "Live "+label+"读取失败 · "+(last["error"] or last["status"]),409)
+            if now < last["updated_at"]+LIVE_READ_RETRY:
+                s["message"] = "Live "+label+"读取中断，等待重试"
+                return False
+            del claim[step]
+        if not worker["online"] or worker["mode"] != "execute" or account["listed_session"] != worker["session_id"]:
+            s["message"] = "等待浏览器恢复执行绑定并同步活动账户，继续 Live 平仓结算"
+            return False
         snap = account["snapshot"]
-        if (snap.get("position_open") is not False or snap.get("unrealized_pnl") != 0 or not account["observed_at"]
+        if (account["read_session"] != worker["session_id"] or account["read_error"]
+                or snap.get("position_open") is not False or snap.get("unrealized_pnl") != 0 or not account["observed_at"]
                 or account["observed_at"] <= opened["updated_at"] or now-account["observed_at"] > OBS_TTL):
             reading = db.execute("""SELECT 1 FROM commands WHERE node=? AND worker=? AND account=?
                 AND action IN ('history.read','account.read') AND status IN ('pending','sending','queued','running')
@@ -906,21 +950,16 @@ class Center:
             s["message"] = "等待平仓后的 Live 账户余额"
             if reading:
                 return False
-            if not claim.get("read") or command(db,claim["read"])["status"] == "succeeded" and now-command(db,claim["read"])["updated"] > OBS_TTL:
+            read = record(command(db,claim["read"])) if claim.get("read") else None
+            if not read or read["session_id"] != worker["session_id"] or now-read["updated_at"] > OBS_TTL:
                 cmd = self._prepare(db,uid(),request({**req,"action":"account.read"}),inventory,opened["source"])
                 insert(db,cmd,"pending",now)
                 claim["read"] = cmd["id"]
             return False
-        node, worker = inventory[0][req["node_id"]], inventory[1][req["node_id"],req["worker_id"]]
         if not node["payout_quote_version"] or plugin_version_parts(worker.get("plugin_version")) < (1,7,1,0):
             s["message"] = "等待节点桥和插件升级以读取 Live 页面可领额"
             return False
         quote = record(command(db,claim["quote"])) if claim.get("quote") else None
-        if quote and quote["status"] in PENDING:
-            s["message"] = "等待读取 Portfolio 页面可领额"
-            return False
-        if quote:
-            require(quote["status"] == "succeeded", "Live 页面可领额读取失败 · "+quote["error"],409)
         if not quote or quote["session_id"] != worker["session_id"] or now-quote["result"]["observed_at"] > OBS_TTL:
             cmd = self._prepare(db,uid(),request({**req,"action":"profit.available","params":{}}),inventory,opened["source"])
             insert(db,cmd,"pending",now)
@@ -949,17 +988,31 @@ class Center:
         cfg = s["config"]
         return random.uniform(cfg[kind+"_delay_min"],cfg[kind+"_delay_max"])
 
-    def _removed_batch_members(self, db, s, missing, inventory, now):
-        """Share one post-fill Accounts page read per browser and persist its ID across restarts."""
+    def _verify_batch_lists(self, db, s, members, accounts_by_order, inventory, now):
+        """Recheck missing accounts and stalled position telemetry with one list read per worker."""
         _, workers, accounts = inventory
         checks = s.setdefault("exit_lists",{})
         confirmed, pending_workers, requests, receipts = set(), set(), {}, {}
-        for opened in missing:
+        stalled = False
+        for opened in members:
             key, wid = opened["id"], opened["worker_id"]
+            if key not in accounts_by_order:
+                continue
             entry = checks.get(key,{})
-            if entry.get("removed"):
+            account = accounts_by_order[key]
+            if account is None and entry.get("removed"):
                 confirmed.add(key)
                 continue
+            if account is not None:
+                if entry.get("removed"):
+                    checks.pop(key)
+                    entry = {}
+                card = account.get("card") or {}
+                last_sample = account.get("card_at") if card.get("active_positions") is not None else None
+                if batch_flat(account,opened) or now-max(opened["updated_at"],last_sample or 0)<BATCH_LIST_RETRY:
+                    checks.pop(key,None)
+                    continue
+                stalled = True
             worker = workers.get((s["node_id"],wid))
             if not worker or not worker["online"]:
                 continue
@@ -971,33 +1024,39 @@ class Center:
                 if check["status"] in PENDING:
                     pending_workers.add(wid)
                     continue
-                if exit_list_excludes(check,opened,worker,accounts):
+                if account is None and exit_list_excludes(check,opened,worker,accounts):
                     entry["removed"] = True
                     confirmed.add(key)
                     continue
-                if now - check["updated_at"] < 30:
+                if now - check["updated_at"] < BATCH_LIST_RETRY:
                     continue
             requests.setdefault(wid,[]).append(key)
         for wid, keys in requests.items():
             if wid in pending_workers:
                 continue
             req = request(dict(node_id=s["node_id"],worker_id=wid,action="accounts.list"))
-            try:
-                check = self._prepare(db,uid(),req,inventory,"strategy-"+(s.get("run") or "legacy"))
-            except Problem:
-                continue
-            insert(db,check,"pending",now)
+            since = max(m["updated_at"] for m in members if m["id"] in keys)
+            existing = db.execute("""SELECT id,created FROM commands WHERE node=? AND worker=? AND action='accounts.list'
+                AND status IN ('pending','sending','queued','running') ORDER BY created DESC LIMIT 1""",(s["node_id"],wid)).fetchone()
+            if existing:
+                if existing["created"]<since:
+                    continue
+                check_id = existing["id"]
+            else:
+                try:
+                    check = self._prepare(db,uid(),req,inventory,"strategy-"+(s.get("run") or "legacy"))
+                except Problem:
+                    continue
+                insert(db,check,"pending",now)
+                check_id = check["id"]
             for key in keys:
-                checks[key] = {"id":check["id"]}
-        return confirmed
+                checks[key] = {"id":check_id}
+        return confirmed,stalled
 
     def _monitor_batch(self, db, s, members, inventory, now):
         accounts = {m["id"]:batch_account(m,inventory[2]) for m in members if m["status"] == "succeeded"}
         missing = [m for m in members if m["id"] in accounts and accounts[m["id"]] is None]
-        for key, account in accounts.items():
-            if account is not None:
-                s.get("exit_lists",{}).pop(key,None)
-        removed = self._removed_batch_members(db,s,missing,inventory,now) if missing else set()
+        removed,stalled = self._verify_batch_lists(db,s,members,accounts,inventory,now)
         complete = True
         for opened in members:
             account = accounts.get(opened["id"])
@@ -1009,8 +1068,12 @@ class Center:
         if s["planned"]:
             s["message"] = "Live 领取已核验，等待本批同向再入场"
         elif not complete:
-            s["message"] = ("等待全量拉取活动账户列表，核对本批已移出的账户"
-                            if len(removed) < len(missing) else "等待本批全部持仓确认结束")
+            if len(removed)<len(missing):
+                s["message"] = "等待全量拉取活动账户列表，核对本批已移出的账户"
+            elif stalled:
+                s["message"] = "持仓读数未更新，等待全量拉取账户列表复核"
+            else:
+                s["message"] = "等待本批全部持仓确认结束"
         else:
             s.pop("exit_lists",None)
             s["members"] = []

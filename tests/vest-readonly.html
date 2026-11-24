@@ -33,12 +33,13 @@
   slInput.oninput = () => {
     const equity = sessionStorage.getItem('equityDuringFill');
     if (equity) {
-      document.querySelector('[data-testid="account-value"]').textContent = equity;
       sessionStorage.setItem('tradeEquity',equity);
       sessionStorage.removeItem('equityDuringFill');
+      fetch('https://api-gateway.hz.vestmarkets.com/v3/accounts?active=true&limit=500');
     }
   };
   form.querySelector('[data-testid="submit-long"]').onclick = () => {
+    document.querySelector('[data-testid="account-value"]').textContent=tradeEquity('Alpha','$1,050.00');
     const quantity = Number(form.querySelector('[data-testid="size-input"]').value)*2;
     const entry = 20000;
     const stop = entry-Number(slInput.value)/quantity;
@@ -89,9 +90,25 @@
   if(sessionStorage.getItem('scanReplacement')) accounts.splice(1,1,['Gamma','eval','Evaluation','1/2','$1,275.00']);
   sessionStorage.setItem('vest-active-account:fixture','Alpha');
   const nativeRows=accounts.map(([name,code],index)=>({id:name,attempt_index:index,status:2,step:1,steps_total:2,
-    stage:code==='eval'?1:2,account_type:code==='eval'?2:3,max_daily_loss_pct:'0.03',daily_reset_balance:'1000',
-    daily_loss_floor:name==='Beta'?'4719.37':'970',max_drawdown_limit:'750'}));
+    stage:code==='eval'?1:2,account_type:code==='eval'?2:3,max_daily_loss_pct:'0.03',daily_reset_balance:'1000',daily_reset_equity:'1001',created_at:1795482303139,
+    daily_loss_floor:name==='Beta'?'4719.37':'970',max_drawdown_limit:'750',initial_capital:'1000'}));
+  if(onAccounts || location.pathname.startsWith('/trade/')){
+    fetch('https://api-gateway.hz.vestmarkets.com/v3/accounts?active=true&limit=500');
+    fetch('https://api-gateway.hz.vestmarkets.com/v3/positions/opened-orders');
+    fetch('https://api-gateway.hz.vestmarkets.com/v3/positions/opened');
+    if(onAccounts) fetch('https://api-gateway.hz.vestmarkets.com/v3/trading-performance/series');
+  }
+  if(location.pathname.startsWith('/trade/') && sessionStorage.getItem('equityDuringFill')) {
+    for(const key of ['account-value','capital-indicator-daily-loss','capital-indicator-drawdown','account-health'])
+      document.querySelector('[data-testid="'+key+'"]').textContent='—';
+  }
+  for(const r of nativeRows) Object.assign(r,{daily_reset_base_limit:'30',daily_reset_at:Date.now()-1000});
   fetch('https://api-gateway.hz.vestmarkets.com/v3/capital/accounts/active');
+  if(location.pathname.startsWith('/trade/') && sessionStorage.getItem('nativePositionProbe')){
+    document.getElementById('positions').innerHTML='<table><tr><td><a href="/trade/NQ-PERP"><span data-testid="position-symbol-probe">NQ</span></a></td></tr></table>';
+    document.querySelector('[data-testid="capital-indicator-drawdown"]').remove();
+    fetch('https://api-gateway.hz.vestmarkets.com/v3/positions/opened');
+  }
   renderCards();
   if(onAccounts && sessionStorage.getItem('partialDirectory')) {
     const grid=document.querySelector('#deskAccounts .grid');

@@ -73,14 +73,29 @@
         phase:row.phase,category:row.category,active_positions:card?.active_positions ?? null};
     });
   }
-  async function read(full, guard, native, previous, since=0) {
+  async function read(full, guard, native, previous, since=0, verifyPositions=false) {
     const deadline = Date.now() + (full ? 12000 : 1500);
     let prior;
     do {
       guard();
       const cards = sample();
-      const source = cards && await native();
-      if (cards && source && source.at >= since && Date.now()/1000-source.at<=330) {
+      const source = (cards || verifyPositions) && await native(verifyPositions ? 'inventory' : 'directory');
+      if (source && source.at >= since && Date.now()/1000-source.at<=330) {
+        // A post-command pair of complete responses identifies removed accounts and flat positions
+        // even if an evaluation card has disappeared or still shows the previous position count.
+        if (verifyPositions && source.position_at>=since && source.position_at>0 && Date.now()/1000-source.position_at<=30) {
+          const visibleById=new Map((cards || []).map(card=>[card.id,card]));
+          const items=source.rows.map(row=>{
+            const card=visibleById.get(row.id);
+            const matched=card?.active_positions===row.active_positions ? card : null;
+            return {...matched,...row,name:card?.name || row.name};
+          });
+          return {items,observed_at:Date.now()/1000,source_at:source.at,source};
+        }
+        if (verifyPositions) {
+          await new Promise(resolve=>setTimeout(resolve,220));
+          continue;
+        }
         const items=nativeItems(source,cards,previous);
         if (!items) { prior=undefined; await new Promise(resolve=>setTimeout(resolve,220)); continue; }
         const signature = membership(items);
@@ -89,7 +104,7 @@
       } else prior = undefined;
       await new Promise(resolve => setTimeout(resolve,220));
     } while (Date.now() < deadline);
-    throw Error('未读到完整的活动账户清单，请等待页面加载');
+    throw Error(verifyPositions ? '未收到本次复核的完整活动账户和持仓响应' : '未读到完整的活动账户清单，请等待页面加载');
   }
   const monitorFields = ['active_positions','pnl','drawdown','drawdown_limit','daily_loss','daily_limit'];
   const directoryFields = [...monitorFields,'pnl_percent','equity','health'];

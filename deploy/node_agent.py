@@ -99,7 +99,11 @@ class Releases:
         if not self.cache.exists():
             subprocess.run(["git","init","--bare","--quiet",str(self.cache)],check=True,timeout=20,creationflags=HIDDEN)
         try:
-            self.git("fetch","--no-tags",self.origin,"+refs/heads/main:refs/remotes/vest/main")
+            # A named promisor remote lets git archive lazily fetch blobs for fleet/ and extension/.
+            self.git("config","remote.vest.url",self.origin)
+            self.git("config","remote.vest.promisor","true")
+            self.git("config","remote.vest.partialclonefilter","blob:none")
+            self.git("fetch","--filter=blob:none","--no-tags","vest","+refs/heads/main:refs/remotes/vest/main")
         except subprocess.SubprocessError as err:
             raise RuntimeError("无法从指定仓库读取 main，请检查网络和节点的 Git 读取权限") from err
         try:
@@ -113,22 +117,24 @@ class Releases:
             tree = temp/"tree"
             tree.mkdir()
             archive = temp/"release.tar"
-            self.git("archive","--format=tar","--output",str(archive),rev,"fleet","extension")
-            with tarfile.open(archive,"r:") as tar:
-                for item in tar:
-                    parts = PurePosixPath(item.name).parts
-                    if (not parts or parts[0] not in ("extension","fleet") or
-                            any(not re.fullmatch(r"[\w.-]+",p) or p in (".","..") for p in parts)):
-                        raise ValueError("Invalid release path")
-                    path = tree.joinpath(*parts)
-                    if item.isdir():
-                        path.mkdir(exist_ok=True,parents=True)
-                    elif item.isfile() and 0 <= item.size <= 32_000_000:
-                        path.parent.mkdir(exist_ok=True,parents=True)
-                        with tar.extractfile(item) as src, path.open("xb") as dst:
-                            shutil.copyfileobj(src,dst)
-                    else:
-                        raise ValueError("Unsupported release entry")
+            # Archiving the commit with a pathspec still prefetches unrelated blobs on some Git versions.
+            for directory in ("fleet","extension"):
+                self.git("archive","--format=tar","--output",str(archive),"--prefix="+directory+"/",rev+":"+directory)
+                with tarfile.open(archive,"r:") as tar:
+                    for item in tar:
+                        parts = PurePosixPath(item.name).parts
+                        if (not parts or parts[0] != directory or
+                                any(not re.fullmatch(r"[\w.-]+",p) or p in (".","..") for p in parts)):
+                            raise ValueError("Invalid release path")
+                        path = tree.joinpath(*parts)
+                        if item.isdir():
+                            path.mkdir(exist_ok=True,parents=True)
+                        elif item.isfile() and 0 <= item.size <= 32_000_000:
+                            path.parent.mkdir(exist_ok=True,parents=True)
+                            with tar.extractfile(item) as src, path.open("xb") as dst:
+                                shutil.copyfileobj(src,dst)
+                        else:
+                            raise ValueError("Unsupported release entry")
             manifest = tree/"extension"/"manifest.json"
             data = read_json(manifest)
             if not (tree/"fleet"/"updates.py").is_file() or not data or data.get("manifest_version") != 3:

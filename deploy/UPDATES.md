@@ -4,6 +4,8 @@
 
 ## 首次接入
 
+Linux 控制中心与 Windows Server 节点使用公网 IP 和端口时，可直接使用[自动安装脚本](bootstrap/README.md)。脚本会安装环境、生成证书、登记节点，并在专用浏览器加载插件。
+
 1. 中心先运行本仓库的新代码。已有 Compose 中心更新工作目录后，运行 `docker compose --env-file center.env -f deploy/center.compose.yml up -d` 并 `docker compose --env-file center.env -f deploy/center.compose.yml restart center`，沿用原卷和管理密钥。
 2. 在每个节点准备下列配置。节点访问中心的 HTTPS 地址，中心访问节点原有的 HTTPS 桥地址。更新服务通过出站 HTTPS 领取指令，无需额外开放端口。原有节点沿用原 ID、桥数据库和独立密钥。旧部署若共用节点密钥，先在各节点与中心换成一一对应的密钥。
 3. 按下方步骤安装适合该主机的更新服务。旧节点首次迁移时，先暂停该节点策略，等已有浏览器操作返回，再将原桥进程交给新服务托管。其余节点可继续运行。

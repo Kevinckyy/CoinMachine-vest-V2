@@ -60,10 +60,16 @@
 | `phase` | `1/2`、`2/2`、`live` 或 `unknown` |
 | `from_date,to_date` | 北京时间 `YYYY-MM-DD`，含首尾日期，可分别留空 |
 | `start_time,end_time` | 每个所选日的 `HH:MM` 时段，左闭右开，结束早于开始时跨至次日。两者相等表示全天 |
-| `section` | `position` 持仓盈亏、`order` 平台订单、`payout` 平台出金、`withdrawal` 系统领取回执、`instruction` 交易指令。默认为 `position` |
+| `section` | `position` 持仓盈亏、`order` 平台订单、`payout` Live 利润领取、`withdrawal` 系统领取回执、`instruction` 交易指令、`account_history` 平台账户历史、`deposit` 链上入金、`chain_withdrawal` 链上提现。默认为 `position` |
+| `account_state` | 查看账户历史时可选 `closed`（已结束，包括通过、失效、领取、到期）或 `active`，省略表示全部已采集状态 |
+| `owner_state` | 在持仓、订单、领取或账户历史中按归属账户当前状态筛选。取 `active` 或 `closed` 时同步筛选盈亏汇总、阶段胜率和明细，省略时包含归属状态未知的记录。 |
 | `offset` | 当前明细的非负偏移，每页 50 条。切换明细和翻页保留同一筛选的汇总 |
 
-响应包含 `timezone,summary,nodes,section,total,offset,items`。每个节点含 `node_id,label,stages` 和节点小计。汇总字段包括 `wins,losses,flat,settled,unsettled,win_rate,realized_pnl,total_paid,completed_payouts,total_withdrawn,withdrawals`。其中 `win_rate` 为 0 至 1 的比率，分母为有已实现盈亏的平仓数。无已结算样本时，胜率和已实现盈亏返回 `null`。金额统一为 USDC，聚合精度为百万分之一。
+响应包含 `timezone,summary,nodes,section,total,offset,items,counts,cash`。每个节点含 `node_id,label,stages` 和节点小计。交易汇总字段包括 `wins,losses,flat,settled,unsettled,win_rate,realized_pnl,total_paid,completed_payouts,total_withdrawn,withdrawals`。`win_rate` 分母为有已实现盈亏的平仓数，没有已结算样本时返回 `null`。交易金额以 USDC 汇总。`counts` 表示筛选范围内已采集的记录数，`cash` 按链上资金方向和原始币种分组，含记录数及成功记录的金额合计。币种缺失单独成组，没有成功记录时合计为 `null`。
+
+插件 1.10.0 随网页加载归档活动及历史账户、平台订单、Live 利润领取和链上资金流水。节点通过独立的 `GET /v1/archive?after=序号` 增量同步，每页最多 200 行。中心「盈亏分析 → 导入历史 JSON」可补入已保存的原始响应页或记录数组。管理接口 `POST /v1/analytics/import` 接受 `node_id,worker_id,items`，其中 `items` 为已转换的归档行，单次最多 200 行。重传按平台编号和更新时间合并。账户历史使用创建时间或已取得的结束时间筛选；订单和链上流水使用创建时间。归档覆盖网页实际加载及操作者导入的分页。
+
+插件 1.11.0 也采集 `/v3/positions` 已加载分页里的已平仓记录。归属使用平台账户 ID，盈亏取平仓行的 `pnl`，中心用持仓编号去重并关联活动或已关闭账户的阶段。账户历史中的阶段净值变动为最终净值减起始资金，交易胜率按已结算持仓计算。
 
 `total_paid` 统计平台已完成且有执行时间的出金净额。`total_withdrawn` 独立统计系统核验过来源余额的领取毛额。平台订单按创建时间、已结算持仓按平仓时间、平台已完成出金按执行时间、系统领取回执按余额核验时间筛选。缺平台时间的持仓使用已标明的观测时间。节点内对同一交易账户和编号去重，全网汇总还会去除跨节点的镜像记录。
 
@@ -92,7 +98,7 @@ Content-Type: application/json
 | `action` | `account` | `params` | 成功返回的 `result` |
 | --- | --- | --- | --- |
 | `accounts.list` | 省略 | `{}` | 全量拉取账户列表，按平台账户 ID 更新活动清单并合并 `/accounts` 卡片读数，返回 `inventory` 和 `count` |
-| `accounts.read_all` | 省略 | `{}` | 全量读取账户信息，先全量拉取列表并确认本地缓存，再在 `/portfolio` 逐户读取并回传。返回 `listed_at,total,read,partial,failed,accounts` |
+| `accounts.read_all` | 省略 | `{}` | 插件 1.11 起在账户页复用有效的原生响应，按平台 ID 合并全表，写入本地缓存后结束。返回 `source,listed_at,total,read,partial,failed,accounts`，各账户列出数据时间、可用数值和缺失项。 |
 | `account.read` | 必填 | `{}` | `observation`，含余额、净值、浮盈亏、风险指标和时间 |
 | `positions.read` | 必填 | `{}` | `observation.snapshot`，含明确的持仓状态、ID、方向、数量、均价和原生保护价 |
 | `history.read` | 必填 | `{}` | 只读。补读该账户的历史持仓及原生订单，对实盘或已归档账户也尝试读取 Portfolio 出金。返回 `observation,tables`。各表含 `available` 和可用时的 `ready,rows_read,skipped,bottom_seen`。历史行分批写入节点桥 |
@@ -152,6 +158,11 @@ Content-Type: application/json
 | 插件 | `POST /v1/plugin/poll` | 原子领取一条指令，空闲返回 `{"command":null}`。支持全量读取的插件上报 `portfolio_version:1`，本地清单写入成功后发送 `cached_scan` 指令 ID，按 `scan.stage` 和 `scan.target` 执行 |
 | 插件 | `POST /v1/plugin/intent` | 开仓携带 `id,stage,proof,observation`，用 `proof.quantity,stop_loss,take_profit` 核对表单。传入 `allow_refill=true` 后，金额变化时返回 `refill=true,authorize_click=false` 和最新金额。填妥后用同一指令再次核验，仅 `authorize_click=true` 允许一次点击 |
 | 插件 | `POST /v1/plugin/result` | 按原会话和指令 ID 上报 `ok,result,error`，可重传回执 |
+| 插件 | `POST /v1/plugin/archive` | 传送节点浏览器留存的历史批次，携带 `worker_id,session_id,generation,items`，成功返回 `accepted:true` |
+
+插件 1.10.0 对支持 `read_receipt` 的桥仅提交一次 `account.read` / `positions.read` 快照。快照内的 `capital_metrics` 保留金额对或百分比，读取时间见 `snapshot.observed_at`。页面缺少整个日亏损或回撤指标时，插件可用当前净值和同账户、同交易日的 Capital 参数按网页公式补值，标记 `source:"active_accounts"`。日亏损另行核对平台的日切时间；有冲突或正在加载的可见指标不能走这个补值分支。两条底线始终直接取平台字段。
+
+`daily_reset_balance` 和 `daily_reset_equity` 分别对应平台日切余额及净值。1.9.0 的旧回执曾以 `daily_reset_equity` 记录日切余额。只读持仓可附 `opened_at`（平台开仓时间，Unix 秒）和 `position_reference_at`（使用结构化响应补字段时的来源时间）。持仓数量或均价只在当前平台账户、阶段及可见持仓 ID 匹配，并且网页响应在 15 秒内时补读。
 
 中心发送的执行请求包含管理接口的目标和参数，另有 `id,instance_id,session_id,phase,source,created_at,expires_at`。资金指令带 `account_ref`，平仓和保护修改还带 `expected_position`。插件上报时携带 `worker_id,session_id,generation,mode,label`；同一浏览器配置文件的授权轮次单调递增，旧轮次无法领取或授权点击。回执使用实际领取指令的会话。
 

@@ -31,7 +31,8 @@ def detail(db, a):
         return None
     if "tracked_position_id" in a and a["tracked_position_id"] != pid:
         return None
-    row = db.execute("""SELECT b.closed, b.phase, json_extract(c.intents,'$.open.time') AS submitted_at
+    row = db.execute("""SELECT b.closed, b.phase,json_extract(b.data,'$.opened_at') AS opened_at,
+        json_extract(c.intents,'$.open.time') AS submitted_at
         FROM book b LEFT JOIN commands c ON c.id=json_extract(b.data,'$.open_command') AND c.node=b.node
           AND c.worker=b.worker AND c.account=b.account AND c.action='order.open' AND c.status='succeeded'
         WHERE b.node=? AND b.worker=? AND b.account=? AND b.kind='position' AND b.ref=?""",
@@ -42,7 +43,7 @@ def detail(db, a):
         return None
     return {**{k: s.get(k) for k in ("position_id", "symbol", "side", "quantity", "entry_price")},
             "take_profit": protection(s, "tp"), "stop_loss": protection(s, "sl"),
-            "submitted_at": row["submitted_at"] if row else None}
+            "submitted_at": row["submitted_at"] if row else None,"opened_at":(row["opened_at"] if row else None) or s.get("opened_at")}
 
 
 def metrics(db, node_id):

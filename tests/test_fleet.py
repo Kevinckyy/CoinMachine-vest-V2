@@ -58,6 +58,8 @@ class FleetTest(unittest.TestCase):
             return bridge.refresh_cards(data) if verb=="PUT" else bridge.status()
         if path.startswith("/v1/ledger?after="):
             return bridge.ledger_page(int(path.split("=")[1]))
+        if path.startswith("/v1/archive?after="):
+            return bridge.ledger_page(int(path.split("=")[1]),True)
         if path.startswith("/v1/logs?after="):
             return bridge.log_page(int(path.split("=")[1]))
         key = path.split("/")[3]
@@ -202,6 +204,20 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(partial["equity"], 0)
         latest = self.center.state("east")["workers"][0]["portfolio_scan"]
         self.assertEqual((latest["id"],latest["partial"]), (key,1))
+
+    def test_bulk_native_directory_retry_preserves_counts_and_source_time(self):
+        key=self.start_portfolio_scan()
+        detail={"id":"card-New","values":{"observed_at":self.time-200,"daily_unlimited":True,
+                "equity":987,"equity_at":self.time-200,"equity_source":"performance_series",
+                "health":90,"drawdown":13,"drawdown_limit":130,"max_drawdown_floor":870}}
+        for _ in range(2):
+            ack=self.scan_directory(key,["New"],details=[detail])
+            self.assertEqual(ack["portfolios"]["New"]["equity_at"],self.time-200)
+            self.assertNotEqual(ack["risks"]["New"].get("equity"),987)
+        self.assertIsNone(self.plugin("east","poll",cached_scan=key)["command"])
+        self.center.sync("east")
+        scan=self.center.get(key)
+        self.assertEqual((scan["status"],scan["result"]["read"],scan["result"]["total"]),("succeeded",1,1))
 
     def test_empty_portfolio_scan_cache_ack_and_idle_timeout(self):
         key = self.start_portfolio_scan()
@@ -589,7 +605,9 @@ class FleetTest(unittest.TestCase):
                 self.assertFalse(self.nodes["east"].get(key)["intents"])
 
     def test_platform_identity_and_stale_floor_retry_without_a_day_lock(self):
-        for name,proof in (("Other",{"reference_card_id":"wrong"}),("Stale",{"reference_at":self.time-331})):
+        for name,proof in (("Other",{"reference_card_id":"wrong"}),("Stale",{"reference_at":self.time-331}),
+                           ("ExpiredFunds",{"risk_source":"flat_balance","risk_at":self.time-16}),
+                           ("Reserved",{"risk_source":"flat_balance","risk_issue":"orders"})):
             self.card_report("east",[self.card(name)])
             self.center.sync("east")
             self.center.submit(name,self.req(name=name,action="order.open",params=dict(side="buy",micro=1)))
@@ -775,6 +793,66 @@ class FleetTest(unittest.TestCase):
         self.assertTrue(s["claims"]["closed-fill"]["done"])
         self.assertFalse(any(c["action"]=="profit.withdraw" for c in self.center.state("east")["commands"]))
 
+    def test_live_settlement_recovers_read_only_navigation_and_rebinding(self):
+        live = self.card("Live",category="funded",phase="live")
+        self.card_report("east",[live])
+        self.report("east",observation={**self.reading("Live"),"category":"funded","phase":"live"})
+        self.center.sync("east")
+        state = {"run":"late","policy_version":2,"claims":{}}
+        opened = dict(id="filled",node_id="east",worker_id="browser",account="Live",phase="live",
+                      source="strategy-late",updated_at=self.time)
+        def settle():
+            with self.center.db.tx() as db:
+                inv = self.center._inventory(db,"east")
+                return self.center._live_exit(db,state,opened,inv[2]["east","browser","Live"],inv,self.time)
+        def deliver(action):
+            self.center.sync("east")
+            cmd = self.plugin("east","poll")["command"]
+            self.assertEqual(cmd["action"],action)
+            return cmd["id"]
+        self.assertFalse(settle())
+        first = deliver("account.read")
+        self.plugin("east","result",id=first,ok=False,error="页面跳转未完成或授权已变化")
+        self.center.sync("east")
+        self.assertFalse(settle())
+        self.assertEqual(state["claims"]["filled"]["read"],first)
+        self.time += 31
+        self.plugin_meta.update(session_id="rebound",generation=2,mode="readonly")
+        self.card_report("east",[live])
+        self.center.sync("east")
+        self.assertFalse(settle())
+        self.assertIn("执行绑定",state["message"])
+        self.plugin_meta.update(session_id="restored",generation=3,mode="execute")
+        self.card_report("east",[live])
+        self.center.sync("east")
+        self.assertFalse(settle())
+        retry = deliver("account.read")
+        self.assertNotEqual(first,retry)
+        self.assertFalse(settle())
+        self.assertEqual(state["claims"]["filled"]["read"],retry)
+        self.plugin("east","result",id=retry,ok=False,error="余额响应已过期",result={"read_retry":"balance"})
+        self.time += 31
+        self.plugin("east","heartbeat")
+        self.center.sync("east")
+        self.assertFalse(settle())
+        retry = deliver("account.read")
+        self.plugin("east","result",id=retry,ok=True,result={"observation":{**self.reading("Live"),"phase":"live","category":"funded"}})
+        self.center.sync("east")
+        self.assertFalse(settle())
+        quote = deliver("profit.available")
+        self.plugin("east","result",id=quote,ok=False,error="跳转超时",result={"read_retry":"navigation"})
+        self.time += 31
+        self.plugin("east","heartbeat")
+        self.center.sync("east")
+        self.assertFalse(settle())
+        again = deliver("profit.available")
+        self.assertNotEqual(quote,again)
+        self.plugin("east","result",id=again,ok=False,error="领取账户不匹配")
+        self.center.sync("east")
+        with self.assertRaisesRegex(Problem,"领取账户不匹配"):
+            settle()
+        self.assertNotIn("withdraw",state["claims"]["filled"])
+
     def test_entry_tiers_only_use_confirmed_openings_of_that_account_and_day(self):
         req = self.req(action="order.open",params=dict(side="buy",micro=1))
         self.center.submit("unfilled",req)
@@ -789,10 +867,98 @@ class FleetTest(unittest.TestCase):
             self.time = daily_floor.entry_day_window(self.time)["end"]
             self.assertFalse(self.center._opened_today(db,a))
 
+    def test_account_notice_permission_and_handoff(self):
+        archive = dict(kind="account_history",ref="phase-1",source_account_id="phase-1",name="Account 218",
+                       phase="1/2",status="3",root_account_id="phase-1",created_at=self.time-90,updated_at=self.time)
+        self.plugin("east","archive",items=[archive])
+        args = dict(kind="phase2",platform_id="phase-1",successor_roots=["phase-1"])
+        self.assertFalse(self.plugin("east","poll",notice_kind="phase2")["notice"]["enabled"])
+        with self.assertRaises(Problem):
+            self.plugin("east","notice.reserve",**args)
+        self.start_ready("east")
+        self.assertTrue(self.plugin("east","poll",notice_kind="phase2")["notice"]["enabled"])
+        with self.assertRaises(Problem):
+            self.plugin("east","notice.reserve",**{**args,"successor_roots":["other"]})
+        self.assertTrue(self.plugin("east","notice.reserve",**args)["authorize"])
+        with self.assertRaises(Problem):
+            self.plugin("east","notice.reserve",**args)
+        pending = self.plugin("east","poll")["notice"]["pending"]
+        self.assertEqual(pending["name"],"Account 218")
+        proof = {**args,"selected":"phase-2","root":"phase-1","phase":"2/2","count":0,"positions_at":self.time}
+        with self.assertRaises(Problem):
+            self.plugin("east","notice.complete",**{**proof,"count":1})
+        self.assertTrue(self.plugin("east","notice.complete",**proof)["completed"])
+        with self.assertRaises(Problem):
+            self.plugin("east","notice.reserve",**args)
+        self.plugin("east","archive",items=[{**archive,"ref":"phase-2","source_account_id":"phase-2","phase":"2/2"}])
+        live = dict(kind="live",platform_id="phase-2",active_phase=None)
+        self.assertTrue(self.plugin("east","notice.reserve",**live)["authorize"])
+        with self.assertRaises(Problem):
+            self.plugin("east","notice.reserve",**live)
+        self.assertTrue(self.plugin("east","notice.complete",**{**proof,**live,"selected":"funded","phase":"live"})["completed"])
+        closed = dict(kind="closed",platform_id="breached",active=False)
+        self.plugin("east","archive",items=[{**archive,"ref":"breached","source_account_id":"breached","status":"5"}])
+        self.assertTrue(self.plugin("east","notice.reserve",**closed)["authorize"])
+        with self.assertRaises(Problem):
+            self.plugin("east","notice.complete",**closed,prior_active=True)
+        self.assertTrue(self.plugin("east","notice.complete",**closed,prior_active=False)["completed"])
+        self.center.strategy("stop",{},"east")
+        self.center.sync("east")
+        self.assertFalse(self.plugin("east","poll",notice_kind="live")["notice"]["enabled"])
+
+    def test_archive_replication_import_and_closed_account_history(self):
+        at=self.time-60
+        account=dict(kind="account_history",ref="vest-206",source_account_id="vest-206",name="Account 206",
+                     phase="2/2",status="5",created_at=at-300,finalized_at=at,updated_at=at,final_equity=0)
+        order=dict(kind="order",ref="ord-1",source_account_id="vest-206",quantity=2,execution_price=17,
+                   symbol="NDX-USD-PERP",status="filled",created_at=at-2,updated_at=at-1)
+        deposit=dict(kind="deposit",ref="deposit-1",amount=5.25,currency="USDC",status="pending",created_at=at,updated_at=at)
+        chain={**deposit,"kind":"chain_withdrawal","ref":"out-1","amount":2,"status":"completed"}
+        self.plugin("east","archive",items=[order,deposit,chain,account])
+        self.plugin("east","archive",items=[order,deposit,chain,account])
+        self.center.sync("east")
+        self.assertEqual(self.nodes["east"].ledger_page(0)["items"],[])
+        self.assertEqual(len(self.nodes["east"].ledger_page(0,True)["items"]),4)
+        report=self.center.analytics(dict(section="account_history",account_state="closed"))
+        self.assertEqual((report["total"],report["items"][0]["account"],report["items"][0]["final_equity"]),(1,"Account 206",0))
+        self.assertEqual(report["counts"]["closed_accounts"],1)
+        self.assertFalse(any(a["name"]=="Account 206" for a in self.center.state()["accounts"]))
+        order_report=self.center.analytics(dict(section="order",account="Account 206",phase="2/2"))
+        self.assertEqual((order_report["total"],order_report["items"][0]["quantity"]),(1,2))
+        position=dict(kind="position",ref="pos-closed",source_account_id="vest-206",closed_at=at,
+                      symbol="NQ-PERP",opened_at=at-5,pnl=-2.75)
+        for _ in range(2):
+            self.plugin("east","archive",items=[position])
+        self.center.sync("east")
+        settled=self.center.analytics(dict(section="position",account="Account 206",phase="2/2"))
+        self.assertEqual((settled["total"],settled["summary"]["realized_pnl"],settled["summary"]["losses"]),(1,-2.75,1))
+        self.assertEqual(self.center.analytics({"section":"position","owner_state":"closed"})["summary"]["realized_pnl"],-2.75)
+        self.assertEqual(self.center.analytics({"section":"position","owner_state":"active"})["total"],0)
+        self.assertEqual(next(r for r in report["cash"] if r["kind"]=="deposit")["settled_amount"],None)
+        done={**deposit,"status":"completed","updated_at":at+10}
+        self.center.import_archive(dict(node_id="east",worker_id="browser",items=[done]))
+        self.plugin("east","archive",items=[{**deposit,"updated_at":at+1}])
+        self.center.sync("east")
+        report=self.center.analytics(dict(section="deposit",node_id="east"))
+        self.assertEqual((report["total"],report["items"][0]["status"]),(1,"completed"))
+        self.assertEqual({r["kind"]:r["settled_amount"] for r in report["cash"]},{"deposit":5.25,"chain_withdrawal":2})
+        self.assertEqual(report["summary"]["total_paid"],0)
+        payout=dict(ref="aaaabbbb0001",source_account_id="vest-live",phase="live",net_amount=9,gross_amount=10,
+                    kind="platform_payout",status="completed",created_at=at,updated_at=at,executed_at=at)
+        live={**account,"ref":"vest-live","source_account_id":"vest-live","name":"Shared","phase":"live","status":"2"}
+        self.plugin("east","archive",items=[live,payout])
+        self.report("east",history=dict(name="Shared",items=[dict(kind="payout",ref="display|aaaa...0001|"+str(at),
+            display_id="aaaa...0001",net_amount=9,gross_amount=10,status="completed",created_at=at,updated_at=at,executed_at=at)]))
+        self.center.sync("east")
+        payouts=self.center.analytics(dict(section="payout",node_id="east"))
+        self.assertEqual((payouts["total"],payouts["summary"]["total_paid"]),(1,9))
+        with self.assertRaises(Problem):
+            self.center.import_archive(dict(node_id="east",worker_id="missing",items=[done]))
+
     def test_plugin_version_reporting_and_old_clients(self):
         target = self.center.plugin_version
         for actual,status,can_open in (("1.5.1","behind",False),("1.7.1","behind",False),(target,"current",True),
-                                      ("1.10.0","ahead",True),("","unknown",False)):
+                                      (str(int(target.split('.')[0])+1)+".0.0","ahead",True),("","unknown",False)):
             self.plugin("east","heartbeat",plugin_version=actual)
             self.center.sync("east")
             state = self.center.state("east")
@@ -1279,6 +1445,34 @@ class FleetTest(unittest.TestCase):
         self.center.decide()
         self.assertEqual(self.center.state()["commands"][0]["account"], "Shared")
         self.assertEqual(self.center.state("west")["commands"], [])
+
+    def test_stale_open_card_requests_one_full_list_and_waits_for_positive_confirmation(self):
+        self.start_cards([self.card("Holding")])
+        self.center.sync("east")
+        opened = self.fill_exam_order()
+        self.time += 1
+        holding = self.card("Holding",active_positions=1)
+        self.card_report("east",[holding])
+        self.time += 29
+        self.plugin("east","heartbeat")
+        self.center.sync("east")
+        self.center.decide()
+        self.assertFalse(any(c["action"]=="accounts.list" for c in self.center.state("east")["commands"]))
+        self.time += 2
+        self.center.decide()
+        self.center.decide()
+        state = self.center.state("east")
+        self.assertIn("持仓读数未更新",state["strategy"]["message"])
+        self.assertEqual(len([c for c in state["commands"] if c["action"]=="accounts.list"]),1)
+        self.finish_exit_list([holding])
+        self.assertEqual(self.center.state("east")["strategy"]["members"],[opened["id"]])
+        self.time += 31
+        self.plugin("east","heartbeat")
+        self.center.sync("east")
+        self.center.decide()
+        self.finish_exit_list([self.card("Holding")])
+        done = self.center.state("east")["strategy"]
+        self.assertEqual((done["members"],done["message"],done["next_at"]),([],"批间等待",self.time+60))
 
     def test_disappeared_batch_shares_one_full_list_and_resumes_after_cooldown(self):
         self.center.strategy("config",{"batch_size":2},"east")

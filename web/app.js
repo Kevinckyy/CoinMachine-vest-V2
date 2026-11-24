@@ -78,6 +78,7 @@ const category = {
   closed: '已关闭',
   failed: '已失败'
 };
+const stageNames = {'1/2':'考核 1/2','2/2':'考核 2/2',live:'Live'};
 const dir = {
   buy: '做多',
   sell: '做空',
@@ -293,28 +294,63 @@ const liveMetrics = new Map();
 const metricKey = (a, cardId, pid, count) => JSON.stringify([a.node_id,a.worker_id,a.name,cardId ?? '',pid ?? '',count]);
 const amountAndLimit = (used, limit) => money(used)+' / '+money(limit);
 const protectionAmount = n => n === 'omitted' ? '未设置' : money(n);
-function metricText(m) {
-  return {pnl:money(m.pnl), drawdown:amountAndLimit(m.drawdown,m.drawdown_limit),
-    daily:amountAndLimit(m.daily_loss,m.daily_limit), at:time(m.at)};
+function metricText(a,m) {
+  if (a.ambiguous) return {pnl:money(m.pnl),drawdown:amountAndLimit(m.drawdown,m.drawdown_limit),
+    daily:amountAndLimit(m.daily_loss,m.daily_limit),at:time(m.at)};
+  const snap=a.snapshot, risk=a.risk || {}, floor=a.daily_floor;
+  const portfolio=a.portfolio?.observed_at >= (a.phase_started_at || 0) ? a.portfolio : {};
+  const day=floor && m.at>=floor.start && m.at<floor.end ? floor : null;
+  const latestLimits=(a.risk_at || 0)>=(portfolio.observed_at || 0) ? risk : portfolio;
+  const drawdownLimit=m.drawdown_limit ?? latestLimits.drawdown_limit ?? portfolio.drawdown_limit ?? risk.drawdown_limit;
+  const dailyLimit=m.daily_limit ?? day?.daily_limit;
+  const drawdownFloor=latestLimits.max_drawdown_floor ?? portfolio.max_drawdown_floor ?? risk.max_drawdown_floor;
+  const samePosition=a.position_detail?.position_id && a.position_detail.position_id===snap.position_id &&
+    (!Object.hasOwn(a,'tracked_position_id') || a.tracked_position_id===snap.position_id) &&
+    snap.position_open===true && (!snap.phase || snap.phase===a.phase) && positionCount(a)===1 && m.at>=a.observed_at;
+  // Vest's evaluation cards show the profit target and aggregate unrealized PnL.
+  // The confirmed position balance excludes that PnL, unlike the last reported equity.
+  const balanceEstimate=samePosition && Number.isFinite(snap.balance) && Number.isFinite(m.pnl);
+  const equity=m.equity ?? (balanceEstimate ? snap.balance+m.pnl : null);
+  const prefix=m.equity==null && balanceEstimate ? '≈' : '';
+  const sampleAt=portfolio.equity_at;
+  const recentSample=portfolio.equity_source==='performance_series' && Number.isFinite(sampleAt) && sampleAt<=m.at &&
+    m.at-sampleAt<=600 && sampleAt>=(a.position_detail?.opened_at || a.position_detail?.submitted_at || 0);
+  function loss(used,limit,reference,sampled) {
+    if (Number.isFinite(used)) return amountAndLimit(used,limit);
+    if (Number.isFinite(equity) && Number.isFinite(reference))
+      return prefix+amountAndLimit(Math.max(0,reference-equity),limit);
+    if (recentSample && Number.isFinite(sampled)) return amountAndLimit(sampled,limit)+'（采样 '+time(sampleAt)+'）';
+    return amountAndLimit(null,limit);
+  }
+  const dailyBase=day?.verified && Number.isFinite(day.floor) && Number.isFinite(dailyLimit) ? day.floor+dailyLimit : null;
+  const initialCapital=Number.isFinite(drawdownFloor) && Number.isFinite(drawdownLimit) ? drawdownFloor+drawdownLimit : null;
+  return {pnl:money(m.pnl), drawdown:loss(m.drawdown,drawdownLimit,initialCapital,portfolio.drawdown),
+    daily:dailyLimit==null && (portfolio.daily_unlimited ?? risk.daily_unlimited)===true ? '无限额' :
+      loss(m.daily_loss,dailyLimit,dailyBase,day && sampleAt>=day.start ? portfolio.daily_loss : null), at:time(m.at)};
+}
+function positionMetricKey(a) {
+  const pid=Object.hasOwn(a,'tracked_position_id') ? a.tracked_position_id : a.snapshot.position_id;
+  return metricKey(a,a.card?.id,pid,positionCount(a));
 }
 function positions(accounts) {
   const rows = accounts.filter(a => a.present && positionCount(a)>0).map(a => {
-    const count = positionCount(a), d = a.position_detail, card = a.card || {}, risk = a.risk || {};
+    const count = positionCount(a), d = a.position_detail, card = a.card || {}, snap = a.snapshot;
     const cardLatest = a.card && a.card_at >= (a.observed_at || 0);
-    const base = cardLatest ? {...card,at:a.card_at} : {...risk,pnl:a.snapshot.unrealized_pnl,at:a.observed_at};
-    const pid = Object.hasOwn(a,'tracked_position_id') ? a.tracked_position_id : a.snapshot.position_id;
-    const key = metricKey(a,card.id,pid,count), tick = liveMetrics.get(key);
-    const m = tick && tick.at > base.at ? tick : base, values = metricText(m);
+    const base = cardLatest ? {...card,at:a.card_at} : {pnl:snap.unrealized_pnl,equity:snap.equity,at:a.observed_at,
+      drawdown:snap.capital_metrics?.drawdown?.current, drawdown_limit:snap.capital_metrics?.drawdown?.limit,
+      daily_loss:snap.capital_metrics?.daily_loss?.current, daily_limit:snap.capital_metrics?.daily_loss?.limit};
+    const key = positionMetricKey(a), tick = liveMetrics.get(key);
+    const m = tick && tick.at > base.at ? tick : base, values = metricText(a,m);
     const note = a.ambiguous ? '同名账户待核对' : count>1 ? count+' 笔持仓合计' : !d ? '等待该笔成交明细' : '';
     return `<tr data-position-key="${esc(key)}" data-observed-at="${esc(m.at)}"><td class="cell"><strong>${esc(a.alias || a.name)}</strong><small>${routeLabel(a)}</small>${note ? '<small>'+esc(note)+'</small>' : ''}</td>
-      <td>${esc(d?.symbol || '—')}</td><td>${d?.side ? tag(dir[d.side],d.side==='buy'?'good':'info') : '—'}</td>
+      <td class="nowrap">${esc(stageNames[a.phase] || '待确认')}</td><td>${esc(d?.symbol || '—')}</td><td>${d?.side ? tag(dir[d.side],d.side==='buy'?'good':'info') : '—'}</td>
       <td class="num">${esc(d?.quantity ?? '—')}</td><td class="num">${money(d?.entry_price)}</td>
       <td data-metric="pnl" class="num ${positive(m.pnl)}">${values.pnl}</td>
       <td data-metric="drawdown" class="num">${values.drawdown}</td><td data-metric="daily" class="num">${values.daily}</td>
       <td class="num">${protectionAmount(d?.take_profit)} / ${protectionAmount(d?.stop_loss)}</td>
-      <td>${time(d?.submitted_at)}</td><td data-metric="at">${values.at}</td></tr>`;
+      <td class="cell">${time(d?.submitted_at || d?.opened_at)}${!d?.submitted_at && d?.opened_at ? '<small>平台开仓</small>' : ''}</td><td data-metric="at">${values.at}</td></tr>`;
   });
-  return rows.length ? table(['账户 / 来源','合约','方向','Vest 数量','成交均价','浮动盈亏 · USDC','回撤 / 上限 · USD',
+  return rows.length ? table(['账户 / 来源','阶段','合约','方向','Vest 数量','成交均价','浮动盈亏 · USDC','回撤 / 上限 · USD',
     '每日亏损 / 上限 · USD','止盈 / 止损 · USD','下单时间','读取时间'],rows) : empty('暂无已读到的持仓','插件读取到活动持仓后会显示在这里。');
 }
 let readingMetrics = false;
@@ -328,10 +364,12 @@ async function refreshPositionMetrics() {
     if (token !== requestedToken) return;
     liveMetrics.clear();
     for (const m of items) liveMetrics.set(metricKey(m,m.card_id,m.position_id,m.active_positions),m);
+    const accounts=new Map(state.accounts.filter(a=>a.present && positionCount(a)>0).map(a=>[positionMetricKey(a),a]));
     for (const row of document.querySelectorAll('[data-position-key]')) {
       const m = liveMetrics.get(row.dataset.positionKey);
-      if (!m || m.at <= Number(row.dataset.observedAt)) continue;
-      const values = metricText(m);
+      const a=accounts.get(row.dataset.positionKey);
+      if (!a || !m || m.at <= Number(row.dataset.observedAt)) continue;
+      const values = metricText(a,m);
       for (const cell of row.querySelectorAll('[data-metric]')) {
         const key = cell.dataset.metric;
         if (cell.textContent !== values[key]) cell.textContent = values[key];
@@ -381,7 +419,14 @@ function nodesView() {
 function renderAccounts() {
   const list = state.accounts.filter(a => a.present && selectedNode === a.node_id && (a.name+' '+a.alias).toLowerCase().includes(accountQuery.trim().toLowerCase()));
   const rows = list.map(a => {
-    const key = addressKey(a), card = a.card || {}, risk = a.risk || {};
+    const key = addressKey(a), card = a.card || {}, risk = {...a.risk};
+    const detail=a.portfolio;
+    if (detail?.source==='native') {
+      for (const field of ['equity','health','daily_loss','daily_limit','drawdown','drawdown_limit','daily_unlimited']) {
+        const previousAt=Math.max(a.risk_at || 0,card[field]!=null ? a.card_at || 0 : 0);
+        if (detail[field]!=null && (risk[field]==null || detail.observed_at>=previousAt)) risk[field]=detail[field];
+      }
+    }
     const status = a.ambiguous ? '同名待核对' : !a.fresh ? '待刷新' : a.excluded ? '主账户' : !a.enabled ? '已停用' : category[a.category] || a.category;
     const pnl = Number.isFinite(card.pnl_percent) ? money(card.pnl)+' ('+card.pnl_percent+'%)' : money(card.pnl);
     return `<tr><td class="cell"><strong>${esc(a.alias || a.name)}</strong><small>${routeLabel(a)}</small></td>
@@ -390,7 +435,7 @@ function renderAccounts() {
       <td>${risk.daily_unlimited ? '无限额' : money(risk.daily_loss)+' / '+money(risk.daily_limit)}</td><td>${money(risk.drawdown)} / ${money(risk.drawdown_limit)}</td>
       <td>${money(risk.equity)}</td><td class="cell">${money(a.daily_floor?.floor)}<small>${a.daily_floor?.source === 'platform' ? '页面已读取' : '等待页面读取'}</small></td>
       <td>${risk.health == null ? '—' : esc(risk.health)+'%'}</td><td class="cell">${a.open_locked ? openLockLabel(a) : a.candidate ? '可候选' : a.in_pool ? '入池待选' : '—'}${openLockDetail(a)}</td>
-      <td class="cell">${time(Math.max(a.card_at || 0,a.observed_at || 0,a.portfolio?.observed_at || 0))}${a.portfolio ? '<small>详情 '+time(a.portfolio.observed_at)+(a.portfolio.missing.length ? ' · 字段不全' : '')+'</small>' : ''}</td><td><div class="actions">${btn('account','管理','link',key)}${btn('accountCmd','指令','link',key)}</div></td></tr>`;
+      <td class="cell">${time(Math.max(a.card_at || 0,a.observed_at || 0,detail?.observed_at || 0))}${detail ? '<small>详情 '+time(detail.observed_at)+(detail.missing.length ? ' · 字段不全' : '')+'</small>' : ''}${detail?.equity_source==='performance_series' ? '<small>净值采样 '+time(detail.equity_at)+'</small>' : ''}</td><td><div class="actions">${btn('account','管理','link',key)}${btn('accountCmd','指令','link',key)}</div></td></tr>`;
   });
   const node = state.nodes.find(n=>n.id===selectedNode);
   const workers = state.workers.filter(w=>w.node_id===selectedNode && w.online);
@@ -399,7 +444,7 @@ function renderAccounts() {
   const scans = state.workers.filter(w=>w.node_id===selectedNode && w.portfolio_scan).map(w=>{
     const s = w.portfolio_scan;
     const stage = s.status !== 'running' ? statuses[s.status]?.[0] || s.status :
-      s.stage === 'portfolio' ? '逐户读取中' : '拉取列表并更新缓存';
+      s.stage === 'portfolio' ? '读取账户详情' : '核对账户列表与缓存';
     return '<tr><td>'+esc(w.label)+'</td><td>'+esc(stage)+'</td><td>'+esc(s.total ?? '—')+'</td><td>'+esc(s.read ?? '—')+
       '</td><td>'+esc(s.partial ?? '—')+'</td><td>'+esc(s.failed ?? '—')+'</td><td>'+esc(s.error || '')+'</td></tr>';
   });

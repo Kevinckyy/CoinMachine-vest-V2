@@ -11,6 +11,7 @@ from .protocol import Problem, dump, ident, obj, require
 WEB = Path(__file__).resolve().parent.parent / "web"
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/reports.js": ("reports.js", "text/javascript; charset=utf-8"),
+          "/archive.js": ("../extension/archive.js", "text/javascript; charset=utf-8"),
           "/strategy.js": ("strategy.js", "text/javascript; charset=utf-8"),
           "/styles.css": ("styles.css", "text/css; charset=utf-8")}
 
@@ -97,12 +98,13 @@ def make_server(bind, port, app, token, plugin_token=None):
                     return app.status(ident(since) if since else None)
                 if keys == ["status"] and method == "PUT":
                     return app.refresh_cards(body)
-                if keys in (["ledger"], ["logs"]) and method == "GET":
+                if keys in (["ledger"], ["archive"], ["logs"]) and method == "GET":
                     query = parse_qs(urlsplit(self.path).query)
                     after = int(query.get("after", ["0"])[0])
-                    return app.ledger_page(after) if keys == ["ledger"] else app.log_page(after)
+                    return app.log_page(after) if keys==["logs"] else app.ledger_page(after,keys==["archive"])
                 if len(keys) == 2 and keys[0] == "plugin" and method == "POST":
-                    return app.plugin(keys[1], body)
+                    reply = app.plugin(keys[1], body)
+                    return {**reply, "archive_version":1} if keys[1]=="poll" else reply
                 if len(keys) == 3 and keys[0] == "commands" and keys[2] == "cancel" and method == "PUT":
                     return app.submit(ident(keys[1]), body, cancel=True)
             else:
@@ -125,6 +127,8 @@ def make_server(bind, port, app, token, plugin_token=None):
                     return app.preset(keys[2],body,remove=True)
                 if keys == ["analytics"] and method == "GET":
                     return app.analytics(query)
+                if keys == ["analytics","import"] and method == "POST":
+                    return app.import_archive(body)
                 if keys == ["commands"] and method == "GET":
                     return app.history(query.get("status", ""), int(query.get("offset", 0)), query.get("node_id"))
                 if len(keys) == 3 and keys[0] == "nodes" and method == "GET":

@@ -11,6 +11,7 @@ services:
       - ../fleet:/app/fleet:ro
       - ../web:/app/web:ro
       - ../extension/manifest.json:/app/extension/manifest.json:ro
+      - ../extension/archive.js:/app/extension/archive.js:ro
       - center-data:/data
   caddy:
     image: caddy:2-alpine

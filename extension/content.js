@@ -14,6 +14,18 @@
     working = false,
     heartbeatBusy = false;
   let runUntil = 0;
+  let archivePending = true, archiveEnabled = false, archiveBusy = false;
+  window.addEventListener('vest-fleet-archive-ready',()=>{archivePending=true; stageArchive();});
+  async function stageArchive() {
+    if (!session || !archiveEnabled || !archivePending || archiveBusy) return;
+    archiveBusy=true;
+    archivePending=false;
+    try {
+      const value=await ipc('archive.stage',{},session);
+      if (value?.more) archivePending=true;
+    } catch { archivePending=true; }
+    finally {archiveBusy=false;}
+  }
   const brief = err => String(err?.message ?? err).replace(/\s+/g, ' ').slice(0, 500);
   function invalidate() {
     session = null;
@@ -21,6 +33,8 @@
     nextCards = 0;
     directory = null;
     monitoring = false;
+    archivePending = true;
+    archiveEnabled = false;
   }
   function onFleetMessage(message, sender, reply) {
     if (sender.id !== chrome.runtime.id) return;
@@ -40,6 +54,7 @@
       data,
       diagnostic,
       pageId,
+      documentStartedAt:performance.timeOrigin,
       session_id: owner?.session_id
     });
     if (!response?.ok) throw Error(response?.error || '本机桥无响应');
@@ -80,30 +95,59 @@
       return value.data;
     }
   });
-  async function nativeAccounts() {
-    const reply=await ipc('native.accounts');
+  async function nativeAccounts(scope='directory',platformId) {
+    const reply=await ipc('native.accounts',{scope,platform_id:platformId});
     guard();
     return reply.bound ? reply.data : null;
+  }
+  async function readBulk(since) {
+    const until=Date.now()+10000;
+    let reading;
+    do {
+      const source=await nativeAccounts('bulk'), now=Date.now()/1000;
+      if (source?.at>=since && now-source.at<=330 && Array.isArray(source.rows)) {
+        const details=source.rows.map(row=>({id:row.id,values:VestBridgeCore.bulkCapitalValues(row,source.at,now)}));
+        const items=source.rows.map(({id,name,phase,category,active_positions},index)=>{
+          const card={id,name,phase,category,active_positions}, v=details[index].values;
+          if (now-v.observed_at<=90) {
+            for (const field of ['equity','health','daily_loss','daily_limit','drawdown','drawdown_limit'])
+              if (v[field]!=null) card[field]=v[field];
+          }
+          return card;
+        });
+        reading={source,items,observed_at:now,source_at:source.at,details};
+        if (source.rows.every(row=>row.equity!=null) || Date.now()+350>=until) return reading;
+      } else reading=null;
+      await new Promise(resolve=>setTimeout(resolve,300));
+    } while(Date.now()<until);
+    if (reading) return reading;
+    throw Error('没有可核验的完整活动账户响应');
   }
   async function observe(data, force = false, scanId) {
     if (location.pathname.replace(/\/$/,'') !== '/accounts' || data.moving) return;
     const generation = data.refresh_cards ?? data.card_generation ?? 0;
+    if (!force && data.refresh_cards===undefined && document.querySelector(
+      '[role="tab"][id$="-trigger-history"][aria-selected="true"],[role="tab"][id$="-trigger-closed"][aria-selected="true"]')) return;
     const full = force || data.refresh_cards !== undefined || !directory || directory.generation !== generation;
     const directoryDue = full || Date.now() >= nextCards;
     if (!directoryDue && !monitoring) return;
     let reading;
     try {
-      // A single sample suffices for prices. Confirm directory changes on two stable DOM samples.
-      const cards = !full && VestCards.sample(false);
-      const source = !full && directoryDue ? await nativeAccounts() : null;
-      const cached = directoryDue ? source : directory?.source;
-      const sample = cards && cached && VestCards.nativeItems(cached,cards,directory?.byId);
-      if (sample && Date.now()/1000-cached.at<=330 && VestCards.membership(sample) === directory.signature) {
-        reading = {items:sample,observed_at:Date.now()/1000,source_at:cached.at,source:cached};
-        if (source) directory.source=source;
-      } else if (sample || directoryDue) {
-        reading = await VestCards.read(full,guard,nativeAccounts,directory?.byId,data.directory_since || 0);
-      } else return;
+      if (scanId) {
+        reading=await readBulk(data.directory_since);
+      } else {
+        // A single sample suffices for prices. Confirm directory changes on two stable DOM samples.
+        const cards = !full && VestCards.sample(false);
+        const source = !full && directoryDue ? await nativeAccounts() : null;
+        const cached = directoryDue ? source : directory?.source;
+        const sample = cards && cached && VestCards.nativeItems(cached,cards,directory?.byId);
+        if (sample && Date.now()/1000-cached.at<=330 && VestCards.membership(sample) === directory.signature) {
+          reading = {items:sample,observed_at:Date.now()/1000,source_at:cached.at,source:cached};
+          if (source) directory.source=source;
+        } else if (sample || directoryDue) {
+          reading = await VestCards.read(full,guard,nativeAccounts,directory?.byId,data.directory_since || 0,force && !!job && job.action==='accounts.list');
+        } else return;
+      }
     } catch (err) {
       if (scanId) await ipc('result',{id:scanId,ok:false,result:{},error:'拉取账户列表失败：'+brief(err).slice(0,460)});
       throw err;
@@ -111,9 +155,9 @@
     const signature = VestCards.membership(reading.items);
     const changedList = signature !== directory?.signature;
     if (full || changedList || !directory.supportsMetrics) {
-      const {source,...cardReading}=reading;
+      const {source,details,...cardReading}=reading;
       const ack = await report({cards:{...cardReading,generation,full:full || changedList,
-        purchase_request:data.purchase_request,...(scanId ? {scan_id:scanId} : {})}});
+        purchase_request:data.purchase_request,...(scanId ? {scan_id:scanId,details,sources:source.sources} : {})}});
       directory = {signature,generation,source,byId:new Map(reading.items.map(x=>[x.id,x])),
         baseline:VestCards.index(reading.items),supportsMetrics:ack?.supports_metrics===true};
     } else {
@@ -136,7 +180,8 @@
     const started = performance.now();
     let cadence = 1500;
     try {
-      const value = await ipc('poll', {}, null);
+      const noticeKind = VestAccountNotices.inspect()?.kind;
+      const value = await ipc('poll', {history_pending:archivePending,notice_kind:noticeKind}, null);
       if (!value.bound) {
         invalidate();
         cadence = 3500;
@@ -144,10 +189,17 @@
       }
       if (session?.session_id !== value.session.session_id) invalidate();
       session = cycleSession = value.session;
+      if (value.data.archive_version===1) archiveEnabled=true;
+      await stageArchive();
       lastContact = Date.now();
       working = true;
       job = value.data.command;
       runUntil = (value.data.run_until || 0) * 1000;
+      if (value.data.notice) {
+        diagnostic = await VestAccountNotices.handle(value.data.notice,{guard,native:nativeAccounts,
+          send:async (op,data) => (await ipc(op,data)).data});
+        return;
+      }
       if (!job) {
         await observe(value.data);
         if (monitoring && location.pathname.replace(/\/$/,'') === '/accounts') cadence = 1000;
@@ -159,12 +211,7 @@
         if (step?.stage === 'list') {
           await observe(value.data,true,job.id);
         } else if (step?.stage === 'portfolio' && step.target) {
-          const {name,card_id,phase} = step.target;
-          const item = {id:job.id,name,card_id};
-          try { item.values = await page.readPortfolio(name,phase); }
-          catch (err) { item.error = brief(err); }
-          await report({portfolio:item});
-          diagnostic = item.error || '';
+          await ipc('result',{id:job.id,ok:false,result:{},error:'节点桥需要更新才能批量读取账户响应'});
         } else throw Error('无法识别全量读取步骤');
         return;
       }
@@ -179,6 +226,9 @@
         }
       } catch (err) {
         error = brief(err);
+        if (job.action==='account.read' && err.readRetry==='balance') result.read_retry='balance';
+        if (err.noticeKind && job.action==='order.open' && job.source?.startsWith('strategy-'))
+          result.notice_kind = err.noticeKind;
         if (err.snapshot) result = {
           observation: {
             name: job.account,

@@ -86,7 +86,8 @@
     function assertNoDialogs(allowed = null) {
       const dialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible);
       if (dialogs.some(el => el !== allowed) || allowed && (!visible(allowed) || dialogs.length !== 1)) {
-        throw new Error('页面存在额外确认或风险弹窗；已暂停，请人工处理');
+        throw Object.assign(Error('页面存在额外确认或风险弹窗；已暂停，请人工处理'),
+          {noticeKind:!allowed && VestAccountNotices.inspect()?.kind});
       }
       if (field('submit')) throw new Error('页面存在成本或风险警告；禁止自动代为确认');
     }
@@ -116,28 +117,37 @@
       const el = field(key);
       return el ? core.parseMoney(elementText(el)) : null;
     }
-    function positionDetails() {
+    function positionDetails(source) {
       const symbolEl = field('positionSymbol', true);
       const id = symbolEl.getAttribute('data-testid')?.match(/^position-symbol-(.+)$/)?.[1];
       const row = symbolEl.closest('tr');
       if (!id || !row) throw new Error('需要可识别持仓 ID 的桌面持仓表，不能按品种猜测控件');
+      const native = source?.position?.position_id===id ? source.position : null;
+      const age = Date.now()/1000-source?.position_at;
+      const recent = native && age>=0 && age<=15;
       const requireSame = (key, prefix) => {
-        const el = field(key, true);
+        const el = field(key, !recent);
+        if (!el) return null;
         if (el.getAttribute('data-testid') !== prefix + id || el.closest('tr') !== row) throw new Error('持仓数据不属于同一持仓 ID: ' + key);
         return el;
       };
       const link = symbolEl.closest('a[href]');
       const symbolText = core.normalized(elementText(symbolEl));
       core.canonicalNqPosition(symbolText, link?.getAttribute('href'), location.href);
-      const side = core.parseSide(elementText(requireSame('positionSide', 'position-side-')));
-      const entry = core.parseMoney(elementText(requireSame('entryPrice', 'position-entry-')));
+      const sideEl = requireSame('positionSide','position-side-');
+      const entryEl = requireSame('entryPrice','position-entry-');
+      const side = sideEl ? core.parseSide(elementText(sideEl)) : native?.side;
+      const entry = entryEl ? core.parseMoney(elementText(entryEl)) : native?.entry_price;
       const valueEl = requireSame('positionValue', 'position-value-');
       // Public Vest desktop markup: value is in the first p, quantity + market unit in the next p.
-      const sizeEl = valueEl.closest('p')?.nextElementSibling;
-      if (!sizeEl || sizeEl.tagName !== 'P' || !visible(sizeEl) || sizeEl.closest('tr') !== row) throw new Error('无法定位同持仓的真实数量');
+      const sizeEl = valueEl?.closest('p')?.nextElementSibling;
+      if ((!sizeEl && !recent) || (sizeEl && (sizeEl.tagName !== 'P' || !visible(sizeEl) || sizeEl.closest('tr') !== row))) throw new Error('无法定位同持仓的真实数量');
       const sizeText = core.normalized(elementText(sizeEl));
-      const quantity = core.parseMoney(sizeText);
-      if (!side || !(entry > 0) || !(quantity > 0) || !sizeText.endsWith(' ' + symbolText)) throw new Error('持仓方向、数量或数量单位无法确认');
+      const quantity = sizeEl ? core.parseMoney(sizeText) : native?.quantity;
+      if (!side || !(entry > 0) || !(quantity > 0) || (sizeEl && !sizeText.endsWith(' ' + symbolText))) throw new Error('持仓方向、数量或数量单位无法确认');
+      const filledFromResponse = !sideEl || !entryEl || !sizeEl;
+      if (filledFromResponse && (!recent || side!==native.side || entry!==native.entry_price || quantity!==native.quantity))
+        throw Error('活动持仓响应与页面读数不一致');
       const protection = queryOne('[data-testid="td-tpsl"]', row);
       const tp = protection ? queryOne('span.text-long', protection) : null;
       const sl = protection ? queryOne('span.text-short', protection) : null;
@@ -149,27 +159,20 @@
         side,
         quantity,
         entry_price: entry,
+        ...(native?.opened_at && age>=0 && age<=90 ? {opened_at:native.opened_at} : {}),
+        ...(filledFromResponse ? {position_reference_at:source.position_at} : {}),
         native_tp_price: tpPrice,
         native_sl_price: slPrice,
-        native_sl: slPrice > 0 && (side === 'buy' ? slPrice < entry : slPrice > entry),
-        native_tp: tpPrice > 0 && (side === 'buy' ? tpPrice > entry : tpPrice < entry),
         native_sl_absent: !!protection && (!sl || /^(?:-|—|–)$/.test(core.normalized(elementText(sl)))),
-        native_tp_absent: !!protection && (!tp || /^(?:-|—|–)$/.test(core.normalized(elementText(tp)))),
-        native_tpsl: tpPrice > 0 && slPrice > 0 && (side === 'buy' ? tpPrice > entry && slPrice < entry : tpPrice < entry && slPrice > entry)
+        native_tp_absent: !!protection && (!tp || /^(?:-|—|–)$/.test(core.normalized(elementText(tp))))
       };
     }
-    function snapshot() {
+    function snapshot(source) {
       positionPanel(true);
       const equity = numeric('balance');
       const pnl = numeric('unrealized');
       const isOpen = core.positionState(!!field('positionOpen'), !!field('positionEmpty'));
-      const details = isOpen ? positionDetails() : {
-        position_id: null,
-        symbol: 'NQ-PERP',
-        side: null,
-        quantity: null,
-        entry_price: null
-      };
+      const details = isOpen ? positionDetails(source) : {};
       let phase = null;
       try {
         phase = observerIdentity().phase;
@@ -197,7 +200,7 @@
     }
     function readyCheck() {
       assertNoDialogs();
-      const current = assertAccount();
+      checkOpenFormAccount();
       const form = mainForm(true);
       for (const key of ['quantity', 'takeProfit', 'stopLoss', 'buy', 'sell']) field(key, true);
       if (field('buy') === field('sell')) throw new Error('做多与做空控件不能相同');
@@ -207,7 +210,12 @@
       if (limit.getAttribute('aria-checked') !== 'false' && limit.dataset.state !== 'unchecked') throw new Error('止盈止损必须确认使用市场触发，请关闭 Limit');
       const market = queryOne('[data-testid="ordertype-tab-market"]', form, true);
       if (!isSelected(market)) throw new Error('必须先切换并校准市价订单');
-      return current;
+    }
+    function checkOpenFormAccount() {
+      assertArmed();
+      if (!core.isNqTradePath(location.pathname) || field('unit',true).dataset.unit!=='micro' || !(numeric('price')>0))
+        throw Error('请核对 NQ 交易页、行情和 Micro 单位');
+      if (findAll(core.defaults.positionOpen,'positionOpen').length) throw Error('交易表单已显示活动持仓');
     }
     function isSelected(el) {
       return el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-pressed') === 'true' || el.getAttribute('data-state') === 'active' || el.getAttribute('data-state') === 'on' || el.getAttribute('data-active') === 'true' || el.getAttribute('data-selected') === 'true';
@@ -341,7 +349,6 @@
       await delay(300);
       assertNoDialogs();
       guard();
-      return snapshot();
     }
     async function awaitPosition(job, oldIds, expectedPosition) {
       const until = Date.now() + 12000;
@@ -387,7 +394,7 @@
     async function selectPositionSize(job) {
       assertArmed(job);
       assertNoDialogs();
-      if (assertAccount().position_open !== false) throw new Error('选择仓位大小前账户必须明确空仓');
+      checkOpenFormAccount();
       const form = mainForm(true);
       const button = queryOne(`[data-testid="size-pct-${job.size_percent}"]`, form, true);
       if (core.normalized(elementText(button)) !== job.size_percent + '%') throw new Error('页面仓位比例按钮文案不匹配');
@@ -399,7 +406,7 @@
         await delay(150);
         assertArmed(job);
         assertNoDialogs();
-        if (assertAccount().position_open !== false) throw new Error('选择仓位大小期间持仓变化');
+        checkOpenFormAccount();
         const slider = queryOne('[role="slider"]', mainForm(true), true);
         const quantity = numeric('quantity');
         if (Number(slider.getAttribute('aria-valuenow')) === job.size_percent && quantity > 0) {
@@ -416,7 +423,8 @@
     function observerAssertPage() {
       assertLive();
       if (!core.isNqTradePath(location.pathname)) throw new Error('请打开已登录的 Vest NQ-PERP 交易页面');
-      if ([...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].some(visible)) throw new Error('页面存在弹窗，请先关闭后再读取账户');
+      if ([...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].some(visible))
+        throw Object.assign(Error('页面存在弹窗，请先关闭后再读取账户'),{noticeKind:VestAccountNotices.inspect()?.kind});
     }
     function observerTrigger(required = true) {
       return queryOne(core.defaults.identity, document, required);
@@ -474,15 +482,12 @@
         account_health: readAccountHealth()?.percent ?? null
       } : current;
     }
+    const missingIndicators = Symbol('missing capital indicators');
     function observerCapitalMetrics() {
-      let phase = null;
-      try {
-        phase = observerIdentity().phase;
-      } catch {}
+      const missing=[];
       const eligible = el => visible(el) && !el.closest('[role="dialog"],[role="alertdialog"],[role="menu"]');
       const banners = [...document.querySelectorAll('div.sticky.top-14')].filter(eligible);
-      const observed_at = Date.now() / 1000;
-      return Object.fromEntries(core.CAPITAL_INDICATORS.map(({
+      const metrics = Object.fromEntries(core.CAPITAL_INDICATORS.map(({
         key,
         testId,
         labels
@@ -508,20 +513,17 @@
           el,
           text: elementText(el)
         }));
+        if (!sources.length) missing.push(key);
         const readings = sources.map(({
           el,
           text
         }) => el.closest('[aria-busy="true"],[data-loading="true"]') ? null : core.parseCapitalMetric(text));
         const first = readings[0];
         const consistent = first && readings.every(item => item && ['current', 'limit', 'percent'].every(field => item[field] === first[field]));
-        return [key, consistent ? {
-          ...first,
-          observed_at,
-          ...(phase ? {
-            phase
-          } : {})
-        } : null];
+        return [key, consistent ? (first.percent==null ? {current:first.current,limit:first.limit} : {percent:first.percent}) : null];
       }));
+      Object.defineProperty(metrics,missingIndicators,{value:missing});
+      return metrics;
     }
     function dailyUnlimited(scope = document) {
       return [...scope.querySelectorAll('div.sticky.top-14 p,[data-testid="capital-indicator-daily-loss"]')].some(el =>
@@ -559,17 +561,27 @@
         trigger.dispatchEvent(new PointerEvent('pointerout',{...opts,relatedTarget:document.body}));
       }
     }
-    async function riskReferences(identity, expectedId) {
+    async function riskReferences(identity, expectedId, positionSample, reading, metricCardId=expectedId) {
       const {name,phase} = identity;
-      const source = await hooks.nativeAccounts();
-      const row = source?.rows.find(item=>item.id===source.selected);
+      const source = await hooks.nativeAccounts('selected');
+      const row = source?.row;
+      if (positionSample && (source?.position_at!==positionSample.position_at ||
+          source?.position?.position_id!==positionSample.position.position_id || Date.now()/1000-source.position_at>15))
+        throw Error('持仓响应在读取期间已更新，请重新读取');
       if (expectedId && row?.id!==expectedId || row && row.phase!==phase)
         return {reference_error:'交易页未确认当前平台账户身份或阶段'};
       const age = Date.now()/1000-source?.at;
       const proof = {reference_card_id:row?.id,reference_at:source?.at,reference_source:'active_accounts'};
-      if (row && age>=0 && age<=330 && (row.daily_floor!=null || row.daily_unlimited) && row.max_drawdown_floor!=null)
+      if (row && age>=0 && age<=330 && (row.daily_floor!=null || row.daily_unlimited) && row.max_drawdown_floor!=null) {
+        if (metricCardId===row.id && reading?.capital_metrics[missingIndicators]?.length) {
+          const derived=core.nativeCapitalMetrics(row,reading.equity,source.at,reading.observed_at);
+          for (const key of reading.capital_metrics[missingIndicators]) {
+            if (derived[key]) reading.capital_metrics[key]={...derived[key],source:'active_accounts'};
+          }
+        }
         return {...proof,daily_floor:row.daily_floor,daily_unlimited:row.daily_unlimited,
-          max_drawdown_floor:row.max_drawdown_floor,daily_reset_equity:row.daily_reset_equity};
+          max_drawdown_floor:row.max_drawdown_floor,daily_reset_balance:row.daily_reset_balance,daily_reset_equity:row.daily_reset_equity};
+      }
       if (expectedId) return proof;
       // Read-only diagnostics may still use the visible tooltip when native fields are unavailable.
       const daily = await readRiskTooltip(riskTrigger('daily-loss',/^(?:max\.? daily loss|daily loss|最大日亏损|每日亏损)$/i),name,root => {
@@ -577,7 +589,7 @@
         for (const el of [root,...root.querySelectorAll('p,span,div')]) {
           const match = core.normalized(el.textContent).match(/^(8\s*pm ET balance|美东时间晚上\s*8\s*点余额|today['’]s floor|今日底线|今日底線)\s*[:：]\s*(\$?\s*[\d,]+(?:\.\d+)?)$/i);
           if (!match) continue;
-          const key = /^(?:8|美东)/.test(match[1]) ? 'daily_reset_equity' : 'daily_floor';
+          const key = /^(?:8|美东)/.test(match[1]) ? 'daily_reset_balance' : 'daily_floor';
           const value = core.parseMoney(match[2]);
           if (result[key]!=null && result[key]!==value) return null;
           result[key] = value;
@@ -589,7 +601,7 @@
         const value = match && core.parseMoney(match[1] || match[2]);
         return value!=null ? {max_drawdown_floor:value} : null;
       });
-      const after = await hooks.nativeAccounts();
+      const after = await hooks.nativeAccounts('selected');
       if (after?.selected!==source?.selected || observerIdentity().signature!==identity.signature)
         return {reference_error:'交易页未确认当前平台账户身份或阶段'};
       return {...proof,reference_source:'tooltip',reference_at:Date.now()/1000,...daily,...maximum};
@@ -617,7 +629,7 @@
         value: first !== null && values.every(value => value === first) ? first : null
       };
     }
-    function observerValues(expectedName, scanning = false) {
+    function observerValues(expectedName, scanning = false, source) {
       observerAssertPage();
       const identity = observerIdentity();
       if (expectedName && identity.name !== expectedName) throw new Error('账户切换尚未确认，未读取资金数据');
@@ -627,7 +639,7 @@
       if (equity === null || unrealized === null) throw new Error('净值或浮动盈亏不可读（可能开启隐私模式）');
       let phase_snapshot;
       if (identity.phase || scanning) try {
-        const current = snapshot();
+        const current = snapshot(source);
         const reading = scanning ? withFlatAccountHealth(current) : current;
         const after = observerIdentity();
         if (after.name === identity.name && after.phase === identity.phase) phase_snapshot = reading;
@@ -635,13 +647,7 @@
       const observed_at = Date.now() / 1000;
       const capital_metrics = observerCapitalMetrics();
       const percent = phase_snapshot?.account_health;
-      if (Number.isFinite(percent)) capital_metrics.health = {
-        text: `${percent}%`,
-        percent,
-        current: null,
-        limit: null,
-        observed_at: phase_snapshot.observed_at
-      };
+      if (Number.isFinite(percent)) capital_metrics.health = {percent};
       return {
         name: identity.name,
         equity,
@@ -767,6 +773,7 @@
     async function observerWaitStable(name, minimumDelay = 1000, {
       monitoring = false,
       scanning = false,
+      source,
       samples = 3,
       deadline: outerDeadline = Infinity,
       sampleInterval = 250,
@@ -782,7 +789,7 @@
       while (Date.now() < deadline) {
         guard();
         try {
-          const value = observerValues(name, scanning);
+          const value = observerValues(name, scanning, source);
           const watchingPosition = monitoring || value.phase_snapshot?.position_open === true;
           const loadingFields = watchingPosition ? '[data-testid="account-value"],[data-testid="account-upnl"]' : '[data-testid="account-value"],[data-testid="account-upnl"],[data-testid^="capital-indicator-"],div.sticky.top-14[aria-busy="true"],div.sticky.top-14 [aria-busy="true"],div.sticky.top-14[data-loading="true"],div.sticky.top-14 [data-loading="true"]';
           const pending = [...document.querySelectorAll(loadingFields)].some(el => visible(el) && el.closest('[aria-busy="true"],[data-loading="true"]'));
@@ -935,20 +942,91 @@
         await observerCloseSelector(assertLive);
       }
     }
-    async function read(name, category, verifyMenu = false, expectedId) {
+    async function selectedRisk(identity, cardId, allowPositionRead=false) {
+      const until=Date.now()+3500;
+      let snapshot;
+      do {
+        observerAssertPage();
+        const source=await hooks.nativeAccounts('selected'), now=Date.now()/1000;
+        if (observerIdentity().signature!==identity.signature || observerSelectorOpen()) throw Error('核验期间交易账户或阶段已变化');
+        const row=source?.row, flat=source?.flat;
+        snapshot={observed_at:now,risk_source:'flat_balance',risk_issue:'identity'};
+        if (cardId && source?.selected===cardId && row?.id===cardId && identity.phase && row.phase===identity.phase && row.category===identity.category) {
+          Object.assign(snapshot,{reference_card_id:row.id,reference_at:source.at,reference_source:'active_accounts'});
+          if (!Number.isFinite(source.at) || source.at>now || now-source.at>330) snapshot.risk_issue='limits';
+          else if (flat?.count>0) {
+            if (allowPositionRead) return null;
+            snapshot.risk_issue='position';
+            break;
+          } else if (flat?.reserved===true) {
+            snapshot.risk_issue='orders';
+            break;
+          } else if (flat?.count!==0 || !Number.isFinite(flat.equity) || !Number.isFinite(flat.at) || flat.at>now || now-flat.at>15) {
+            snapshot.risk_issue='balance';
+            snapshot.sources=source.sources;
+          } else {
+            const metrics=core.nativeCapitalMetrics(row,flat.equity,source.at,now,flat.at);
+            const health=core.capitalHealth(metrics,row.daily_unlimited);
+            if (health==null) snapshot.risk_issue='limits';
+            else {
+              delete snapshot.risk_issue;
+              Object.assign(snapshot,{risk_at:flat.at,position_open:false,equity:flat.equity,balance:flat.equity,
+                unrealized_pnl:0,phase:row.phase,account_health:health,capital_metrics:metrics,daily_floor:row.daily_floor,
+                max_drawdown_floor:row.max_drawdown_floor,daily_reset_balance:row.daily_reset_balance,
+                daily_reset_equity:row.daily_reset_equity,daily_unlimited:row.daily_unlimited});
+              break;
+            }
+          }
+        }
+        if (Date.now()<until) await delay(180);
+      } while (Date.now()<until);
+      return {name:identity.name,category:identity.category,phase:identity.phase,snapshot};
+    }
+    async function read(name, category, verifyMenu = false, expectedId, readCardId, nativeRisk=false) {
       const identity = await waitForAccountIdentity(observerAssertPage);
       const selected = {
         name,
         category
       };
       const switched = identity.name !== name;
-      if (switched || verifyMenu) await observerSelect(selected, assertLive);
+      const selectedSource = async () => {
+        const cardId=expectedId || readCardId;
+        if (!cardId) return null;
+        const source = await hooks.nativeAccounts('selected');
+        const current = observerIdentity();
+        const age = Date.now()/1000-source?.at;
+        return current.name===name && current.phase && source?.selected===cardId && source.row?.phase===current.phase &&
+          source.row.category===current.category && age>=0 && age<=330 ? source : null;
+      };
+      let source = !switched && !observerSelectorOpen() ? await selectedSource() : null;
+      if (switched || (verifyMenu && !source)) {
+        await observerSelect(selected, assertLive);
+        source = await selectedSource();
+      }
+      if (nativeRisk) {
+        const current=observerIdentity();
+        if (current.name!==name) throw Error('读取期间账户发生变化');
+        const reading=await selectedRisk(current,expectedId || readCardId,!expectedId && !!readCardId);
+        if (reading) {
+          if (!expectedId && reading.snapshot.risk_issue) {
+            const ages=Object.entries(reading.snapshot.sources || {}).map(([key,value])=>
+              key+'='+ (typeof value==='number' ? Math.round(reading.snapshot.observed_at-value)+'s' : value));
+            const error = Error(['当前账户交易响应未就绪',reading.snapshot.risk_issue,...ages].join(' · '));
+            if (reading.snapshot.risk_issue==='balance') error.readRetry='balance';
+            throw error;
+          }
+          return reading;
+        }
+      }
       const active = queryOne('[data-testid="account-tab-active-positions"]');
       if (active && !isSelected(active)) await selectTab('[data-testid="account-tab-active-positions"]', () => document, assertLive);
-      await ensurePositionPanelLayout(assertLive);
+      const markers = source?.position && findAll(core.defaults.positionOpen,'positionOpen');
+      if (markers?.length!==1 || markers[0].dataset.testid!=='position-symbol-'+source.position.position_id ||
+          Date.now()/1000-source.position_at>15) await ensurePositionPanelLayout(assertLive);
       const account = await observerWaitStable(name, switched ? 1000 : 200, {
         monitoring: !switched && !verifyMenu,
         scanning: true,
+        source,
         samples: 3,
         sampleInterval: 120,
         guard: assertLive
@@ -959,7 +1037,9 @@
         position_open: null,
         observed_at: account.observed_at
       };
-      const reference = await riskReferences(id,expectedId);
+      const reference = await riskReferences(id,expectedId,snap.position_reference_at ? source : null,account,expectedId || readCardId);
+      if ((source || reference.reference_card_id) && readCardId && reference.reference_card_id!==readCardId)
+        throw Error('读取期间平台账户身份已变化');
       if (observerIdentity().signature!==id.signature) throw Error('读取期间账户或阶段已变化');
       const restricted = ['default', 'main', 'primary', 'master', 'closed', 'failed'].includes(selected.category);
       return {
@@ -1006,21 +1086,16 @@
       observerAssertPage();
       const identity = observerIdentity();
       if (identity.name !== config.accountName) throw Error('提交前交易账户已变化');
-      const reference = await riskReferences(identity,config.platformId);
-      const latest = observerValues(identity.name,true);
-      if (observerIdentity().signature !== identity.signature) throw Error('读取最新风控期间账户或阶段变化');
-      return {name:identity.name,category:identity.category,phase:identity.phase,
-        snapshot:{...latest.phase_snapshot,observed_at:latest.observed_at,equity:latest.equity,balance:latest.balance,
-          unrealized_pnl:latest.unrealized_pnl,capital_metrics:latest.capital_metrics,daily_unlimited:dailyUnlimited(),...reference}};
+      return selectedRisk(identity,config.platformId);
     }
     async function prepareOpenClick(job) {
       await prepare(assertArmed);
-      if (readyCheck().position_open !== false) throw Error('开仓前需确认空仓');
+      readyCheck();
       core.validateJob(job, config);
       if (job.size_percent) job.quantity = await selectPositionSize(job);
       else await setInput('quantity', core.nqVestToInput(job.quantity, 'micro'));
       if (job.stop_loss != null && job.stop_loss<job.quantity*0.25) {
-        const reading = await read(config.accountName,config.accountCategory,false,config.platformId);
+        const reading = await currentOpenObservation();
         const checked = await hooks.preflight(reading,job.quantity);
         job.stop_loss = checked.stop_loss;
         job.take_profit = checked.take_profit ?? job.take_profit;
@@ -1059,13 +1134,13 @@
           core.validateJob(job,config);
           continue;
         }
-        return verifiedForm;
+        return {verifiedForm,approved:observation.snapshot};
       }
     }
     async function openOrder(job) {
-      let verifiedForm;
+      let prepared;
       try {
-        verifiedForm = await prepareOpenClick(job);
+        prepared = await prepareOpenClick(job);
       } catch (error) {
         // An account can become ineligible while the site is sizing the order or rebuilding its form.
         if (!error.reselect) {
@@ -1074,9 +1149,14 @@
         }
         throw error;
       }
-      assertArmed();
-      if (readyCheck().position_open !== false || (readAccountHealth()?.percent ?? 0) < 25) throw Error('提交前持仓或健康度已变化');
-      click(verifiedForm());
+      const latest=(await currentOpenObservation()).snapshot;
+      if (latest.risk_issue || latest.position_open!==false || !(latest.account_health>=25) ||
+          ['reference_card_id','phase','equity','account_health','daily_floor','max_drawdown_floor','daily_unlimited']
+            .some(k=>latest[k]!==prepared.approved[k]) ||
+          JSON.stringify(latest.capital_metrics)!==JSON.stringify(prepared.approved.capital_metrics))
+        throw Error('提交许可后账户风控响应已变化，已取消点击');
+      readyCheck();
+      click(prepared.verifiedForm());
       const filled = await awaitPosition(job, new Set());
       const missing = [[filled.stop_check,job.stop_loss,filled.native_sl_absent],
                        [filled.take_profit_check,job.take_profit,filled.native_tp_absent]]
@@ -1253,10 +1333,12 @@
     async function execute(cmd, continuation) {
       if (continuation) return continueCommand(cmd,continuation);
       if (cmd.action==='profit.available') return continueCommand(cmd,{stage:'portfolio'});
-      const observation = await read(cmd.account, null, true,cmd.expected_risk?.card_id);
+      const readOnly = cmd.action==='account.read' || cmd.action==='positions.read';
+      const observation = await read(cmd.account,null,true,cmd.expected_risk?.card_id,readOnly ? cmd.read_card_id : null,
+        cmd.action==='order.open' || cmd.action==='account.read' && !!cmd.read_card_id);
       let approved;
       if (cmd.action === 'order.open') approved = await hooks.preflight(observation);
-      else await hooks.report({observation});
+      else if (!readOnly || !cmd.read_receipt) await hooks.report({observation});
       if (cmd.action === 'history.read') {
         const tables = await history(cmd.account, true);
         if (observation.phase === 'live' || ['funded','live','closed','failed'].includes(observation.category)) {
@@ -1270,7 +1352,7 @@
         observation
       };
       if (cmd.action === 'positions.read') {
-        if (typeof observation.snapshot.position_open !== 'boolean') throw Error('无法确认活动持仓');
+        if (typeof observation.snapshot.position_open !== 'boolean') throw Object.assign(Error('无法确认活动持仓'),{snapshot:observation.snapshot});
         return {
           observation
         };

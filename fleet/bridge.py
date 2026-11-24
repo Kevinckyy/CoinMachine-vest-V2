@@ -10,6 +10,7 @@ from .protocol import (PHASES, PORTFOLIO_SCAN, PRIMARY, RUN_TTL, TERMINAL, WRITE
 from .storage import Database, check_reservations, command, find_command, finish, insert, record
 from .trading_day import entry_day_window
 
+NOTICE_KINDS = {"phase2", "live", "closed"}
 
 def worker_view(row):
     return dict(row) if row else None
@@ -87,6 +88,8 @@ class Bridge:
     def __init__(self, path, node_id, clock=time.time):
         self.db = Database(path)
         self.status_feed = status_delta.StatusFeed()
+        self.notice_seen = {}
+        self.notice_until = 0
         self.node_id, self.clock = ident(node_id), clock
         self.release = os.environ.get("VEST_FLEET_RELEASE", "")
         self.launch_id = os.environ.get("VEST_FLEET_LAUNCH_ID", "")
@@ -97,6 +100,9 @@ class Bridge:
             CREATE TABLE IF NOT EXISTS worker_build(worker_id TEXT PRIMARY KEY,release TEXT NOT NULL,
                 portfolio_version INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS update_gate(slot INTEGER PRIMARY KEY CHECK(slot=1),owner TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS account_notices(worker TEXT NOT NULL,platform_id TEXT NOT NULL,kind TEXT NOT NULL,
+                root TEXT NOT NULL,name TEXT NOT NULL,started REAL NOT NULL,completed REAL,PRIMARY KEY(worker,platform_id,kind));
+            CREATE UNIQUE INDEX IF NOT EXISTS one_pending_notice ON account_notices(worker) WHERE completed IS NULL;
             CREATE TABLE IF NOT EXISTS workers(
                 worker_id TEXT PRIMARY KEY, label TEXT NOT NULL, generation INTEGER NOT NULL,
                 session_id TEXT NOT NULL, mode TEXT NOT NULL, last_seen REAL NOT NULL,
@@ -169,10 +175,12 @@ class Bridge:
                         json_extract(result,'$.partial') AS partial,json_extract(result,'$.failed') AS failed
                         FROM commands WHERE worker=? AND action=? ORDER BY created DESC,id DESC LIMIT 1""",
                                   (row["worker_id"], PORTFOLIO_SCAN)).fetchone()
-                workers.append({**worker_view(row), "portfolio_scan": dict(scan) if scan else None})
+                workers.append({**worker_view(row), "portfolio_scan": dict(scan) if scan else None,
+                                "notice_waiting":self.clock()-self.notice_seen.get(row["worker_id"],-float("inf"))<12})
             snap = {"version": 1, "open_policy_version":daily_floor.OPEN_POLICY_VERSION, "payout_quote_version":1, "node_id": self.node_id, "instance_id": self.instance_id, "release":self.release,
-                    "launch_id": self.launch_id,
-                    "ledger_seq": db.execute("SELECT COALESCE(MAX(seq),0) FROM book").fetchone()[0],
+                    "launch_id": self.launch_id, "notice_until": self.notice_until,
+                    "notice_waiting": any(self.clock()-at < 12 for at in self.notice_seen.values()),
+                    "ledger_seq":ledger.high_water(db,False),"archive_seq":ledger.high_water(db,True),
                     "log_seq": db.execute("SELECT COALESCE(MAX(id),0) FROM node_logs").fetchone()[0],
                     "card_generation":db.execute("SELECT generation FROM card_request").fetchone()[0],
                     "workers": workers,
@@ -183,15 +191,65 @@ class Bridge:
 
     def refresh_cards(self, body):
         require(body.get("instance_id")==self.instance_id,"节点数据库身份不匹配",409)
-        gen = number(body.get("generation"),"刷新批次",1,2**53-1,True)
         with self.db.tx() as db:
-            db.execute("UPDATE card_request SET generation=MAX(generation,?)",(gen,))
-        return {"generation":gen}
+            if "generation" in body:
+                gen = number(body["generation"],"刷新批次",1,2**53-1,True)
+                db.execute("UPDATE card_request SET generation=MAX(generation,?)",(gen,))
+            if "allow_notices" in body:
+                self.notice_until = self.clock()+10 if boolean(body["allow_notices"]) else 0
+            require("generation" in body or "allow_notices" in body,"缺少刷新或账户提示操作")
+            return {"generation":db.execute("SELECT generation FROM card_request").fetchone()[0]}
 
-    def ledger_page(self, after):
+    def _notice(self, db, op, wid, body, now):
+        require(body["mode"]=="execute" and now < self.notice_until and not db.execute("SELECT 1 FROM update_gate").fetchone(),
+                "等待中心授权处理账户提示",409)
+        platform = ident(body.get("platform_id"))
+        kind = choice(body.get("kind"),NOTICE_KINDS,"账户提示")
+        pending = db.execute("SELECT * FROM account_notices WHERE worker=? AND completed IS NULL",(wid,)).fetchone()
+        if op=="notice.complete":
+            require(pending and (pending["platform_id"],pending["kind"])==(platform,kind),"阶段处理记录不匹配",409)
+            if kind=="closed":
+                require(body.get("prior_active") is False,"关闭账户仍出现在活动列表",409)
+            else:
+                successor = ident(body.get("selected"))
+                require(successor!=platform and body.get("root")==pending["root"] and
+                        body.get("phase")==("2/2" if kind=="phase2" else "live") and body.get("count")==0,
+                        "新阶段账户或空仓证明不匹配",409)
+                number(body.get("positions_at"),"新阶段持仓读取时间",now-90,now+2)
+            db.execute("UPDATE account_notices SET completed=? WHERE worker=? AND completed IS NULL",(now,wid))
+            db.execute("DELETE FROM card_sync WHERE worker=?",(wid,))
+            reporting.log(db,self.node_id,now,"browser","账户提示处理已核验，重新拉取活动清单",worker=wid,account=pending["name"])
+            return {"completed":True}
+        require(not pending and not db.execute("SELECT 1 FROM commands WHERE worker=? AND status='running'",(wid,)).fetchone(),
+                "浏览器仍有未结束的操作",409)
+        row = db.execute("SELECT data FROM book WHERE node=? AND worker=? AND kind='account_history' AND ref=?",
+                         (self.node_id,wid,platform)).fetchone()
+        require(row,"等待节点归档弹窗所对应的平台账户",409)
+        old = json.loads(row[0])
+        phase, name, root = old.get("phase"), old.get("name"), old.get("root_account_id") or platform
+        require(phase in PHASES and name and name.lower() not in PRIMARY,"无法核验弹窗账户阶段",409)
+        if kind=="phase2":
+            roots = body.get("successor_roots")
+            require(phase=="1/2" and isinstance(roots,list) and len(roots)<=500 and root in roots,
+                    "未核验到同一考核链的第二阶段账户",409)
+        elif kind=="live":
+            require(phase=="2/2" and old.get("status") in ("2","3","6") and body.get("active_phase") in (None,"2/2"),
+                    "弹窗与已登记的二阶段账户不符",409)
+        else:
+            require(body.get("active") is False and old.get("status") not in ("3","6"),"关闭通知与活动账户状态不符",409)
+        reserved = db.execute("""INSERT INTO account_notices VALUES(?,?,?,?,?,?,NULL)
+            ON CONFLICT(worker,platform_id,kind) DO UPDATE SET completed=NULL,started=excluded.started
+            WHERE excluded.kind='closed' AND account_notices.completed IS NOT NULL AND account_notices.completed<excluded.started-5""",
+            (wid,platform,kind,root,name,now))
+        require(reserved.rowcount,"该账户提示已有处理记录，请核对平台结果",409)
+        label = {"phase2":"开始第二阶段","live":"激活 Live","closed":"关闭亏损上限通知"}[kind]
+        reporting.log(db,self.node_id,now,"browser","已登记一次页面操作 · "+label,worker=wid,account=name)
+        return {"authorize":True,"name":name,"root":root}
+
+    def ledger_page(self, after, archive=False):
         after = number(after, "同步游标", 0, 2**63-1, True)
         with self.db.tx() as db:
-            return {"node_id": self.node_id, "instance_id": self.instance_id, **ledger.page(db, after)}
+            return {"node_id": self.node_id, "instance_id": self.instance_id, **ledger.page(db, after,archive)}
 
     def log_page(self, after):
         after = number(after, "同步游标", 0, 2**63-1, True)
@@ -410,7 +468,18 @@ class Bridge:
             # A stored receipt may arrive after reload. It can only finish its original lease.
             if op == "result":
                 return self._result(db, body, now)
+            if op == "archive":
+                wid = ident(body.get("worker_id"))
+                owner = db.execute("SELECT session_id,generation FROM workers WHERE worker_id=?",(wid,)).fetchone()
+                generation = number(body.get("generation"),"采集会话轮次",0,2**53-1,True)
+                sid = ident(body.get("session_id"))
+                require(owner and (generation < owner["generation"] or
+                        generation==owner["generation"] and sid==owner["session_id"]), "采集会话尚未注册",409)
+                ledger.archive_rows(db,self.node_id,wid,body.get("items"))
+                return {"accepted":True}
             wid, sid = self._touch(db, body, now)
+            if op in ("notice.reserve","notice.complete"):
+                return self._notice(db,op,wid,body,now)
             if op == "heartbeat":
                 return {"ok": True}
             if op == "read-all":
@@ -438,10 +507,12 @@ class Bridge:
                     reading = obj(body["cards"])
                     if reading.get("full") and plugin_version_parts(body.get("plugin_version")) >= (1,9,0,0):
                         require(reading.get("source_at") is not None,"完整活动账户清单缺少平台读取时间",409)
-                    ack = cards.update(db, wid, sid, reading, now)
-                    if "scan_id" in reading:
+                    is_scan = "scan_id" in reading
+                    ack = cards.update(db, wid, sid, reading, now, defer_cache=is_scan)
+                    if is_scan:
                         row = portfolio.owned(db, reading["scan_id"], wid, sid)
                         portfolio.listed(db, row, reading, now)
+                        ack.update(cards.directory_cache(db, wid, now))
                     return ack
                 if "portfolio" in body:
                     require(body.get("page", "").rstrip("/") == "/portfolio", "需要 Portfolio 页面", 409)
@@ -470,6 +541,16 @@ class Bridge:
                 if running["action"] == PORTFOLIO_SCAN and json.loads(running["body"])["session_id"] == sid:
                     return portfolio.delivery(db, running, body.get("cached_scan"), now)
                 return {"command": None}
+            if body["mode"]=="execute" and plugin_version_parts(body.get("plugin_version")) >= (1,11,3,0):
+                pending = db.execute("SELECT platform_id,root,name,kind,started FROM account_notices WHERE worker=? AND completed IS NULL",(wid,)).fetchone()
+                if pending or body.get("notice_kind") in NOTICE_KINDS:
+                    self.notice_seen[wid] = now
+                    manual = db.execute("""SELECT 1 FROM commands WHERE worker=? AND status='queued'
+                        AND json_extract(body,'$.source') NOT LIKE 'strategy-%'""",(wid,)).fetchone()
+                    if pending or now < self.notice_until or not manual:
+                        return {"notice":{"enabled":now < self.notice_until,"pending":dict(pending) if pending else None}}
+                else:
+                    self.notice_seen.pop(wid,None)
             refresh_generation = None
             if body.get("cards_version")==1:
                 gen = db.execute("SELECT generation FROM card_request").fetchone()[0]
@@ -502,6 +583,9 @@ class Bridge:
                 if cmd["action"] == PORTFOLIO_SCAN:
                     db.execute("UPDATE commands SET result=? WHERE id=?", (dump(portfolio.progress(row)), row["id"]))
                     return portfolio.delivery(db, command(db, row["id"]), None, now)
+                if cmd["action"] in ("account.read", "positions.read"):
+                    _, account = target(db, cmd)
+                    cmd = {**cmd, "read_receipt": True, "read_card_id": (account.get("card") or {}).get("id")}
                 return {"command": cmd, "run_until": now + RUN_TTL,"card_generation":db.execute("SELECT generation FROM card_request").fetchone()[0]}
             if refresh_generation is not None:
                 return {"command":None,"refresh_cards":refresh_generation}
@@ -531,8 +615,17 @@ class Bridge:
         identity_verified = bool(card_id and snap.get("reference_card_id")==card_id)
         recent = (snap.get("reference_source")=="active_accounts" and type(reference_at) in (int,float)
                   and max(now-330,day["start"]) <= reference_at <= min(now+5,day["end"]))
+        issue = None
         if not identity_verified:
             issue = "交易页未确认当前平台账户身份或阶段"
+        elif snap.get("risk_source")=="flat_balance":
+            issue = {"limits":"活动账户响应缺少本交易日的风控数据", "position":"活动持仓响应显示账户已有持仓",
+                     "orders":"活动挂单占用账户余额", "balance":"缺少近期余额、持仓或挂单的完整响应"}.get(snap.get("risk_issue"))
+            risk_at = snap.get("risk_at")
+            if not issue and (snap.get("risk_issue") is not None or not recent or type(risk_at) not in (int,float)
+                              or not max(now-15,day["start"]) <= risk_at <= min(now+5,day["end"])):
+                issue = "交易页风控响应不完整或已过期"
+        if issue:
             lock = account.get("open_lock") or {}
             if lock.get("until",0)<=now or lock.get("kind")=="read_retry":
                 lock = {"kind":"read_retry","until":now+45,"reason":issue,"card_id":card_id}
@@ -541,7 +634,7 @@ class Bridge:
             finish(db,cmd["id"],"cancelled",now,issue,result)
             return result
         if not recent:
-            snap = {key:value for key,value in snap.items() if key not in ("daily_floor","max_drawdown_floor","daily_reset_equity","reference_at")}
+            snap = {key:value for key,value in snap.items() if key not in ("daily_floor","max_drawdown_floor","daily_reset_equity","daily_reset_balance","reference_at")}
             obs = {**obs,"snapshot":snap}
         risk = cards.from_trade(snap)
         actual = {**risk,"phase":obs.get("phase"),"category":obs.get("category"),"card_id":card_id}
@@ -674,6 +767,12 @@ class Bridge:
                 "回执不属于领取该指令的会话", 409)
         late = row["status"] == "unknown" and body.get("ok") is True
         if row["status"] in TERMINAL and not late:
+            if cmd["action"] in ("account.read","positions.read") and cmd["result"].get("observation"):
+                worker, account = target(db,cmd)
+                if (worker and account and account["present"] and not account["ambiguous"] and account["risk"]
+                        and worker["session_id"]==account["read_session"]==cmd["session_id"]):
+                    return {"status":row["status"],"risk":account["risk"],"open_lock":account["open_lock"],
+                            "daily_floor":daily_floor.view(db,cmd["worker_id"],cmd["account"],now)}
             return {"status": row["status"]}
         require(row["status"] == "running" or late, "指令尚未领取", 409)
         ok = boolean(body.get("ok"))
@@ -681,6 +780,8 @@ class Bridge:
         require(len(dump(result)) < 180000, "回执过大")
         error = string(body.get("error", ""), "错误信息", 500, True)
         status = "succeeded" if ok else "unknown" if cmd["intents"] else "failed"
+        if status=="failed" and cmd["action"]=="order.open" and cmd["source"].startswith("strategy-") and result.get("notice_kind") in NOTICE_KINDS:
+            status, result = "cancelled", {"reselect":True,"notice_kind":result["notice_kind"]}
         if row["action"] == PORTFOLIO_SCAN:
             require(not ok, "全量读取须先确认清单，再逐户提交详情", 409)
             finish(db, row["id"], status, now, error, portfolio.progress(row))
@@ -701,12 +802,13 @@ class Bridge:
             except Problem as err:
                 status, error = "failed", str(err)
         obs = result.get("observation")
+        observed = None
         worker, current = target(db, cmd)
         if obs and cmd["account"] and current and current["present"] and worker["session_id"] == cmd["session_id"]:
             require(obs.get("name") == cmd["account"], "回执账户不符", 409)
             if now - 180 <= obs.get("snapshot", {}).get("observed_at", 0) <= now + 10:
-                self._observe(db, cmd["worker_id"], obs, now)
+                observed = self._observe(db, cmd["worker_id"], obs, now)
         finish(db, row["id"], status, now, error, result)
         if status == "succeeded":
             ledger.command_evidence(db, record(command(db, row["id"])))
-        return {"status": status}
+        return {"status": status, **((observed or {}) if cmd["action"] in ("account.read","positions.read") else {})}

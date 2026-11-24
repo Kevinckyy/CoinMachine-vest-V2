@@ -107,7 +107,7 @@ def metric_items(previous, changes, directory, sid):
     return items
 
 
-def update(db, wid, sid, data, now, *, metrics=False):
+def update(db, wid, sid, data, now, *, metrics=False, defer_cache=False):
     data = obj(data)
     gen = number(data.get("generation"),"刷新批次",0,2**53-1,True)
     requested = db.execute("SELECT generation FROM card_request").fetchone()[0]
@@ -208,8 +208,15 @@ def update(db, wid, sid, data, now, *, metrics=False):
                (wid,sid,gen,observed if full else sync["full_at"],observed,source_at if source_at is not None else sync["source_at"] if sync and sync["session"]==sid else None))
     if metrics:
         return {"observed_at": observed, "risks": changed_risks}
+    ack = {"count":len(items),"generation":gen,"supports_metrics":True}
+    if not defer_cache:
+        ack.update(directory_cache(db, wid, now))
+    return ack
+
+
+def directory_cache(db, wid, now):
     rows = db.execute("SELECT name,risk,portfolio,open_lock FROM accounts WHERE worker_id=? AND present=1",(wid,)).fetchall()
-    return {"count":len(items),"generation":gen,"supports_metrics":True,"risks":{r["name"]:json.loads(r["risk"]) for r in rows},
+    return {"risks":{r["name"]:json.loads(r["risk"]) for r in rows},
             "floors":{r["name"]:daily_floor.view(db,wid,r["name"],now) for r in rows},
             "open_locks":{r["name"]:json.loads(r["open_lock"]) for r in rows if r["open_lock"]},
             "portfolios":{r["name"]:json.loads(r["portfolio"]) for r in rows if r["portfolio"]}}

@@ -28,7 +28,7 @@ async function refresh() {
 }
 for (const [id, type, notice] of [
   ['refreshCards','ui.refresh','已请求全量拉取账户列表'],
-  ['readAll','ui.readAll','已请求全量读取账户信息，可在中心查看逐户读取进度']
+  ['readAll','ui.readAll','已请求批量读取账户响应，可在中心查看结果']
 ]) {
   $(id).onclick = async () => {
     $(id).disabled = true;

@@ -34,7 +34,7 @@ def capture(db, worker, account, at, allowance=None, reset=None, platform=None):
     if allowance is not None:
         allowance = number(allowance,"每日亏损额度",0,1e12)
     if reset is not None:
-        reset = number(reset,"美东 20:00 账户价值",0.01,1e12)
+        reset = number(reset,"美东 20:00 账户价值",0,1e12)
     if platform is not None:
         platform = number(platform,"平台当日爆仓线",0,1e12)
     if old and platform is None and reset is None and allowance == old["allowance"]:

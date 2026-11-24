@@ -1,6 +1,5 @@
 'use strict';
 
-const stageNames = {'1/2':'考核 1/2','2/2':'考核 2/2',live:'Live'};
 const poolNames = {random:'全随机选择',same_stage:'每批同阶段',dynamic:'动态分配'};
 const strategyFor = id => state.strategies.find(s => s.node_id === id);
 const poolChanges = new Set();
