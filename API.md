@@ -109,7 +109,7 @@ Content-Type: application/json
 | `order.open` | 必填 | `{"side":"buy","micro":1,"stop_buffer":20}` | 已确认成交和原生保护的持仓快照。开仓许可凭据含下单时核定的爆仓线、缓冲和实际止损金额 |
 | `order.close` | 必填 | `{"position_id":"页面持仓ID"}` | 全量平仓后的空仓快照 |
 | `position.protect` | 必填 | `{"position_id":"页面持仓ID","stop_loss":100,"take_profit":250}` | 已核验的实际保护状态，至少指定一项金额 |
-| `profit.withdraw` | 必填 | `{"amount":50}` | 核验后的源账户余额、申请金额、预计到账额与主账户收款对象。可加 `"all_available":true`，仅在页面可领总额恰好等于申请金额时提交 |
+| `profit.withdraw` | 必填 | `{"amount":50}` | 在 Portfolio 核对并提交，等待同页源账户余额实际扣减。回执给出 `balance_before,balance_after,amount,expected_received,recipient`。1.12.3 起 `balance_source` 标明扣款依据为该页的账户余额响应或空仓账户价值。可加 `"all_available":true`，仅在页面可领总额恰好等于申请金额时提交 |
 | `profit.available` | 必填，Live 账户 | `{}` | 只读打开 Portfolio 利润领取预览，返回 `account,phase,available,observed_at`。策略通过 `strategy_payout.quote_id` 关联这个读数，以本次页面可领额决定领取。节点需支持 `payout_quote_version=1`，插件需为 1.7.1 或更高版本 |
 
 开仓方向为 `buy` 或 `sell`。`micro` 是正整数，也可用 `size_percent` 指定 25、50、75 或 100 百分档。两者选一。`stop_buffer` 为净值缓冲 M，省略时使用该节点对应阶段的设置（初始 20 USD）。需要设置止损时，止损金额取净值至今日底线的距离与剩余最大回撤的较小值，再减去 M，向下取整至美分。开仓许可记录 `equity`、`daily_floor.floor`、`max_drawdown_floor`、`floor_gap`、`distance_to_max_floor` 和 `remaining_max_drawdown`。Live 开仓可传固定金额 `take_profit` 或 `reward_ratio` 配合 `min_take_profit`。盈亏比开仓许可同时记录风险基数 `reward_risk_amount`。带止损时基数为本单止损金额，免止损时基数为 `equity - max(daily_floor.floor, max_drawdown_floor)`。平仓和修改保护会核对持仓 ID、方向、数量、品种和均价。

@@ -630,6 +630,9 @@ class Bridge:
                 if cmd["action"] in ("account.read", "positions.read"):
                     _, account = target(db, cmd)
                     cmd = {**cmd, "read_receipt": True, "read_card_id": (account.get("card") or {}).get("id")}
+                if cmd["action"]=="profit.withdraw":
+                    _, account = target(db,cmd)
+                    cmd.update(read_card_id=(account.get("card") or {}).get("id"), flat_balance=account["snapshot"].get("balance"))
                 return {"command": cmd, "run_until": now + RUN_TTL,"card_generation":db.execute("SELECT generation FROM card_request").fetchone()[0]}
             if refresh_generation is not None:
                 return {"command":None,"refresh_cards":refresh_generation}

@@ -1214,115 +1214,18 @@
         type: 'close'
       }, null, expected);
     }
-    async function withdraw(cmd, continuation) {
-      let before = continuation && {balance:continuation.balance_before}, preview = continuation?.preview, after;
-      const claim = {
-        id: cmd.id,
-        name: cmd.account,
-        account_id: cmd.account,
-        identity: observerIdentity().signature,
-        policy: cmd.strategy_payout || {
-          live_payout_recipient: 'main',
-          live_payout_mode: cmd.params.all_available ? 'all' : 'amount',
-          live_payout_amount: cmd.params.amount
-        }
-      };
-      const flow = globalThis.VestProfitClaimFlow.create({
-        guard: () => hooks.guard(true),
-        identity: observerIdentity,
-        visible,
-        text: elementText,
-        money: core.parseMoney,
-        click,
-        isTrade: core.isNqTradePath,
-        select: async name => {
-          if (observerIdentity().name !== name) throw Error('领取目标账户变化');
-        },
-        flat: async name => {
-          const observation = await read(name, 'funded');
-          const s = observation.snapshot;
-          if (observation.phase !== 'live' || s.position_open !== false || s.unrealized_pnl !== 0) throw Error('领取前后需确认 Live 号空仓');
-          return s;
-        },
-        call: async (_, data) => {
-          if (data.action === 'reserve') {
-            before = data.snapshot;
-            if (cmd.strategy_payout && (Math.abs(before.equity-before.balance) > 0.005 ||
-                cmd.strategy_payout.target_balance != null && before.balance-cmd.strategy_payout.target_balance <= 0.005))
-              throw Error('Live 空仓余额或领取依据已变化');
-            return {
-              claim: {
-                ...claim,
-                status: 'preparing',
-                mode_epoch: 1
-              }
-            };
-          }
-          if (data.action === 'intent') {
-            preview = data.preview;
-            if (preview.amount !== cmd.params.amount || preview.recipient !== 'main') {
-              throw Error('提现预览与指令不符，页面可领取 '+preview.available+'，申请 '+preview.amount+'，预计实收 '+preview.received);
-            }
-            await hooks.intent('withdraw', {
-              balance_before: before.balance,
-              ...preview
-            });
-            return {
-              authorize_click: true
-            };
-          }
-          if (data.action === 'verify') {
-            after = data.snapshot;
-            if (Math.abs(after.balance - (before.balance - preview.amount)) > 0.005) throw Error('扣款后余额与预期不符，请核验平台记录');
-            if (cmd.strategy_payout?.live_payout_mode === 'all' && cmd.strategy_payout.target_balance != null &&
-                Math.abs(after.balance-cmd.strategy_payout.target_balance) > 0.005) throw Error('领取全部净利润后的余额未回到原指令起始余额');
-            return {
-              verified: true
-            };
-          }
-          return {};
-        }
-      });
-      try {
-        if (continuation) flow.resume(claim,1,continuation.stage,continuation.started);
-        else await flow.begin(claim,1);
-        while (flow.active) {
-          const next = await flow.run(1);
-          if (next?.stage) return {continuation:{...next,balance_before:before.balance,preview}};
-          if (flow.active) await delay(220);
-        }
-        return {
-          observation: {
-            name: cmd.account,
-            category: 'funded',
-            phase: 'live',
-            snapshot: after
-          },
-          amount: preview.amount,
-          expected_received: preview.received,
-          recipient: 'main',
-          balance_before: before.balance,
-          balance_after: after.balance,
-          verification: 'source_balance_debited'
-        };
-      } finally {
-        flow.dispose();
-      }
-    }
     const history = globalThis.VestHistory.create({guard: () => { assertLive(); assertNoDialogs(); }, identity: observerIdentity,
       query: queryOne, selected: isSelected, select: selectTab, report: hooks.report});
-    async function continueCommand(cmd, step) {
-      const claim = cmd.action === 'profit.withdraw', portfolio = step.stage === 'portfolio';
-      if (!claim && (!['history.read','profit.available'].includes(cmd.action) || !portfolio) || !portfolio && step.stage !== 'return')
-        throw Error('无法识别跨页指令步骤');
+    async function onPortfolio(cmd, step) {
+      const claim = cmd.action === 'profit.withdraw';
+      if (step && (cmd.action!=='history.read' || step.stage!=='portfolio')) throw Error('无法识别跨页指令步骤');
       const check = () => {
         hooks.guard(claim);
         assertNoDialogs();
-        if (location.origin !== 'https://next.vestmarkets.com' || !(portfolio ?
-          location.pathname.replace(/\/$/,'') === '/portfolio' : core.isNqTradePath(location.pathname)))
+        if (location.origin !== 'https://next.vestmarkets.com' || location.pathname.replace(/\/$/,'') !== '/portfolio')
           throw Error('指令未到达指定页面');
       };
-      const id = await waitForAccountIdentity(check, portfolio ? '[data-testid="portfolio-root"]' : undefined);
+      const id = await waitForAccountIdentity(check,'[data-testid="portfolio-root"]');
       if (id.name !== cmd.account) {
         try { await observerSelect({name:cmd.account},check,Date.now()+6000,check); }
         finally { if (observerSelectorOpen()) await observerCloseSelector(check); }
@@ -1331,7 +1234,11 @@
       const current = observerIdentity();
       if (current.name !== cmd.account || cmd.phase && current.phase !== cmd.phase || claim && current.phase !== 'live')
         throw Error('跳转后账户或阶段与指令不一致');
-      if (claim) return withdraw(cmd,step);
+      if (claim) {
+        core.assertExecutionAllowed(current);
+        return globalThis.VestProfitClaimFlow.withdraw({guard:()=>hooks.guard(true),identity:observerIdentity,
+          visible,text:elementText,click,money:core.parseMoney,delay,intent:hooks.intent,nativeAccounts:hooks.nativeAccounts},cmd);
+      }
       if (cmd.action==='profit.available') {
         if (current.phase!=='live') throw Error('只有 Live 账户可以读取可领取利润');
         return globalThis.VestProfitClaimFlow.readAvailable({account:cmd.account,guard:assertLive,identity:observerIdentity,
@@ -1342,8 +1249,7 @@
       return {observation:step.observation,tables};
     }
     async function execute(cmd, continuation) {
-      if (continuation) return continueCommand(cmd,continuation);
-      if (cmd.action==='profit.available') return continueCommand(cmd,{stage:'portfolio'});
+      if (continuation || cmd.action==='profit.available' || cmd.action==='profit.withdraw') return onPortfolio(cmd,continuation);
       const readOnly = cmd.action==='account.read' || cmd.action==='positions.read';
       const observation = await read(cmd.account,null,true,cmd.expected_risk?.card_id,readOnly ? cmd.read_card_id : null,
         cmd.action==='order.open' || cmd.action==='account.read' && !!cmd.read_card_id);
@@ -1383,7 +1289,6 @@
         selectors: core.defaults
       };
       try {
-        if (cmd.action === 'profit.withdraw') return await withdraw(cmd);
         const p = cmd.params;
         const job = {
           ...p,

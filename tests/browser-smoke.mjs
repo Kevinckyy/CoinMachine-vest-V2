@@ -216,6 +216,39 @@ try {
   await ui.evaluate(`(() => {const f=document.getElementById('dialogForm');Object.entries(${JSON.stringify({id:'lab',label:'本地测试节点',url:bridgeURL,token:nodeToken})}).forEach(([k,v])=>f.elements[k].value=v);f.requestSubmit();})()`);
   await until(async()=>(await api('state')).nodes[0]?.online,'registered node');
   const vest=await tab(), fixture=await readFile(path.join(root,'tests','vest-readonly.html'));
+  // Exercise post-click failures on a separate Portfolio document without a bridge or a real submit.
+  const payoutTab=await tab();
+  const payoutHtml=fixture.toString().replace('<head>',"<head><script>sessionStorage.setItem('testPayout','yes')</script>");
+  await payoutTab.send('Fetch.enable',{patterns:[{urlPattern:'*'}]});
+  payoutTab.on('Fetch.requestPaused',p=>payoutTab.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:200,
+    responseHeaders:[{name:'Content-Type',value:p.resourceType==='Document'?'text/html; charset=utf-8':'application/json'}],
+    body:Buffer.from(p.resourceType==='Document'?payoutHtml:'{}').toString('base64')}));
+  await payoutTab.send('Page.navigate',{url:'https://next.vestmarkets.com/portfolio'});
+  await until(()=>payoutTab.evaluate("!!document.querySelector('[data-testid=withdraw-open]')"),'isolated Portfolio fixture');
+  await payoutTab.evaluate(await readFile(path.join(root,'extension/profit-claim.js'),'utf8'));
+  async function payoutCase(kind) {
+    const clock=Date.now;
+    let now=clock(),submitted=0,granted=0;
+    Date.now=()=>now;
+    const start=now/1000;
+    const ctx={guard(){},identity:()=>({name:'Beta',phase:'live',category:'funded'}),
+      visible:e=>!!e?.getClientRects().length,text:e=>e?.textContent.trim(),money:v=>Number(String(v).replace(/[$,]/g,'')),
+      delay:async ms=>{now+=ms;},intent:async()=>{granted++;},
+      nativeAccounts:async()=>({selected:submitted && kind==='switch'?'Other':'Beta',phase:'live',
+        balance:submitted ? (kind==='net'?1968:1960) : 2000,at:submitted && kind!=='stale'?now/1000:start}),
+      click:el=>{if(el.matches('[data-testid=claim-profit-submit]')) {submitted++;el.closest('[role=dialog]').remove();} else el.click();}};
+    try {
+      const result=await VestProfitClaimFlow.withdraw(ctx,{account:'Beta',read_card_id:'Beta',flat_balance:2000,params:{amount:40}});
+      return [granted,submitted,result.balance_source,result.balance_after];
+    } catch (err) {return [granted,submitted,err.message];} finally {Date.now=clock;}
+  }
+  for(const kind of ['native','switch','stale','net']) {
+    const result=await payoutTab.evaluate('('+payoutCase.toString()+')('+JSON.stringify(kind)+')');
+    assert.deepEqual(result.slice(0,2),[1,1]);
+    if(kind==='native') assert.deepEqual(result.slice(2),['portfolio_accounts_response',1960]);
+    else assert.match(result[2],kind==='switch'?/账户 ID/:/尚未确认实际扣款/);
+  }
+  await browserCdp.send('Target.closeTarget',{targetId:payoutTab.targetId});
   const gateway='https://api-gateway.hz.vestmarkets.com';
   const archivedPages={
     '/v3/accounts':{accounts:[{account_id:'Gamma',amount:'985'}]},
@@ -829,6 +862,14 @@ try {
   assert.equal(accountCache.floors.Alpha.floor,970);
   await vest.evaluate("sessionStorage.removeItem('tradeSelector')");
   await vest.evaluate("sessionStorage.setItem('testPayout','yes')");
+  const readLive=randomUUID();
+  await api('commands/'+readLive,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'account.read',params:{}});
+  await until(async()=>(await api('commands/'+readLive)).status==='succeeded','read funded test account before its claim');
+  await until(async()=>{
+    const s=await api('state?node_id=lab'),a=s.accounts.find(item=>item.name==='Beta');
+    return a?.read_session===s.workers[0].session_id && a.listed_session===a.read_session && s.workers[0].page==='/accounts';
+  },'the center has the confirmed flat balance');
+  await vest.evaluate("sessionStorage.setItem('scanTrace','[]')");
   const quoteId=randomUUID();
   await api('commands/'+quoteId,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'profit.available',params:{}});
   const pageQuote=await until(async()=>{
@@ -838,13 +879,10 @@ try {
   },'read the platform withdrawable amount with no financial click');
   assert.equal(pageQuote.available,40);
   assert.equal(await vest.evaluate("sessionStorage.getItem('testPayoutDebited')"),null);
-  const readLive=randomUUID();
-  await api('commands/'+readLive,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'account.read',params:{}});
-  await until(async()=>(await api('commands/'+readLive)).status==='succeeded','read funded test account before its claim');
-  await until(async()=>{
-    const s=await api('state?node_id=lab'),a=s.accounts.find(item=>item.name==='Beta');
-    return a?.read_session===s.workers[0].session_id && a.listed_session===a.read_session;
-  },'the center has received the funded account reading for this session');
+  const quotedDocument=await vest.evaluate('performance.timeOrigin');
+  await sleep(3500);
+  assert.equal(await vest.evaluate('location.pathname'),'/portfolio');
+  assert.equal(await vest.evaluate('performance.timeOrigin'),quotedDocument);
   const claim=randomUUID();
   await api('commands/'+claim,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'profit.withdraw',
     params:{amount:40,all_available:true}});
@@ -852,8 +890,12 @@ try {
     const c=await api('commands/'+claim);
     if(c.status!=='succeeded')throw Error(c.status+' '+c.error);
     return c;
-  },'full claim across directly loaded documents with no navigation bar',45000);
-  assert.deepEqual([claimed.result.amount,claimed.result.expected_received,claimed.result.balance_after],[40,32,1960]);
+  },'claim and delayed debit verified on the same Portfolio page',45000);
+  assert.deepEqual([claimed.result.amount,claimed.result.expected_received,claimed.result.balance_before,claimed.result.balance_after,
+    claimed.result.balance_source],[40,32,2000,1960,'portfolio_account_value']);
+  const claimTrace=await vest.evaluate("JSON.parse(sessionStorage.getItem('scanTrace'))");
+  assert.deepEqual(claimTrace.filter(([event,path])=>event==='page' && path!=='/accounts'),[['page','/portfolio']]);
+  assert.deepEqual(claimTrace.filter(([event])=>['submit','debit'].includes(event)),[['submit','/portfolio'],['debit','/portfolio']]);
   assert.equal(await vest.evaluate("sessionStorage.getItem('testPayoutDebited')"),'1');
   const emptyQuote=randomUUID();
   await api('commands/'+emptyQuote,'PUT',{node_id:'lab',worker_id:worker.worker_id,account:'Beta',action:'profit.available',params:{}});

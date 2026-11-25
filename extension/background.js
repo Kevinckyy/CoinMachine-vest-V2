@@ -527,7 +527,7 @@ async function directoryRoute(owner,url,work,since) {
 async function pollWork(owner,cfg,meta,url,documentId,historyPending,noticeKind) {
   if ((await binding())?.session_id !== owner.session_id) throw Error('绑定已变化');
   await drain(cfg);
-  const saved = await chrome.storage.session.get(['cardRoute','cardVisit','returnCards','cachedScan']);
+  const saved = await chrome.storage.session.get(['cardRoute','cardVisit','returnCards','portfolioUntil','cachedScan']);
   const route = saved.cardRoute;
   let data;
   if (route) {
@@ -558,7 +558,8 @@ async function pollWork(owner,cfg,meta,url,documentId,historyPending,noticeKind)
   if (cmd) {
     const scan = cmd.action === 'accounts.read_all';
     const directory = cmd.action === 'accounts.list' || scan && data.scan?.stage === 'list';
-    const path = directory || scan ? DESTINATIONS.accounts : cmd.action==='profit.available' ? DESTINATIONS.portfolio : DESTINATIONS.trade;
+    const payout = cmd.action==='profit.available' || cmd.action==='profit.withdraw';
+    const path = directory || scan ? DESTINATIONS.accounts : payout ? DESTINATIONS.portfolio : DESTINATIONS.trade;
     if (cmd.action==='account.read' && cmd.read_card_id && data.arrived && !data.renewedBalance &&
         Date.now()-route?.started>15000 && data.run_until*1000-Date.now()>15000) {
       const timing=await nativeDirectory(owner.tabId,documentId,true);
@@ -571,7 +572,7 @@ async function pollWork(owner,cfg,meta,url,documentId,historyPending,noticeKind)
       const moving=await directoryRoute(owner,url,{...data,owner:publicBinding(owner)},data.directory_since);
       if (moving) return moving;
     } else if (!data.arrived) {
-      let move=cmd.action==='profit.available' || !onPath(url,path);
+      let move=!onPath(url,path);
       if (!move && (cmd.action==='order.open' || cmd.action==='account.read' && cmd.read_card_id)) {
         const timing=await nativeDirectory(owner.tabId,documentId,true), now=Date.now()/1000;
         move=!(timing?.trade_at>=now-6 && timing.at>=now-315);
@@ -579,7 +580,7 @@ async function pollWork(owner,cfg,meta,url,documentId,historyPending,noticeKind)
       if (move) return startRoute(owner,url,path,{...data,arrived:true,owner:publicBinding(owner)});
     }
     const lease = {...owner,action:cmd.action};
-    if (cmd.action==='profit.withdraw' || cmd.action==='history.read') {
+    if (cmd.action==='history.read') {
       Object.assign(lease,{command:cmd,run_until:data.run_until,stage:data.continuation?.stage || 'trade'});
     }
     await chrome.storage.session.set({['lease.'+cmd.id]:lease});
@@ -601,7 +602,8 @@ async function pollWork(owner,cfg,meta,url,documentId,historyPending,noticeKind)
     return {refresh_cards:generation,purchase_request:cardRequest,directory_since:since};
   }
   if (saved.returnCards === owner.session_id) {
-    await chrome.storage.session.remove('returnCards');
+    if (onPath(url,DESTINATIONS.portfolio) && Date.now()<saved.portfolioUntil) return data;
+    await chrome.storage.session.remove(['returnCards','portfolioUntil']);
     if (!onPath(url,DESTINATIONS.accounts))
       return startRoute(owner,url,DESTINATIONS.accounts,{arrived:true,card_generation:generation});
   }
@@ -612,11 +614,9 @@ async function continueCommand(owner, url, {id,continuation}) {
   if (lease?.session_id !== owner.session_id || lease.pageId !== owner.pageId || lease.tabId !== owner.tabId ||
       !lease.command || Date.now() >= lease.run_until*1000 || (await binding())?.session_id !== owner.session_id)
     throw Error('跨页指令租约已失效');
-  const withdraw = lease.action==='profit.withdraw';
   const toPortfolio = lease.stage==='trade' && continuation?.stage==='portfolio' && onPath(url,DESTINATIONS.trade);
-  const toTrade = withdraw && lease.stage==='portfolio' && continuation?.stage==='return' && onPath(url,DESTINATIONS.portfolio);
-  if (withdraw && owner.mode!=='execute' || !(toPortfolio || toTrade)) throw Error('不允许此指令跳转步骤');
-  return startRoute(owner,url,toPortfolio ? DESTINATIONS.portfolio : DESTINATIONS.trade,
+  if (lease.action!=='history.read' || !toPortfolio) throw Error('不允许此指令跳转步骤');
+  return startRoute(owner,url,DESTINATIONS.portfolio,
     {command:lease.command,owner:publicBinding(owner),run_until:lease.run_until,arrived:true,continuation});
 }
 let pendingMetricRisks = new Map();
@@ -684,7 +684,11 @@ async function handle(message, sender) {
     const key = 'lease.' + message.data.id;
     const owner = (await chrome.storage.session.get(key))[key];
     if (!owner || owner.tabId !== sender.tab.id || owner.pageId !== message.pageId || owner.session_id !== message.session_id) throw Error('没有属于该页面的指令租约');
-    if (owner.action !== 'accounts.list') await chrome.storage.session.set({returnCards:owner.session_id});
+    if (owner.action !== 'accounts.list') {
+      // Allow the center to consume a positive quote and send the claim on this same document.
+      const hold=owner.mode==='execute' && owner.action==='profit.available' && message.data.ok && message.data.result?.available>0;
+      await chrome.storage.session.set({returnCards:owner.session_id,portfolioUntil:hold ? Date.now()+180000 : 0});
+    }
     const cfg = await settings();
     await exclusive(()=>persistReceipt({
       ...message.data,
@@ -706,7 +710,7 @@ async function handle(message, sender) {
   if (op==='native.accounts') {
     if (message.session_id!==owner.session_id || !sender.documentId) throw Error('账户快照会话已变化');
     const scope=message.data?.scope;
-    const view = ['selected','bulk','inventory','notice'].includes(scope) ? scope : 'directory';
+    const view = ['selected','bulk','inventory','notice','payout'].includes(scope) ? scope : 'directory';
     const data=await nativeDirectory(owner.tabId,sender.documentId,view,message.data.platform_id || '');
     if ((scope==='bulk' || scope==='inventory') && data?.rows) {
       const {cardCache}=await chrome.storage.local.get('cardCache');

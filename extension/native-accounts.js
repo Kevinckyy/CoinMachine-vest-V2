@@ -214,7 +214,7 @@
     }
     if (scope==='directory') return {at:snapshot.at,...positionTotals(positions.snapshot),rows:snapshot.rows.map(({id,name,phase,category})=>({id,name,phase,category}))};
     const notice=scope==='notice';
-    if (scope!=='selected' && !notice) return null;
+    if (scope!=='selected' && scope!=='payout' && !notice) return null;
     const selected = new Set();
     for (let i=0;i<sessionStorage.length;i++) {
       const key=sessionStorage.key(i);
@@ -233,6 +233,8 @@
     }
     const id=selected.size===1 ? [...selected][0] : null;
     const row=snapshot.rows.find(item=>item.id===id);
+    if (scope==='payout') return {selected:id,phase:row?.phase ?? null,
+      balance:row ? balances.snapshot?.rows.get(id) ?? null : null,at:balances.snapshot?.at ?? null};
     const opened=positions.snapshot;
     if (notice) {
       const roots = new Map();

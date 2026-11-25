@@ -1,4 +1,4 @@
-/* Public DOM only. A persisted server intent precedes the one financial click. */
+/* Verify a profit claim on the bound Portfolio page, with one authorized submit. */
 (() => {
   'use strict';
   function units(value) {
@@ -17,21 +17,19 @@
     const numerator=BigInt(m[1]+(m[2]||''))*10n**BigInt(Math.max(0,exponent));
     return Number(total*numerator/(100n*scale))/1e6;
   }
-  function create(a) {
-    let state=null;
+  async function withdraw(a,cmd) {
+    const deadline=Date.now()+90000;
+    const policy=cmd.strategy_payout || {live_payout_recipient:'main',
+      live_payout_mode:cmd.params.all_available ? 'all' : 'amount',live_payout_amount:cmd.params.amount};
+    const matchesBalance=(a,b)=>Number.isFinite(a) && Number.isFinite(b) &&
+      Math.abs(Math.round(a*1e6)-Math.round(b*1e6))<=5000;
     const dialogs=()=>[...document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open]')].filter(a.visible);
-    function own(loading=false) {
-      if(!state)throw new Error('利润领取流程已停止');
-      a.guard(state.epoch);
-      let identity;
-      try{identity=a.identity();}catch(error){if(loading)return false;throw error;}
-      if(loading&&!identity.phase&&identity.name===state.claim.name)return false;
-      if(identity.name!==state.claim.name||identity.phase!=='live'||!['funded','live'].includes(identity.category))throw new Error('领取期间账户或 Live 阶段发生变化');
-      return true;
-    }
-    function payload(action,extra={}) {
-      return {action,claim_id:state.claim.id,account_id:state.claim.account_id,name:state.claim.name,
-        identity:state.claim.identity,phase:'live',mode_epoch:state.epoch,...extra};
+    function own() {
+      a.guard();
+      const identity=a.identity();
+      if (location.origin!=='https://next.vestmarkets.com' || location.pathname.replace(/\/$/,'')!=='/portfolio' ||
+          identity.name!==cmd.account || identity.phase!=='live' || !['funded','live'].includes(identity.category))
+        throw Error('领取期间 Portfolio 页面、账户或 Live 阶段已变化');
     }
     function one(selector,scope=document,fallback=null) {
       const found=[...scope.querySelectorAll(selector)].filter(a.visible);
@@ -53,12 +51,12 @@
       if(current&&current.kind!=='form')throw new Error('提交前出现领取结果窗口，请核对实际余额');
       return current?.dialog;
     }
-    function submittedNotice(dialog) {
+    function submittedNotice(dialog,expectedReceived) {
       const description=a.text(one('[data-slot="dialog-description"]',dialog,'p'));
       const amountText=description.match(/^\$\s*([\d,]+(?:\.\d{1,6})?)\s*正在转入您的主账户[，,]\s*将在\s*24\s*小时后到账[。.]?$/)?.[1]
         ?? description.match(/^\$\s*([\d,]+(?:\.\d{1,6})?)\s+is being transferred to your (?:primary|main) account and will arrive in 24 hours\.?$/i)?.[1];
       const amount=a.money(amountText);
-      if(!(amount>0)||Math.abs(amount-state.received)>0.0000005||
+      if(!(amount>0)||Math.abs(amount-expectedReceived)>0.0000005||
         dialog.querySelector('form,[data-testid="claim-profit-submit"],[data-testid="confirm-order-submit"],[data-testid="close-submit"]')){
         throw new Error('领取确认窗口的到账金额或主账户信息与已提交请求不符');
       }
@@ -111,107 +109,111 @@
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,String(value));
       input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));
     }
-    return {
-      get active(){return !!state;},
-      heartbeat(){return state?.reserved?payload('heartbeat'):null;},
-      dispose(){state=null;},
-      resume(claim,epoch,stage,started) {
-        if(state || !['portfolio','return'].includes(stage))throw Error('领取步骤无效');
-        state={claim,epoch,stage,started,reserved:true};
-      },
-      async begin(claim,epoch) {
-        if(state)throw new Error('已有领取流程尚未核验');
-        state={claim,epoch,stage:'reserve',started:Date.now()};
-        try{
-          a.guard(epoch);await a.select(claim.name,epoch);own();
-          const snapshot=await a.flat(claim.name,epoch);own();
-          const reply=await a.call('profit-claim',payload('reserve',{snapshot}));own();
-          if(reply.claim?.status!=='preparing'||reply.claim.mode_epoch!==epoch)throw new Error('领取任务已提交或授权变化，不重复执行');
-          state.claim=reply.claim;state.reserved=true;state.stage='go-portfolio';
-        }catch(error){if(error.code==='EXECUTION_CONNECTION_PENDING'&&!state?.reserved)state=null;await this.fail(error);throw error;}
-      },
-      async fail(error) {
-        if(!state||error.code==='EXECUTION_CONNECTION_PENDING')return;
-        try{await a.call('profit-claim',payload('fail',{error:error.message}));}catch{}
-      },
-      async run(epoch) {
-        if(!state)return false;
-        try{
-          if(epoch!==state.epoch)throw new Error('利润领取授权轮次已变化');
-          a.guard(epoch);if(Date.now()-state.started>90000)throw new Error('利润领取超过 90 秒未完成核验；禁止重试提交');
-          if(!own(['portfolio','return','go-return'].includes(state.stage)))return true;
-          if(state.stage==='go-portfolio'){
-            if(dialogs().length)throw Error('存在额外弹窗，禁止切换领取页面');
-            return {stage:'portfolio',started:state.started};
-          }
-          if(state.stage==='portfolio'){
-            if(location.pathname.replace(/\/$/,'')!=='/portfolio')return true;
-            if(dialogs().length)throw new Error('打开领取前出现未知弹窗');
-            const button=one('button[data-testid="withdraw-open"]');
-            if(button.type!=='button')throw new Error('领取入口类型变化');
-            state.stage='dialog';a.click(button);return true;
-          }
-          if(state.stage==='dialog'){
-            const dialog=modal();if(!dialog)return true;
-            const policy=state.claim.policy;
-            if(policy.live_payout_recipient!=='main')throw new Error('领取收款参数不是主账户');
-            if(policy.live_payout_mode==='amount')edit(one('input[name="amount"]',dialog),policy.live_payout_amount);
-            else edit(one('[data-testid="claim-profit-amount-slider-percentage"]',dialog),policy.live_payout_mode==='all'?100:policy.live_payout_percent);
-            state.stage='preview';return true;
-          }
-          if(state.stage==='preview'){
-            const dialog=modal();if(!dialog)throw new Error('领取预览意外关闭');
-            const q=quote(dialog),expected=expectedAmount(q.available,state.claim.policy);
-            if(q.amount!==expected)throw new Error('页面联动金额与策略参数不符');
-            const button=one('button[data-testid="claim-profit-submit"]',dialog);
-            if(button.type!=='submit'||button.disabled)throw new Error('领取提交按钮尚不可用');
-            const reply=await a.call('profit-claim',payload('intent',{preview:{...q,flat:portfolioFlat()}}));
-            // Reserve locally before any possible click. Losing this response
-            // or changing modes cannot turn into a second financial request.
-            state.stage='submitted';
-            if(!reply.authorize_click)throw new Error('该领取已送达或状态不明，禁止重复点击');
-            const key='profit-claim-clicks:'+state.claim.account_id;
-            const history=(await chrome.storage.local.get(key))[key]||[];
-            if(history.includes(state.claim.id))throw new Error('本领取已尝试，禁止重放');
-            await chrome.storage.local.set({[key]:[...history.slice(-499),state.claim.id]});
-            own();const fresh=modal(),proof=fresh&&quote(fresh);
-            if(!proof||JSON.stringify(proof)!==JSON.stringify(q))throw new Error('提交前领取预览或收款状态变化');
-            portfolioFlat();
-            state.received=q.received;
-            a.click(one('button[data-testid="claim-profit-submit"]',fresh));return true;
-          }
-          if(state.stage==='submitted'||state.stage==='go-return'){
-            const current=readDialog();
-            if(current?.kind==='form'){
-              if(state.dismissed)throw new Error('提交结果已确认后又出现领取输入窗口，请核对实际余额');
-              state.stage='submitted';return true;
-            }
-            if(current?.kind==='submitted'){
-              const button=submittedNotice(current.dialog);
-              if(state.dismissed||button.disabled||button.getAttribute('aria-disabled')==='true'||button.getAttribute('aria-busy')==='true')return true;
-              own();state.dismissed=true;state.stage='go-return';a.click(button);return true;
-            }
-            // Some versions close the form without a receipt. Give a receipt
-            // mounted on the next render time to appear before leaving.
-            if(state.stage==='submitted'){state.stage='go-return';return true;}
-            if(a.isTrade(location.pathname)){state.stage='return';return true;}
-            return {stage:'return',started:state.started};
-          }
-          if(state.stage==='return'){
-            if(!a.isTrade(location.pathname))return true;
-            if(dialogs().length)throw new Error('返回交易页存在额外确认窗口');
-            const snapshot=await a.flat(state.claim.name,epoch);own();
-            const reply=await a.call('profit-claim',payload('verify',{snapshot}));own();
-            if(!reply.verified&&reply.claim?.status!=='verified')throw new Error('领取后余额尚未核验');
-            state=null;return true;
-          }
-          return true;
-        }catch(error){
-          if(error.code==='OBSERVATION_PENDING'&&state?.stage==='return')return true;
-          await this.fail(error);throw error;
+    let platformId=cmd.read_card_id;
+    async function balances() {
+      own();
+      const source=await a.nativeAccounts('payout');
+      own();
+      if (source?.selected) {
+        if (platformId && platformId!==source.selected || source.phase && source.phase!=='live')
+          throw Error('Portfolio 账户 ID 或阶段与领取目标不一致');
+        platformId=source.selected;
+      }
+      const root=one('[data-testid="portfolio-root"]');
+      const values=[...root.querySelectorAll('[data-testid="account-value"]')].filter(a.visible);
+      const busy='[aria-busy="true"],[data-loading="true"],[data-slot="skeleton"],.animate-pulse';
+      const el=values.length===1 ? values[0] : null;
+      const display=el && !el.closest(busy) && !el.querySelector(busy) ? a.money(a.text(el)) : null;
+      const at=source?.at, now=Date.now()/1000;
+      const cash=platformId && source?.selected===platformId && source.phase==='live' &&
+        Number.isFinite(at) && at<=now && now-at<=180 && Number.isFinite(source.balance) ? source.balance : null;
+      return {cash,at,display};
+    }
+    own();
+    if (dialogs().length) throw Error('打开领取前存在额外弹窗');
+    portfolioFlat();
+    // A DOM value can briefly belong to the previous selection. Anchor it to the confirmed flat balance.
+    let before, sampled;
+    const readyBy=Date.now()+8000;
+    do {
+      const sample=await balances();
+      const value=sample.cash ?? sample.display;
+      if (value>0 && (cmd.flat_balance==null ? sample.cash!==null : matchesBalance(value,cmd.flat_balance))
+          && value===sampled) {
+        before=value;
+        break;
+      }
+      sampled=value;
+      await a.delay(180);
+    } while (Date.now()<readyBy);
+    if (before===undefined) throw Error('Portfolio 领取前余额未就绪或与平仓后余额不一致');
+    if (policy.live_payout_recipient!=='main') throw Error('领取收款参数不是主账户');
+    const button=one('button[data-testid="withdraw-open"]');
+    if (button.type!=='button' || button.disabled) throw Error('领取入口尚不可用');
+    a.click(button);
+    let dialog;
+    while (!(dialog=modal())) {
+      own();
+      if (Date.now()>=deadline) throw Error('领取表单未打开');
+      await a.delay(180);
+    }
+    if (policy.live_payout_mode==='amount') edit(one('input[name="amount"]',dialog),policy.live_payout_amount);
+    else edit(one('[data-testid="claim-profit-amount-slider-percentage"]',dialog),policy.live_payout_mode==='all'?100:policy.live_payout_percent);
+    await a.delay(220);
+    own();
+    dialog=modal();
+    if (!dialog) throw Error('领取预览意外关闭');
+    const q=quote(dialog);
+    if (q.amount!==expectedAmount(q.available,policy) || q.amount!==cmd.params.amount)
+      throw Error('页面领取金额与指令不符');
+    function submitButton(form) {
+      const el=one('button[data-testid="claim-profit-submit"]',form);
+      if (el.type!=='submit' || el.disabled || el.getAttribute('aria-disabled')==='true') throw Error('领取提交按钮尚不可用');
+      return el;
+    }
+    submitButton(dialog);
+    // The bridge persists the intent and the background worker journals its permission before returning.
+    await a.intent('withdraw',{...q,balance_before:before,flat:portfolioFlat()});
+    const last=await balances();
+    dialog=modal();
+    if (!matchesBalance(last.cash ?? last.display,before) || !dialog || JSON.stringify(quote(dialog))!==JSON.stringify(q))
+      throw Error('提交前领取余额、金额或收款状态变化');
+    portfolioFlat();
+    const confirmed=submitButton(dialog);
+    const clickedAt=Date.now()/1000;
+    a.click(confirmed);
+    let dismissed=false;
+    while (Date.now()<deadline) {
+      await a.delay(250);
+      own();
+      const current=readDialog();
+      if (current?.kind==='submitted') {
+        const ok=submittedNotice(current.dialog,q.received);
+        if (!dismissed && !ok.disabled && ok.getAttribute('aria-disabled')!=='true' && ok.getAttribute('aria-busy')!=='true') {
+          dismissed=true;
+          a.click(ok);
         }
-      },
-    };
+        continue;
+      }
+      if (current) {
+        if (dismissed) throw Error('领取结果关闭后输入窗口再次出现，请核对实际余额');
+        continue;
+      }
+      const sample=await balances();
+      // A fresh cash response takes precedence. For the rounded display require a visible change from before the click.
+      const native=sample.cash!==null && sample.at>clickedAt;
+      const after=native ? sample.cash : sample.display;
+      if (!matchesBalance(after,before-q.amount) || after<0 || after>=before) continue;
+      if (!native && (!matchesBalance(last.display,before) || last.display===after)) continue;
+      portfolioFlat();
+      if (policy.target_balance!=null && policy.live_payout_mode==='all' && Math.abs(after-policy.target_balance)>0.005)
+        throw Error('领取后余额与原指令起始余额不符');
+      return {observation:{name:cmd.account,category:'funded',phase:'live',snapshot:{
+        observed_at:Date.now()/1000,balance:after,equity:after,unrealized_pnl:0,position_open:false}},
+        amount:q.amount,expected_received:q.received,recipient:'main',balance_before:before,balance_after:after,
+        balance_source:native ? 'portfolio_accounts_response' : 'portfolio_account_value',verification:'source_balance_debited'};
+    }
+    throw Error('领取已提交，Portfolio 余额尚未确认实际扣款，请核对平台记录');
   }
   async function readAvailable(a) {
     const check = () => {
@@ -244,7 +246,15 @@
       const value=amounts.length===1 ? a.money(a.text(amounts[0])) : null;
       if(value!==null && value>=0 && value===prior) {
         const result={account:a.account,phase:'live',available:value,observed_at:Date.now()/1000};
-        if(dialog) dialog.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true,cancelable:true}));
+        if(dialog) {
+          dialog.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true,cancelable:true}));
+          const closeBy=Date.now()+2000;
+          while(dialogs().includes(dialog) && Date.now()<closeBy) {
+            check();
+            await new Promise(r=>setTimeout(r,100));
+          }
+          if(dialogs().length) throw Error('领取预览未关闭，无法继续领取');
+        }
         return result;
       }
       prior=value;
@@ -252,5 +262,5 @@
     } while(Date.now()<deadline);
     throw Error('平台未明确显示可领取金额');
   }
-  globalThis.VestProfitClaimFlow={create,expectedAmount,readAvailable};
+  globalThis.VestProfitClaimFlow={withdraw,readAvailable};
 })();

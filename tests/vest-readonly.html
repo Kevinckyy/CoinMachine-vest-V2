@@ -168,8 +168,16 @@
         '<input name="amount" data-slot="form-control" value="40"><input data-testid="claim-profit-amount-slider-percentage">'+
         '<div><p>您将收到</p><span>$32.00</span></div><button type="submit" data-testid="claim-profit-submit">提交</button>';
       document.body.append(dialog);
+      dialog.onkeydown=event=>{if(event.key==='Escape')dialog.remove();};
       dialog.querySelector('button').onclick=()=>{
         sessionStorage.setItem('testPayoutDebited',String(1+Number(sessionStorage.getItem('testPayoutDebited'))));
+        trace('submit',location.pathname);
+        setTimeout(()=>{
+          if(trigger.querySelector('span.truncate').textContent==='Beta') {
+            document.querySelector('[data-testid="account-value"]').textContent='$1,960.00';
+            trace('debit',location.pathname);
+          }
+        },1200);
         dialog.innerHTML='<h2>Profit Claim Request Submitted</h2><p>$32.00 is being transferred to your main account and will arrive in 24 hours.</p><button type="button">Got It</button>';
         dialog.querySelector('button').onclick=()=>dialog.remove();
       };
