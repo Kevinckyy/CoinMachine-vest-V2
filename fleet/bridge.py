@@ -172,7 +172,7 @@ class Bridge:
             workers = []
             for row in db.execute("""SELECT w.*,COALESCE(b.release,'') AS release,COALESCE(b.portfolio_version,0) AS portfolio_version,
                     COALESCE(b.strategy_version,0) AS strategy_version,COALESCE(b.plugin_version,'') AS plugin_version,c.session AS card_session,
-                    c.generation AS card_generation,c.full_at AS cards_full_at,m.mode AS pending_mode FROM workers w
+                    c.generation AS card_generation,c.full_at AS cards_full_at,c.positions_at,c.position_count,m.mode AS pending_mode FROM workers w
                     LEFT JOIN worker_mode_requests m ON m.worker=w.worker_id AND m.session=w.session_id
                     LEFT JOIN worker_build b ON b.worker_id=w.worker_id LEFT JOIN card_sync c ON c.worker=w.worker_id ORDER BY label"""):
                 scan = db.execute("""SELECT id,status,error, json_extract(result,'$.stage') AS stage,
@@ -732,9 +732,11 @@ class Bridge:
         if not reason and lock:
             db.execute("UPDATE accounts SET open_lock=NULL WHERE worker_id=? AND name=?",(wid,cmd["account"]))
             lock = None
-        profit = None
+        profit = risk_amount = None
         if not reason:
-            profit = daily_floor.take_profit(cmd["params"],stop["remaining_drawdown"] if stop["stop_omitted"] else amount)
+            if "reward_ratio" in cmd["params"]:
+                risk_amount = daily_floor.reward_risk(stop)
+            profit = daily_floor.take_profit(cmd["params"],risk_amount)
             if profit is not None and profit<=0:
                 reason = "盈亏比计算的止盈金额不足一美分"
         result = {"risk":actual,"changed":changed,"daily_floor":floor,"open_lock":lock,"observed_at":snap["observed_at"]}
@@ -746,7 +748,7 @@ class Bridge:
             reporting.log(db,self.node_id,now,"preflight","交易页已更正缓存并通过开仓核对 · "+", ".join(changed),
                           worker=wid,account=cmd["account"],command_id=cmd["id"])
         db.execute("INSERT OR REPLACE INTO open_preflight VALUES(?,?,?)",(cmd["id"],sid,now))
-        return {**result, **stop, "approved":True, "take_profit":profit}
+        return {**result, **stop, "approved":True, "take_profit":profit, "reward_risk_amount":risk_amount}
 
     def _intent(self, db, wid, sid, body, now):
         row = command(db, ident(body.get("id")))
@@ -784,6 +786,8 @@ class Bridge:
             proof["stop_buffer"] = cmd["params"]["stop_buffer"]
             proof["stop_omitted"] = checked["stop_omitted"]
             proof["remaining_drawdown"] = checked["remaining_drawdown"]
+            if "reward_ratio" in cmd["params"]:
+                proof["reward_risk_amount"] = checked["reward_risk_amount"]
             if cmd["phase"] == "live":
                 proof["initial_balance"] = target(db,cmd)[1]["initial_balance"]
         if stage == "withdraw" and cmd["params"].get("all_available"):

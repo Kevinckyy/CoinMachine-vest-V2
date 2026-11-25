@@ -125,12 +125,12 @@
   }
   function openedPositions(payload) {
     // Vest sends an explicit null collection when the user has no open positions.
-    if (Object.hasOwn(payload,'positions') && payload.positions===null && !(Number(payload.total)>0)) return new Map();
+    if (Object.hasOwn(payload,'positions') && payload.positions===null && (payload.total==null || Number(payload.total)===0)) return new Map();
     if (!Array.isArray(payload?.positions)) {
       positions.state='invalid-positions';
       return;
     }
-    if (payload.positions.length>1000) return;
+    if (payload.positions.length>1000 || payload.total!=null && Number(payload.total)!==payload.positions.length) return;
     const byAccount=new Map(), ids=new Set();
     for (const p of payload.positions) {
       const accountId=p?.accountId ?? p?.account_id;
@@ -175,16 +175,22 @@
     const amount=count===0 && reserved===false ? bal?.rows.get(id) : null;
     return {count,reserved,equity:amount ?? null,at:amount!=null ? Math.min(pos.at,ord.at,bal.at) : null};
   }
+  function positionTotals(opened) {
+    if (!opened) return {};
+    let count=0;
+    for (const entry of opened.rows.values()) count+=entry.count;
+    return {position_at:opened.at,position_count:count};
+  }
   // The extension reads a copy from the exact bound document. No request headers, tokens,
   // page functions, or unrelated response bodies are passed across worlds.
   Object.defineProperty(window,'vestFleetSnapshotsV2',{value:(scope='directory',priorId='') => {
     const snapshot=accounts.snapshot;
-    if (scope===true) return {at:snapshot?.at ?? null,pending_at:accounts.pending ?? null,bulk_version:1,
+    if (scope===true) return {at:snapshot?.at ?? null,pending_at:accounts.pending ?? null,bulk_version:1,position_at:positions.snapshot?.at ?? null,
       trade_at:Math.min(...[balances,orders,positions].map(ch=>ch.snapshot?.at || 0))};
     if (!snapshot) return null;
     if (scope==='inventory') {
       const opened=positions.snapshot;
-      return {at:snapshot.at,position_at:opened?.at ?? null,
+      return {at:snapshot.at,...positionTotals(opened),
         rows:snapshot.rows.map(({id,name,phase,category})=>({id,name,phase,category,
           active_positions:opened ? opened.rows.get(id)?.count ?? 0 : null}))};
     }
@@ -192,7 +198,7 @@
       const now=Date.now()/1000;
       const fresh=(channel,maxAge)=>channel.snapshot && now-channel.snapshot.at<=maxAge ? channel.snapshot : null;
       const pos=fresh(positions,90), bal=fresh(balances,330), ord=fresh(orders,90);
-      return {at:snapshot.at,ready:!!(pos && bal && ord),sources:{
+      return {at:snapshot.at,...positionTotals(pos),ready:!!(pos && bal && ord),sources:{
         balances:balances.snapshot?.rows.size ?? null,positions:positions.snapshot?.rows.size ?? null,
         orders:orders.snapshot?.rows.size ?? null,series:series.size,
         balance_state:balances.state || 'unseen',position_state:positions.state || 'unseen',order_state:orders.state || 'unseen',
@@ -206,7 +212,7 @@
           equity_at:recent ? chart.at : flat.at};
       })};
     }
-    if (scope==='directory') return {at:snapshot.at,rows:snapshot.rows.map(({id,name,phase,category})=>({id,name,phase,category}))};
+    if (scope==='directory') return {at:snapshot.at,...positionTotals(positions.snapshot),rows:snapshot.rows.map(({id,name,phase,category})=>({id,name,phase,category}))};
     const notice=scope==='notice';
     if (scope!=='selected' && !notice) return null;
     const selected = new Set();

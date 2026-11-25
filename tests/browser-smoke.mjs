@@ -387,8 +387,10 @@ try {
   await until(async()=>{
     const s=await api('state?node_id=lab');
     if (!s.strategy.enabled) throw Error(s.strategy.message);
-    return s.strategy.startup_scans?.[worker.worker_id]?.confirmed && s.workers[0].card_generation===s.nodes[0].card_generation;
-  },'strategy confirms the directory and the full account scan before selecting',50000);
+    return s.strategy.startup_scans?.[worker.worker_id]?.confirmed && s.workers[0].position_count===1 &&
+      s.strategy.batch===0 && s.strategy.message.includes('空仓') &&
+      s.workers[0].card_generation===s.nodes[0].card_generation;
+  },'startup waits for the pre-existing position after completing the full scan',50000);
   await vest.evaluate("sessionStorage.setItem('purchased','yes');const p=document.createElement('p');p.setAttribute('role','status');p.textContent='Your Funded Account is ready to trade.';document.body.append(p)");
   await until(async()=>(await api('state?node_id=lab')).accounts.find(a=>a.name==='Gamma')?.in_pool,'new purchase joins a running strategy');
   await api('nodes/lab/strategy/stop','POST',{});

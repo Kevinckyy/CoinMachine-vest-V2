@@ -7,7 +7,9 @@ from .trading_day import entry_day_window
 
 
 CENT = Decimal("0.01")
-OPEN_POLICY_VERSION = 4
+TWO_FLOOR_STOP_VERSION = 4
+TWO_FLOOR_REWARD_VERSION = 5
+OPEN_POLICY_VERSION = TWO_FLOOR_REWARD_VERSION
 
 
 def decimal(value):
@@ -118,6 +120,12 @@ def stop_decision(risk, floor, params):
             "distance_to_max_floor":float(max_distance) if max_distance is not None else None,
             "remaining_max_drawdown":float(total) if total is not None else None,
             "stop_loss":float(amount) if amount is not None else None, "stop_omitted":omit}
+
+
+def reward_risk(stop):
+    if stop["stop_omitted"]:
+        return min(stop["remaining_drawdown"], stop["distance_to_max_floor"])
+    return stop["stop_loss"]
 
 
 def take_profit(params, risk_amount):

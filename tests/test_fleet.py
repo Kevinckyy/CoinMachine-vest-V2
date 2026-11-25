@@ -169,7 +169,7 @@ class FleetTest(unittest.TestCase):
         self.center.sync(nid)
         self.complete_startup_scan(nid)
 
-    def complete_startup_scan(self,nid,partial=False):
+    def complete_startup_scan(self,nid,partial=False,positions=None):
         self.center.decide()
         self.center.sync(nid)
         key = self.center.state(nid)["strategy"]["startup_scans"]["browser"]["id"]
@@ -186,8 +186,10 @@ class FleetTest(unittest.TestCase):
             if partial:
                 values["health"] = None
             details.append(dict(id=item["id"],values=values))
+        if positions is None:
+            positions = dict(at=self.time,count=sum(a["active_positions"] for a in items))
         self.report(nid,page="/accounts",cards=dict(generation=current["card_generation"],full=True,observed_at=self.time,
-                    source_at=self.time,items=items,scan_id=key,details=details))
+                    source_at=self.time,items=items,scan_id=key,details=details,positions=positions))
         self.plugin(nid,"poll",cached_scan=key)
         self.center.sync(nid)
         self.time += 0.001
@@ -225,6 +227,64 @@ class FleetTest(unittest.TestCase):
         self.center.sync("east")
         self.assertIn("更新账户读数",reason())
 
+    def test_startup_waits_for_external_positions_then_resumes_once_after_restart(self):
+        # Shared is explicitly outside the pool. Ready can open as soon as the whole browser is flat.
+        self.start_cards([self.card("Shared",active_positions=1,pnl=0),self.card("Ready")])
+        state = self.center.state("east")
+        self.assertEqual(state["strategy"]["batch"],0)
+        self.assertIn("Shared",state["strategy"]["message"])
+        self.assertIn("空仓",next(a for a in state["accounts"] if a["name"]=="Ready")["candidate_reason"])
+        self.assertFalse(self.after_startup(state))
+        self.center.db.close()
+        self.center = Center(self.root/"center",self.clock,self.transport)
+        self.time += 1
+        self.card_report("east",[self.card("Ready")])
+        self.center.sync("east")
+        self.center.decide()
+        self.center.decide()
+        check, = self.after_startup(self.center.state("east"))
+        self.assertEqual(check["action"],"accounts.list")
+        self.center.sync("east")
+        self.assertEqual(self.plugin("east","poll")["command"]["id"],check["id"])
+        generation = self.nodes["east"].status()["card_generation"]
+        def positions(at,count):
+            self.report("east",page="/accounts",cards=dict(items=[self.card("Ready")],full=True,
+                        generation=generation,observed_at=self.time,source_at=self.time,positions=dict(at=at,count=count)))
+            self.center.sync("east")
+            self.center.decide()
+        # The row vanished but an old empty response must not override the later positive one.
+        positions(self.time-5,0)
+        self.assertFalse(self.center.state("east")["strategy"]["members"])
+        self.time += 1
+        positions(self.time,0)
+        self.center.decide()
+        opened = [c for c in self.center.state("east")["commands"] if c["action"]=="order.open"]
+        self.assertEqual([c["account"] for c in opened],["Ready"])
+
+    def test_startup_rejects_prestart_flat_and_counts_positions_outside_directory(self):
+        self.enable("east")
+        self.center.strategy("start",{},"east")
+        self.center.sync("east")
+        self.card_report("east")
+        self.center.sync("east")
+        self.complete_startup_scan("east",positions=dict(at=self.time-1,count=0))
+        self.center.decide()
+        self.assertEqual([c["action"] for c in self.after_startup(self.center.state("east"))],["accounts.list"])
+        for nid in ("east","west"):
+            self.report(nid,page="/accounts",cards=dict(generation=self.nodes[nid].status()["card_generation"],
+                        full=True,observed_at=self.time,source_at=self.time,items=[self.card("Ready")],
+                        positions=dict(at=self.time,count=2)))
+            self.center.sync(nid)
+        self.center.decide()
+        self.assertIn("2 笔",self.center.state("east")["strategy"]["message"])
+        self.time += 1
+        self.report("east",page="/accounts",cards=dict(generation=self.nodes["east"].status()["card_generation"],
+                    full=True,observed_at=self.time,source_at=self.time,items=[self.card("Ready")],
+                    positions=dict(at=self.time,count=0)))
+        self.center.sync("east")
+        self.center.decide()
+        self.assertEqual(self.center.state("east")["strategy"]["batch"],1)
+
     def test_first_batch_waits_for_every_participating_browser(self):
         self.enable("east")
         self.start_ready("east")
@@ -240,8 +300,19 @@ class FleetTest(unittest.TestCase):
         self.center.sync("east")
         key=self.plugin("east","poll",worker_id="second")["command"]["id"]
         self.assertEqual(key,scans["second"]["id"])
-        self.report("east",worker_id="second",page="/accounts",cards={**directory,"scan_id":key,"details":[]})
+        self.report("east",worker_id="second",page="/accounts",cards={**directory,"scan_id":key,"details":[],
+                    "positions":{"at":self.time,"count":1}})
         self.plugin("east","poll",worker_id="second",cached_scan=key)
+        self.center.sync("east")
+        self.center.decide()
+        self.assertFalse(self.after_startup(self.center.state("east")))
+        self.time += 26
+        self.plugin("east","heartbeat")
+        self.center.sync("east")
+        self.center.decide()
+        self.assertIn("second 离线",self.center.state("east")["strategy"]["message"])
+        self.report("east",worker_id="second",page="/accounts",cards={**directory,"observed_at":self.time,"source_at":self.time,
+                    "positions":{"at":self.time,"count":0}})
         self.center.sync("east")
         self.center.decide()
         self.assertEqual([c["action"] for c in self.after_startup(self.center.state("east"))],["order.open"])
@@ -802,9 +873,11 @@ class FleetTest(unittest.TestCase):
             return self.plugin("east",op,id=cmd["id"],observation=obs,**kwargs)
         approved = check("preflight")
         self.assertEqual((approved["floor_gap"],approved["distance_to_max_floor"],approved["stop_loss"],
-                          approved["take_profit"]),(-326.06,300,None,626.06))
+                          approved["take_profit"]),(-326.06,300,None,300))
+        stale = check("intent",stage="open",allow_refill=True,proof=dict(quantity=2,stop_loss=None,take_profit=626.06))
+        self.assertEqual((stale["authorize_click"],stale["refill"],stale["take_profit"]),(False,True,300))
         snap["daily_floor"] = 4720
-        refill = check("intent",stage="open",allow_refill=True,proof=dict(quantity=2,stop_loss=None,take_profit=626.06))
+        refill = check("intent",stage="open",allow_refill=True,proof=dict(quantity=2,stop_loss=None,take_profit=300))
         self.assertFalse(refill["authorize_click"])
         self.assertEqual((refill["floor_gap"],refill["stop_loss"],refill["take_profit"]),(20,260,260))
         snap.pop("max_drawdown_floor")
@@ -871,13 +944,36 @@ class FleetTest(unittest.TestCase):
         obs["snapshot"]["daily_floor"] = 974
         obs["snapshot"]["max_drawdown_floor"] = 980
         updated = check()
-        self.assertEqual((updated["stop_loss"],updated["take_profit"]),(None,52))
+        self.assertEqual((updated["stop_loss"],updated["reward_risk_amount"],updated["take_profit"]),(None,20,50))
         self.assertIn("daily_floor",updated["changed"])
         obs["snapshot"].pop("daily_floor")
         missing = check()
         self.assertTrue(missing["reselect"])
         self.assertIn("爆仓线",missing["open_lock"]["reason"])
         self.assertFalse(self.nodes["east"].get("ratio")["intents"])
+
+    def test_live_omitted_stop_uses_nearer_platform_floor_in_preflight_and_signed_intent(self):
+        self.card_report("east",[self.card("Live",phase="live",category="funded")])
+        obs = {**self.reading("Live"),"phase":"live","category":"funded"}
+        snap = obs["snapshot"]
+        snap.update(balance=5000,equity=5000,max_drawdown_floor=4700,daily_floor=4364.30963864)
+        self.report("east",observation=obs)
+        self.center.sync("east")
+        self.center.submit("nearer",self.req(name="Live",action="order.open",params=dict(
+                           side="buy",micro=1,reward_ratio=1,omit_stop_below=301,stop_buffer=20)))
+        self.center.sync("east")
+        self.plugin("east","poll")
+        for floor,expected in ((4364.30963864,300),(4679.50113364,300),(4700,300),(4850,150)):
+            snap["daily_floor"] = floor
+            check = self.plugin("east","preflight",id="nearer",observation=obs)
+            self.assertEqual((check["stop_loss"],check["reward_risk_amount"],check["take_profit"]),(None,expected,expected))
+        def submit(amount):
+            return self.plugin("east","intent",id="nearer",stage="open",allow_refill=True,observation=obs,
+                               proof=dict(quantity=2,stop_loss=None,take_profit=amount))
+        self.assertTrue(submit(300)["refill"])
+        self.assertTrue(submit(150)["authorize_click"])
+        proof = self.nodes["east"].get("nearer")["intents"]["open"]["proof"]
+        self.assertEqual((proof["reward_risk_amount"],proof["take_profit"]),(150,150))
 
     def test_phase_two_size_and_migrated_take_profit_defaults(self):
         self.center.strategy("config",dict(size_percent=25,phase2_size_percent=75),"east")

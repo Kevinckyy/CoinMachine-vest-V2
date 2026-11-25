@@ -154,19 +154,26 @@
     }
     const signature = VestCards.membership(reading.items);
     const changedList = signature !== directory?.signature;
+    const positionAt=reading.source?.position_at;
+    const positionSample=positionAt>0 && Number.isSafeInteger(reading.source.position_count) && Date.now()/1000-positionAt<=90 &&
+      (full || changedList || directory?.supportsPositionTotals && positionAt!==directory.positionAt)
+      ? {at:positionAt,count:reading.source.position_count} : null;
+    const positions=positionSample ? {positions:positionSample} : {};
     if (full || changedList || !directory.supportsMetrics) {
       const {source,details,...cardReading}=reading;
-      const ack = await report({cards:{...cardReading,generation,full:full || changedList,
+      const ack = await report({cards:{...cardReading,...positions,generation,full:full || changedList,
         purchase_request:data.purchase_request,...(scanId ? {scan_id:scanId,details,sources:source.sources} : {})}});
       directory = {signature,generation,source,byId:new Map(reading.items.map(x=>[x.id,x])),
-        baseline:VestCards.index(reading.items),supportsMetrics:ack?.supports_metrics===true};
+        baseline:VestCards.index(reading.items),supportsMetrics:ack?.supports_metrics===true,
+        supportsPositionTotals:ack?.supports_position_totals===true};
     } else {
       const items = VestCards.changes(reading.items,directory.baseline,directoryDue);
-      await report({metrics:{items,base_at:directory.observedAt,observed_at:reading.observed_at,generation,directory:directoryDue},
+      await report({metrics:{items,...positions,base_at:directory.observedAt,observed_at:reading.observed_at,generation,directory:directoryDue},
         ...(directoryDue ? {localItems:reading.items} : {})});
       for (const patch of items) Object.assign(directory.baseline.get(patch.name),patch);
     }
     directory.observedAt = reading.observed_at;
+    if (positionSample) directory.positionAt=positionAt;
     monitoring = directory.supportsMetrics && reading.items.some(a=>a.active_positions>0);
     if (directoryDue || changedList) nextCards = Date.now()+8000;
     diagnostic = '';

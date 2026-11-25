@@ -224,7 +224,7 @@ class Center:
                 actual,target = plugin_version_parts(w.get("plugin_version")),plugin_version_parts(self.plugin_version)
                 status = "unknown" if not actual or not target else "current" if actual==target else "behind" if actual<target else "ahead"
                 workers[nid, w["worker_id"]] = {**w, "node_id": nid, "online": online and now - w["last_seen"] < WORKER_TTL,
-                                                "supports_open_policy":nodes[nid]["open_policy_version"]>=daily_floor.OPEN_POLICY_VERSION and actual>=(1,9,0,0),
+                                                "supports_open_policy":nodes[nid]["open_policy_version"]>=daily_floor.TWO_FLOOR_STOP_VERSION and actual>=(1,9,0,0),
                                                 "plugin_version":w.get("plugin_version",""),"version_status":status}
             for a in snap["accounts"]:
                 key = (nid, a["worker_id"], a["name"])
@@ -266,6 +266,8 @@ class Center:
                     if not scans or any(not v.get("confirmed") for v in scans.values()) or any(
                             scans.get(w["worker_id"],{}).get("session")!=w["session_id"] for w in online):
                         startup_wait = ("等待浏览器全量拉取账户列表" if not scans else "等待启动前全量读取账户信息完成")
+                    else:
+                        startup_wait = s.get("startup_position_wait","")
                 for cmd in self._strategy_candidates(db,s,(nodes,workers,accounts),"buy"):
                     a = accounts[cmd["node_id"],cmd["worker_id"],cmd["account"]]
                     if startup_wait:
@@ -406,6 +408,9 @@ class Center:
         if req["action"]=="order.open" and a:
             require(worker["supports_open_policy"],
                     "开仓风控需要支持两条底线的节点桥及 1.9.0 或更高版本插件",409)
+            if "reward_ratio" in req["params"]:
+                require(node["open_policy_version"]>=daily_floor.TWO_FLOOR_REWARD_VERSION,
+                        "Live 盈亏比止盈需要 1.12.2 或更高版本节点桥",409)
             require(a["phase"]=="live" or req["params"].get("take_profit") is None and "reward_ratio" not in req["params"],
                     "考核账户开仓不设止盈",409)
             budget = daily_floor.stop_decision(a.get("risk") or {},a.get("daily_floor"),req["params"])["stop_loss"]
@@ -759,8 +764,9 @@ class Center:
                         (node_id,"strategy-"+s["run"])).fetchone(),"上一轮策略仍有未结束的指令",409)
                 self._request_cards(db,node_id)
                 s.pop("exit_lists",None)
+                s.pop("startup_position_wait",None)
                 s.update(enabled=True, draining=False, run=uid(), batch=0, members=[], replace=0,
-                         next_at=self.clock(), message="等待浏览器全量拉取账户列表",planned=[], reentries={}, claims={},
+                         started_at=self.clock(), next_at=self.clock(), message="等待浏览器全量拉取账户列表",planned=[], reentries={}, claims={},
                          policy_version=2, startup_scans={}, avoid_once=[], pool_day=entry_day_window(self.clock())["start"])
                 for key in ("pool_exam_ids","pool_live_ids","pool_waiting_live_ids","pool_refilling","run_pool","batch_side","batch_phase"):
                     s.pop(key,None)
@@ -893,6 +899,67 @@ class Center:
             return True
         s["message"] = f"启动前全量读取账户信息 · 已确认 {complete} / {len(scans)} 个浏览器"
         return False
+
+    def _startup_positions_flat(self, db, s, inventory, now, has_candidates):
+        nid = s["node_id"]
+        started = s.get("started_at",s["next_at"])
+        seen = {}
+        for (_,wid,name), a in inventory[2].items():
+            if a["present"]:
+                held = seen.setdefault(wid,[])
+                if (positions.latest_count(a) or 0)>0:
+                    held.append((name,max(a.get("card_at") or 0,a.get("observed_at") or 0)))
+        workers = {wid:worker for (_,wid), worker in inventory[1].items()}
+        waits = [wid+" 离线，等待复核持仓" for wid in s["startup_scans"] if wid not in workers]
+        for wid, worker in workers.items():
+            scan = s["startup_scans"].get(wid)
+            held = seen.get(wid,[])
+            count, at = worker.get("position_count"), worker.get("positions_at") or 0
+            if not worker["online"]:
+                if scan or wid in seen or count:
+                    waits.append(wid+" 离线，等待复核持仓")
+                continue
+            if not scan or worker.get("card_session")!=worker["session_id"]:
+                waits.append(wid+" 等待当前会话同步")
+                continue
+            if "position_count" not in worker or plugin_version_parts(worker.get("plugin_version"))<(1,12,2,0):
+                waits.append(wid+" 需升级节点桥及插件至 1.12.2 或更高版本")
+                continue
+            # A disappearing card, a P&L of zero, or a previous session cannot confirm a flat browser.
+            last_open = max([scan.get("last_open_at",0),at if count else 0]+[t for _,t in held])
+            if last_open:
+                scan["last_open_at"] = last_open
+            fresh = at>=started and now-at<BATCH_LIST_RETRY
+            if count==0 and at>=started and at>last_open and (fresh or not has_candidates):
+                scan.pop("visible_holding",None)
+                continue
+            just_disappeared = scan.get("visible_holding") and not held
+            scan["visible_holding"] = bool(held)
+            if held:
+                waits.append(wid+" · "+ "、".join(name for name,_ in held[:3]))
+            elif count:
+                waits.append(f"{wid} · {count} 笔")
+            else:
+                waits.append(wid+" 等待最新持仓响应")
+            if count and fresh and not just_disappeared:
+                continue
+            # A full list command reuses Vest's page reads and also checks accounts absent from the grid.
+            prior = command(db,scan["position_request"]) if scan.get("position_request") else None
+            if prior and (prior["status"] in PENDING or now-prior["updated"]<BATCH_LIST_RETRY):
+                continue
+            req = request(dict(node_id=nid,worker_id=wid,action="accounts.list"))
+            try:
+                check = self._prepare(db,uid(),req,inventory,"strategy-"+s["run"])
+            except Problem as err:
+                waits[-1] += " · "+str(err)
+                continue
+            insert(db,check,"pending",now)
+            scan["position_request"] = check["id"]
+        if waits:
+            s["startup_position_wait"] = s["message"] = "首批开仓等待确认全部空仓 · "+" / ".join(waits)
+            return False
+        s.pop("startup_position_wait",None)
+        return True
 
     def _opened_today(self, db, account):
         start = entry_day_window(self.clock())["start"]
@@ -1208,7 +1275,8 @@ class Center:
         if not self._refresh_strategy_directory(db,s,inventory,now):
             s["message"] = "等待浏览器全量拉取账户列表"
             return
-        if "startup_scans" in s and not s["batch"] and not self._startup_details(db,s,inventory):
+        startup = not s["batch"] and "startup_scans" in s
+        if startup and not self._startup_details(db,s,inventory):
             return
         if members and not s["planned"] and not s.get("replace"):
             self._monitor_batch(db,s,members,inventory,now)
@@ -1216,6 +1284,8 @@ class Center:
         candidates = {}
         for cmd in self._strategy_candidates(db,s,inventory,s.get("batch_side","buy")):
             candidates.setdefault(cmd["account_ref"],[]).append(cmd)
+        if startup and not self._startup_positions_flat(db,s,inventory,now,bool(candidates)):
+            return
         if not s["planned"] and not self._plan_orders(s,inventory,candidates,members):
             if self._discover_phase(db,s,inventory):
                 s["message"] = "等待读取新账户的阶段"

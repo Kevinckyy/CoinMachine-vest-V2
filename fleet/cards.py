@@ -29,8 +29,10 @@ def schema(db):
     for reason in READ_FAILURES:
         db.execute("""UPDATE accounts SET open_lock=json_set(open_lock,'$.kind','read_retry','$.until',0)
                       WHERE json_extract(open_lock,'$.kind') IS NULL AND json_extract(open_lock,'$.reason')=?""",(reason,))
-    if "source_at" not in {r[1] for r in db.execute("PRAGMA table_info(card_sync)")}:
-        db.execute("ALTER TABLE card_sync ADD COLUMN source_at REAL")
+    sync_cols = {r[1] for r in db.execute("PRAGMA table_info(card_sync)")}
+    for name, spec in (("source_at","REAL"), ("positions_at","REAL"), ("position_count","INTEGER")):
+        if name not in sync_cols:
+            db.execute(f"ALTER TABLE card_sync ADD COLUMN {name} {spec}")
 
 
 def from_trade(snap):
@@ -126,7 +128,7 @@ def update(db, wid, sid, data, now, *, metrics=False, defer_cache=False):
     previous = {r["name"]:r for r in db.execute("SELECT * FROM accounts WHERE worker_id=?",(wid,))}
     duplicate = set()
     if metrics:
-        fields(data, ("generation", "observed_at", "base_at", "directory", "items"))
+        fields(data, ("generation", "observed_at", "base_at", "directory", "items", "positions"))
         require(sync["seen"] == data.get("base_at") and observed > sync["seen"], "监控读数基线已变化", 409)
         directory = boolean(data.get("directory"))
         items = metric_items(previous, raw, directory, sid)
@@ -203,12 +205,23 @@ def update(db, wid, sid, data, now, *, metrics=False, defer_cache=False):
             db.execute("UPDATE accounts SET phase_started_at=? WHERE worker_id=? AND name=?", (observed if phase else None,wid,name))
         if metrics and dump(risk) != row["risk"]:
             changed_risks[name] = risk
-    db.execute("""INSERT INTO card_sync VALUES(?,?,?,?,?,?) ON CONFLICT(worker) DO UPDATE SET
-                session=excluded.session,generation=excluded.generation,full_at=excluded.full_at,seen=excluded.seen,source_at=excluded.source_at""",
-               (wid,sid,gen,observed if full else sync["full_at"],observed,source_at if source_at is not None else sync["source_at"] if sync and sync["session"]==sid else None))
+    same_session = sync and sync["session"]==sid
+    positions_at, count = (sync["positions_at"], sync["position_count"]) if same_session else (None,None)
+    if "positions" in data:
+        sample = obj(data["positions"])
+        at = number(sample.get("at"),"平台持仓响应时间",observed-120,observed+1)
+        latest = number(sample.get("count"),"平台活动持仓数",0,1000,True)
+        if positions_at is None or at>positions_at or at==positions_at and latest>count:
+            positions_at, count = at, latest
+    db.execute("""INSERT INTO card_sync(worker,session,generation,full_at,seen,source_at,positions_at,position_count)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(worker) DO UPDATE SET session=excluded.session,generation=excluded.generation,
+                full_at=excluded.full_at,seen=excluded.seen,source_at=excluded.source_at,
+                positions_at=excluded.positions_at,position_count=excluded.position_count""",
+               (wid,sid,gen,observed if full else sync["full_at"],observed,source_at if source_at is not None else sync["source_at"] if same_session else None,
+                positions_at,count))
     if metrics:
         return {"observed_at": observed, "risks": changed_risks}
-    ack = {"count":len(items),"generation":gen,"supports_metrics":True}
+    ack = {"count":len(items),"generation":gen,"supports_metrics":True,"supports_position_totals":True}
     if not defer_cache:
         ack.update(directory_cache(db, wid, now))
     return ack

@@ -516,7 +516,8 @@ async function directoryRoute(owner,url,work,since) {
       const timing=await nativeDirectory(owner.tabId,undefined,true);
       if (work.command?.action==='accounts.read_all' && timing && timing.bulk_version!==1) break;
       const now=Date.now()/1000;
-      if (timing?.at!=null && timing.at>=since && now-timing.at<=330 ||
+      const positionsReady=work.command?.action!=='accounts.list' || timing?.position_at>=since && now-timing.position_at<=30;
+      if (timing?.at!=null && timing.at>=since && now-timing.at<=330 && positionsReady ||
           timing?.pending_at!=null && timing.pending_at>=since && now-timing.pending_at<=12) return null;
       if (i<3) await new Promise(resolve=>setTimeout(resolve,250));
     }
@@ -649,7 +650,7 @@ async function reportCards(owner,cfg,payload) {
   if (cards.scan_id) await chrome.storage.session.remove('lease.'+cards.scan_id);
   if (cards.full && cards.purchase_request && (await chrome.storage.local.get('cardRequest')).cardRequest===cards.purchase_request)
     await chrome.storage.local.remove('cardRequest');
-  return {supports_metrics:data.supports_metrics};
+  return {supports_metrics:data.supports_metrics,supports_position_totals:data.supports_position_totals};
 }
 async function reportMetrics(owner,cfg,payload) {
   // The complete DOM sample stays in the browser. Only the numeric changes cross the bridge.

@@ -84,6 +84,10 @@ async function get(path,body) {
 const pos={accountId:active.id,positionId:'p',symbol:'NDX-USD-PERP',side:'long',quantity:'0.0911',openPrice:'26900.75',openDate:Date.now()-1000,pnl:'0',orders:[{user_id:'hidden'}]};
 await get(opened,{positions:[pos]});
 assert.equal(snapshot('inventory').rows[0].active_positions,1);
+await get(opened,{positions:[pos,{...pos,accountId:'outside-capital-list',positionId:'outside'}],total:2});
+assert.equal(snapshot('bulk').position_count,2);
+assert.equal(snapshot('directory').position_count,2);
+assert.equal(snapshot('inventory').rows[0].active_positions,1);
 assert.equal(snapshot('selected').position.quantity,0.0911);
 assert.equal(snapshot('selected').position.opened_at,pos.openDate/1000);
 assert.ok(!('pnl' in snapshot('selected').position));
@@ -130,10 +134,12 @@ assert.equal(row0.active_positions,0);
 const detail=VestBridgeCore.bulkCapitalValues(row0,bulk.at,Date.now()/1000);
 await get(opened,{positions:null});
 assert.equal(snapshot('inventory').rows[0].active_positions,0);
+assert.equal(snapshot('directory').position_count,0);
 assert.ok(snapshot('inventory').position_at);
 assert.equal(snapshot('selected').flat.equity,4900);
-for (const bad of [{},{positions:null,total:1},{positions:null,next:'more'},{positions:null,error:'unavailable'}]) {
+for (const bad of [{},{positions:[],total:1},{positions:[pos],total:2},{positions:null,total:1},{positions:null,next:'more'},{positions:null,error:'unavailable'}]) {
   await get(opened,bad);
+  assert.equal(snapshot('directory').position_count,undefined);
   assert.equal(snapshot('inventory').rows[0].active_positions,null);
   assert.equal(snapshot('selected').flat.count,null);
   assert.equal(snapshot('selected').flat.equity,null);

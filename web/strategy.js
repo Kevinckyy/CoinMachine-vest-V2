@@ -302,7 +302,7 @@ function updateStrategyFields() {
   }
   fields.dynamic_exam_slots.max = multiple ? String(batch - 1) : '';
   fields.dynamic_reserve_high.min = String(Math.max(2,(fields.dynamic_reserve_low.valueAsNumber || 1) + 1));
-  $('liveProfitNote').textContent = profit === 'ratio' ? '止盈取最低止盈额与风险金额乘盈亏比中的较大值。免设止损时，风险金额取净值至页面爆仓线的距离。' :
+  $('liveProfitNote').textContent = profit === 'ratio' ? '止盈取最低止盈额与风险金额乘盈亏比中的较大值。带止损时按本单止损金额计算。免止损时，取净值到当日底线、最大回撤线两段距离中的较小值。' :
     profit === 'entries' ? '每个账户按美东 20:00 日切。已确认成交后使用后续档；未填止盈额的档位跳过开仓。' : '未填固定止盈额时，此模式下的 Live 账户跳过自动开仓。';
 }
 
