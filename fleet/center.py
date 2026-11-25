@@ -259,8 +259,19 @@ class Center:
                 a["position_detail"] = positions.detail(db, a)
                 a["candidate"] = False
             for s in strategies:
+                startup_wait = ""
+                if s["enabled"] and not s["batch"] and "startup_scans" in s:
+                    online = [w for w in workers.values() if w["node_id"]==s["node_id"] and w["online"]]
+                    scans = s["startup_scans"]
+                    if not scans or any(not v.get("confirmed") for v in scans.values()) or any(
+                            scans.get(w["worker_id"],{}).get("session")!=w["session_id"] for w in online):
+                        startup_wait = ("等待浏览器全量拉取账户列表" if not scans else "等待启动前全量读取账户信息完成")
                 for cmd in self._strategy_candidates(db,s,(nodes,workers,accounts),"buy"):
-                    accounts[cmd["node_id"],cmd["worker_id"],cmd["account"]]["candidate"] = True
+                    a = accounts[cmd["node_id"],cmd["worker_id"],cmd["account"]]
+                    if startup_wait:
+                        a["candidate_reason"] = startup_wait
+                    else:
+                        a["candidate"] = True
             result = dict(now=self.clock(), plugin_version=self.plugin_version, nodes=list(nodes.values()), workers=list(workers.values()),
                         accounts=list(accounts.values()), strategies=strategies, strategy=strategies[0] if len(strategies)==1 else None,
                         strategy_settings=strategy_config.library(db), unknown_count=unknown, commands=[summary(r) for r in recent])
@@ -750,7 +761,7 @@ class Center:
                 s.pop("exit_lists",None)
                 s.update(enabled=True, draining=False, run=uid(), batch=0, members=[], replace=0,
                          next_at=self.clock(), message="等待浏览器全量拉取账户列表",planned=[], reentries={}, claims={},
-                         policy_version=2, avoid_once=[], pool_day=entry_day_window(self.clock())["start"])
+                         policy_version=2, startup_scans={}, avoid_once=[], pool_day=entry_day_window(self.clock())["start"])
                 for key in ("pool_exam_ids","pool_live_ids","pool_waiting_live_ids","pool_refilling","run_pool","batch_side","batch_phase"):
                     s.pop(key,None)
             elif op == "config":
@@ -787,8 +798,26 @@ class Center:
     def _strategy_candidates(self, db, s, inventory, side):
         config = s["config"]
         for (nid,wid,name), a in inventory[2].items():
-            if (nid != s["node_id"] or not a["in_pool"] or not a["fresh"] or a["phase"] not in account_pool.PHASES
-                    or inventory[1][nid,wid].get("notice_waiting")):
+            if nid != s["node_id"] or not a["in_pool"]:
+                continue
+            worker = inventory[1][nid,wid]
+            reason = None
+            if not inventory[0][nid]["online"]:
+                reason = "节点离线"
+            elif not worker["online"]:
+                reason = "浏览器离线"
+            elif worker.get("pending_mode"):
+                reason = "等待插件确认权限切换"
+            elif worker["mode"] != "execute":
+                reason = "浏览器处于只读模式"
+            elif worker.get("notice_waiting"):
+                reason = "等待处理账户弹窗"
+            elif not a["fresh"]:
+                reason = "等待当前浏览器会话更新账户读数"
+            elif a["phase"] not in account_pool.PHASES:
+                reason = "账户阶段尚未确认"
+            if reason:
+                a["candidate_reason"] = reason
                 continue
             prefix = "live_" if a["phase"] == "live" else ""
             params = {key:config[prefix+key] for key in ("size_percent","stop_buffer")}
@@ -804,6 +833,7 @@ class Center:
                 else:
                     params["take_profit"] = config["live_take_profit"]
                 if mode != "ratio" and params["take_profit"] is None:
+                    a["candidate_reason"] = "Live 止盈金额尚未设置"
                     continue
             params["side"] = side
             if config[prefix+"skip_stop_loss_on_low_drawdown"]:
@@ -813,11 +843,56 @@ class Center:
             req = dict(node_id=nid,worker_id=wid,account=name,action="order.open",params=params)
             reentry = s.get("reentries",{}).get(a["account_ref"] or name)
             if reentry and command(db,reentry)["worker"] != wid:
+                a["candidate_reason"] = "再入场须使用原领取浏览器"
                 continue
             try:
                 yield self._prepare(db,uid(),req,inventory,"strategy-"+(s.get("run") or "preview"),reentry)
-            except Problem:
+            except Problem as err:
+                a["candidate_reason"] = str(err)
+
+    def _startup_details(self, db, s, inventory):
+        scans = s["startup_scans"]
+        workers = [w for w in inventory[1].values() if w["online"]]
+        for w in workers:
+            wid = w["worker_id"]
+            prior = scans.get(wid)
+            if prior and prior["session"] == w["session_id"]:
                 continue
+            req = request(dict(node_id=s["node_id"],worker_id=wid,action=PORTFOLIO_SCAN))
+            cmd = self._prepare(db,uid(),req,inventory,"strategy-"+s["run"])
+            insert(db,cmd,"pending",self.clock())
+            scans[wid] = {"id":cmd["id"],"session":w["session_id"]}
+        complete = 0
+        for wid, scan in scans.items():
+            if scan.get("confirmed"):
+                complete += 1
+                continue
+            receipt = command(db,scan["id"])
+            if receipt["status"] in PENDING:
+                continue
+            detail = json.loads(receipt["result"] or "null") or {}
+            items = detail.get("accounts") or []
+            if (receipt["status"]!="succeeded" or detail.get("stage")!="done" or detail.get("total")!=len(items)
+                    or detail.get("read")!=len(items) or detail.get("partial") or detail.get("failed")):
+                label = inventory[1].get((s["node_id"],wid),{}).get("label",wid)
+                reason = receipt["error"] or f"完整 {detail.get('read',0)} / {detail.get('total',0)}，字段不全 {detail.get('partial',0)}"
+                incomplete = [i["name"] for i in items if i.get("status")!="read"]
+                if incomplete:
+                    reason += " · "+ "、".join(incomplete[:3])
+                raise Problem("启动前全量读取账户信息未完成 · "+label+" · "+reason,409)
+            # A receipt can reach the center one sync before the snapshot containing its account details.
+            for item in items:
+                account = inventory[2].get((s["node_id"],wid,item["name"]))
+                if account and account["present"] and (account.get("card") or {}).get("id")==item["card_id"] and (
+                        (account.get("portfolio") or {}).get("observed_at",0) < item["values"]["observed_at"]):
+                    break
+            else:
+                scan["confirmed"] = True
+                complete += 1
+        if workers and complete==len(scans):
+            return True
+        s["message"] = f"启动前全量读取账户信息 · 已确认 {complete} / {len(scans)} 个浏览器"
+        return False
 
     def _opened_today(self, db, account):
         start = entry_day_window(self.clock())["start"]
@@ -1132,6 +1207,8 @@ class Center:
             return
         if not self._refresh_strategy_directory(db,s,inventory,now):
             s["message"] = "等待浏览器全量拉取账户列表"
+            return
+        if "startup_scans" in s and not s["batch"] and not self._startup_details(db,s,inventory):
             return
         if members and not s["planned"] and not s.get("replace"):
             self._monitor_batch(db,s,members,inventory,now)

@@ -87,6 +87,19 @@ assert.equal(snapshot('inventory').rows[0].active_positions,1);
 assert.equal(snapshot('selected').position.quantity,0.0911);
 assert.equal(snapshot('selected').position.opened_at,pos.openDate/1000);
 assert.ok(!('pnl' in snapshot('selected').position));
+const working={status:'awaiting',executionType:'market',sizeMode:'full_position',triggerPrice:'26800.25'};
+await get(opened,{positions:[{...pos,takeProfits:[],stopLosses:[working]}]});
+assert.equal(snapshot('selected').position.native_sl_price,26800.25);
+assert.equal(snapshot('selected').position.native_tp_absent,true);
+await get(opened,{positions:[{...pos,stopLosses:[{...working,status:'cancelled'},working]}]});
+assert.equal(snapshot('selected').position.native_sl_price,26800.25);
+await get(opened,{positions:[{...pos,stopLosses:[{...working,status:'triggered'}]}]});
+assert.equal(snapshot('selected').position.native_sl_absent,true);
+for(const legs of [[working,working],[{...working,status:'unknown'}],[{...working,sizeMode:'fixed',quantity:'0.01'}]]){
+  await get(opened,{positions:[{...pos,stopLosses:legs}]});
+  assert.equal(snapshot('selected').position.native_sl_price,null);
+  assert.equal(snapshot('selected').position.native_sl_absent,false);
+}
 for(const positions of [[],[pos,{...pos,positionId:'other'}],[{...pos,accountId:'other'}],[{...pos,symbol:'OTHER'}]]){
   await get(opened,{positions}); assert.equal(snapshot('selected').position,undefined);
 }

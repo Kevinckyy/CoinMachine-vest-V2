@@ -163,8 +163,8 @@
         ...(filledFromResponse ? {position_reference_at:source.position_at} : {}),
         native_tp_price: tpPrice,
         native_sl_price: slPrice,
-        native_sl_absent: !!protection && (!sl || /^(?:-|—|–)$/.test(core.normalized(elementText(sl)))),
-        native_tp_absent: !!protection && (!tp || /^(?:-|—|–)$/.test(core.normalized(elementText(tp))))
+        native_sl_absent: !!sl && /^(?:-|—|–)$/.test(core.normalized(elementText(sl))),
+        native_tp_absent: !!tp && /^(?:-|—|–)$/.test(core.normalized(elementText(tp)))
       };
     }
     function snapshot(source) {
@@ -1061,6 +1061,17 @@
         guard: assertArmed,
         noDialogs: assertNoDialogs,
         read: () => assertAccount(false),
+        readProtection: async since => {
+          const source = await hooks.nativeAccounts('selected').catch(()=>null);
+          assertArmed();
+          const p = source?.position;
+          if (!config.platformId || source?.selected!==config.platformId || source.row?.id!==config.platformId ||
+              !(source.sources?.positions>since && source.sources.positions<=Date.now()/1000)) return null;
+          if (!p || p.position_id!==filled.position_id || p.side!==filled.side ||
+              !core.sameQuantity(p.entry_price,filled.entry_price) || !core.sameQuantity(p.quantity,filled.quantity))
+            throw Error('保存后的活动持仓响应显示原仓位已变化，请核对');
+          return p;
+        },
         one: queryOne,
         click,
         delay,
@@ -1362,7 +1373,7 @@
       const identity = observerIdentity();
       if (cmd.phase && identity.phase !== cmd.phase) throw Error('指令阶段与页面不一致');
       config = {
-        platformId: cmd.expected_risk?.card_id,
+        platformId: cmd.expected_risk?.card_id || observation.snapshot?.reference_card_id,
         accountId: cmd.account,
         accountName: cmd.account,
         accountCategory: observation.category,

@@ -29,7 +29,7 @@ class FleetTest(unittest.TestCase):
         self.center = Center(self.root / "center", self.clock, self.transport)
         self.lose_delivery = False
         self.plugin_meta = dict(worker_id="browser", session_id="session-1", generation=1,
-                                mode="execute", label="Browser A", page="/trade/NQ-PERP", strategy_version=1,plugin_version=self.center.plugin_version)
+                                mode="execute", label="Browser A", page="/trade/NQ-PERP", portfolio_version=1,strategy_version=1,plugin_version=self.center.plugin_version)
         self.addCleanup(self.close)
         for nid in self.nodes:
             self.center.configure_node(nid, dict(url="https://" + nid + ".example", label=nid, token=secrets.token_hex(20)))
@@ -158,11 +158,93 @@ class FleetTest(unittest.TestCase):
         return self.plugin(nid,"report",page="/accounts",cards=dict(items=items,full=full,observed_at=self.time,source_at=self.time,
                            generation=bridge.status()["card_generation"]))
 
+    @staticmethod
+    def after_startup(state):
+        return [c for c in state["commands"] if c["action"] != "accounts.read_all"]
+
     def start_ready(self,nid):
         self.center.strategy("start",{},nid)
         self.center.sync(nid)
         self.card_report(nid)
         self.center.sync(nid)
+        self.complete_startup_scan(nid)
+
+    def complete_startup_scan(self,nid,partial=False):
+        self.center.decide()
+        self.center.sync(nid)
+        key = self.center.state(nid)["strategy"]["startup_scans"]["browser"]["id"]
+        bridge = self.nodes[nid]
+        self.assertEqual(self.plugin(nid,"poll")["command"]["id"],key)
+        current = bridge.status()
+        items = [a["card"] for a in current["accounts"] if a["present"] and a["card"]]
+        details = []
+        for item in items:
+            values = {"health":90,"equity":1000,"daily_limit":30,"daily_loss":0,"drawdown":26.08,"drawdown_limit":300}
+            values.update({k:item[k] for k in values if item.get(k) is not None})
+            values.update(observed_at=self.time,equity_at=self.time,equity_source="flat_balance",
+                          daily_floor=970,max_drawdown_floor=700)
+            if partial:
+                values["health"] = None
+            details.append(dict(id=item["id"],values=values))
+        self.report(nid,page="/accounts",cards=dict(generation=current["card_generation"],full=True,observed_at=self.time,
+                    source_at=self.time,items=items,scan_id=key,details=details))
+        self.plugin(nid,"poll",cached_scan=key)
+        self.center.sync(nid)
+        self.time += 0.001
+
+    def test_startup_details_gate_survives_restart_and_rejects_partial_receipt(self):
+        self.enable("east")
+        self.center.strategy("start",{},"east")
+        self.center.sync("east")
+        self.card_report("east")
+        self.center.sync("east")
+        self.center.decide()
+        before=self.center.state("east")
+        scan,=before["commands"]
+        self.assertEqual(scan["action"],"accounts.read_all")
+        self.assertIn("全量读取",next(a for a in before["accounts"] if a["in_pool"])["candidate_reason"])
+        self.center.db.close()
+        self.center=Center(self.root/"center",self.clock,self.transport)
+        self.center.decide()
+        self.assertEqual([c["id"] for c in self.center.state("east")["commands"]],[scan["id"]])
+        self.complete_startup_scan("east",partial=True)
+        self.center.decide()
+        state=self.center.state("east")
+        self.assertFalse(state["strategy"]["enabled"])
+        self.assertIn("字段不全",state["strategy"]["message"])
+        self.assertFalse(self.after_startup(state))
+
+    def test_candidate_reason_for_readonly_and_expired_observation(self):
+        self.enable("east")
+        self.plugin("east","heartbeat",mode="readonly",generation=2,session_id="readonly")
+        self.center.sync("east")
+        def reason():
+            return next(a for a in self.center.state("east")["accounts"] if a["in_pool"])["candidate_reason"]
+        self.assertIn("只读",reason())
+        self.plugin("east","heartbeat",generation=3,session_id="new-session")
+        self.center.sync("east")
+        self.assertIn("更新账户读数",reason())
+
+    def test_first_batch_waits_for_every_participating_browser(self):
+        self.enable("east")
+        self.start_ready("east")
+        generation=self.nodes["east"].status()["card_generation"]
+        directory=dict(generation=generation,full=True,observed_at=self.time,source_at=self.time,items=[])
+        self.report("east",worker_id="second",page="/accounts",cards=directory)
+        self.center.sync("east")
+        self.center.decide()
+        state=self.center.state("east")
+        scans=state["strategy"]["startup_scans"]
+        self.assertEqual(set(scans),{"browser","second"})
+        self.assertFalse(self.after_startup(state))
+        self.center.sync("east")
+        key=self.plugin("east","poll",worker_id="second")["command"]["id"]
+        self.assertEqual(key,scans["second"]["id"])
+        self.report("east",worker_id="second",page="/accounts",cards={**directory,"scan_id":key,"details":[]})
+        self.plugin("east","poll",worker_id="second",cached_scan=key)
+        self.center.sync("east")
+        self.center.decide()
+        self.assertEqual([c["action"] for c in self.after_startup(self.center.state("east"))],["order.open"])
 
     @staticmethod
     def card(name, **changes):
@@ -288,6 +370,8 @@ class FleetTest(unittest.TestCase):
         self.assertEqual((expired["status"],expired["result"]["failed"]), ("failed",1))
 
     def test_scan_requires_capable_browser_and_stops_on_new_session(self):
+        self.plugin("east","heartbeat",portfolio_version=0)
+        self.center.sync("east")
         with self.assertRaisesRegex(Problem, "重新加载"):
             self.center.read_accounts("east")
         key = self.start_portfolio_scan()
@@ -303,6 +387,7 @@ class FleetTest(unittest.TestCase):
         self.center.sync("east")
         self.card_report("east",items)
         self.center.sync("east")
+        self.complete_startup_scan("east")
         self.center.decide()
 
     def test_defaults_presets_node_copies_and_legacy_config(self):
@@ -345,7 +430,7 @@ class FleetTest(unittest.TestCase):
                          live_skip_stop_loss_on_low_drawdown=True,live_drawdown_stop_loss_threshold=150),"east")
         self.start_cards(items)
         state = self.center.state("east")
-        first, = state["commands"]
+        first, = self.after_startup(state)
         self.assertEqual((first["account"],first["params"]["size_percent"],first["params"]["stop_buffer"],
                           first["params"]["omit_stop_below"],first["params"]["side"]),("Funded",75,11,150,"sell"))
         self.assertEqual((state["strategy"]["planned"],state["strategy"]["next_at"]),
@@ -354,10 +439,10 @@ class FleetTest(unittest.TestCase):
         self.center = Center(self.root/"center",self.clock,self.transport)
         self.time += 11
         self.center.decide()
-        self.assertEqual(len(self.center.state("east")["commands"]),1)
+        self.assertEqual(len(self.after_startup(self.center.state("east"))),1)
         self.time += 1
         self.center.decide()
-        second = self.center.state("east")["commands"][0]
+        second = self.after_startup(self.center.state("east"))[0]
         self.assertEqual((second["account"],second["params"]["side"],second["params"]["size_percent"],
                           second["params"]["stop_buffer"],second["created_at"]),("Second","sell",25,20,self.time))
         self.assertNotIn("omit_stop_below",second["params"])
@@ -367,12 +452,12 @@ class FleetTest(unittest.TestCase):
         items = [self.card("First"),live]
         self.center.strategy("config",dict(batch_size=2,live_default_locked=True,side="buy",live_side="sell"),"east")
         self.start_cards(items)
-        self.assertFalse(self.center.state("east")["commands"])
+        self.assertFalse(self.after_startup(self.center.state("east")))
         self.assertTrue(next(a for a in self.center.state("east")["accounts"] if a["name"]=="Funded")["live_default_locked"])
         self.center.account_config(dict(node_id="east",worker_id="browser",account="Funded",in_pool=True))
         self.center.decide()
         s = self.center.state("east")
-        self.assertFalse(s["commands"])
+        self.assertFalse(self.after_startup(s))
         self.assertFalse(s["strategy"]["enabled"])
         self.assertIn("方向冲突",s["strategy"]["message"])
 
@@ -381,7 +466,7 @@ class FleetTest(unittest.TestCase):
                  self.card("Live",phase="live",category="funded")]
         self.center.strategy("config",dict(batch_size=2,pool_strategy="same_stage",same_stage_full_batch=True),"east")
         self.start_cards(items)
-        self.assertEqual({c["phase"] for c in self.center.state("east")["commands"]},{"2/2"})
+        self.assertEqual({c["phase"] for c in self.after_startup(self.center.state("east"))},{"2/2"})
         import random
         cfg = strategy_config.settings(strategy_config.DEFAULT_CONFIG,dict(pool_strategy="dynamic",batch_size=3,
                      pool_limits_enabled=True,exam_pool_limit=2,live_pool_limit=3,dynamic_exam_slots=1))
@@ -478,7 +563,7 @@ class FleetTest(unittest.TestCase):
         self.center.sync("east")
         for _ in range(3):
             self.center.decide()
-        records = self.center.state("east")["commands"]
+        records = self.after_startup(self.center.state("east"))
         self.assertEqual(len(records),4)
         again, = [c for c in records if c.get("reentry_claim")]
         self.assertEqual((again["reentry_claim"],again["params"]["side"],again["expected_floor"]["floor"]),(claim["id"],"buy",959.75))
@@ -501,15 +586,16 @@ class FleetTest(unittest.TestCase):
         initial = [self.card("Shared"),self.card("Only-east")]
         self.card_report("east",initial)
         self.center.sync("east")
+        self.complete_startup_scan("east")
         self.center.decide()
-        self.assertEqual(self.center.state("east")["commands"],[])
+        self.assertEqual([c["action"] for c in self.center.state("east")["commands"]],["accounts.read_all"])
         self.time += 2
         new = self.card("New")
         self.card_report("east",initial+[new],full=False)
         self.center.sync("east")
         self.center.decide()
         state = self.center.state("east")
-        self.assertEqual([c["account"] for c in state["commands"]],["New"])
+        self.assertEqual([c["account"] for c in state["commands"] if c["action"]=="order.open"],["New"])
         self.assertEqual({a["name"] for a in state["accounts"] if a["in_pool"]},{"New"})
         self.time += 1
         self.card_report("east",[new,{**new,"id":"other-id"}],full=False)
@@ -530,12 +616,12 @@ class FleetTest(unittest.TestCase):
         self.center.sync("east")
         probe = self.plugin("east","poll")["command"]
         self.assertEqual((probe["account"],probe["action"]),("New","account.read"))
-        self.assertEqual(len(self.center.state("east")["commands"]),1)
+        self.assertEqual(len(self.after_startup(self.center.state("east"))),1)
         self.time += 1
         self.plugin("east","result",id=probe["id"],ok=True,result={"observation":{**self.reading("New"),"phase":"2/2"}})
         self.center.sync("east")
         self.center.decide()
-        records = self.center.state("east")["commands"]
+        records = self.after_startup(self.center.state("east"))
         self.assertEqual([(c["action"],c["phase"]) for c in records],[("order.open","2/2"),("account.read",None)])
 
     def test_disabled_pool_refresh_finishes_after_authoritative_list(self):
@@ -543,7 +629,7 @@ class FleetTest(unittest.TestCase):
         self.start_cards([self.card("First")])
         state = self.center.state("east")
         self.assertGreater(state["nodes"][0]["card_generation"],0)
-        self.assertFalse(state["commands"])
+        self.assertFalse(self.after_startup(state))
         self.assertFalse(state["strategy"]["enabled"])
         self.assertIn("无法组成下一批",state["strategy"]["message"])
 
@@ -558,6 +644,7 @@ class FleetTest(unittest.TestCase):
         self.center.sync("east")
         self.card_report("east",items)
         self.center.sync("east")
+        self.complete_startup_scan("east")
         self.center.decide()
         self.center.sync("east")
         first = self.plugin("east","poll")["command"]
@@ -795,7 +882,7 @@ class FleetTest(unittest.TestCase):
     def test_phase_two_size_and_migrated_take_profit_defaults(self):
         self.center.strategy("config",dict(size_percent=25,phase2_size_percent=75),"east")
         self.start_cards([self.card("Second",phase="2/2")])
-        cmd, = self.center.state("east")["commands"]
+        cmd, = self.after_startup(self.center.state("east"))
         self.assertEqual(cmd["params"]["size_percent"],75)
         self.assertNotIn("take_profit",cmd["params"])
         old = {**strategy_config.DEFAULT_CONFIG,"size_percent":50,"live_size_percent":100,"live_take_profit":30,"take_profit":14}
@@ -927,6 +1014,8 @@ class FleetTest(unittest.TestCase):
         with self.assertRaises(Problem):
             self.plugin("east","notice.reserve",**args)
         self.start_ready("east")
+        self.plugin("east","poll",notice_kind="phase2")
+        self.center.sync("east")
         self.assertTrue(self.plugin("east","poll",notice_kind="phase2")["notice"]["enabled"])
         with self.assertRaises(Problem):
             self.plugin("east","notice.reserve",**{**args,"successor_roots":["other"]})
@@ -1148,7 +1237,7 @@ class FleetTest(unittest.TestCase):
         state = self.center.state("east")
         self.assertTrue(state["strategy"]["enabled"])
         self.assertFalse(any(a["candidate"] for a in state["accounts"]))
-        self.assertEqual(len(state["commands"]),1)
+        self.assertEqual(len(self.after_startup(state)),1)
         self.assertEqual(self.center.get(cmd["id"])["intents"],{})
 
     @staticmethod
@@ -1352,19 +1441,19 @@ class FleetTest(unittest.TestCase):
             self.center.strategy("config", {"side":side}, nid)
             self.start_ready(nid)
         self.center.decide()
-        original = self.center.state()["commands"]
+        original = self.after_startup(self.center.state())
         self.assertEqual({c["node_id"] for c in original}, {"east","west"})
         self.assertEqual({(c["node_id"],c["params"]["side"]) for c in original}, {("east","buy"),("west","sell")})
         self.assertTrue(all(c["account"] == "Only-" + c["node_id"] for c in original))
         self.center.db.close()
         self.center = Center(self.root / "center", self.clock, self.transport)
         self.center.decide()
-        self.assertEqual(len(self.center.state()["commands"]), 2)
+        self.assertEqual(len(self.after_startup(self.center.state())), 2)
         self.center.sync("east")
         self.center.strategy("stop", {}, "east")
         self.center.sync("east")
-        self.assertEqual(self.center.state("east")["commands"][0]["status"], "cancelled")
-        self.assertEqual(self.center.state("west")["commands"][0]["status"], "pending")
+        self.assertEqual(self.after_startup(self.center.state("east"))[0]["status"], "cancelled")
+        self.assertEqual(self.after_startup(self.center.state("west"))[0]["status"], "pending")
         self.assertTrue(self.center.state("west")["strategy"]["enabled"])
         self.assertIsNone(self.center.state()["strategy"])
 
@@ -1374,7 +1463,7 @@ class FleetTest(unittest.TestCase):
         self.center.strategy("config", {"batch_size":2}, "east")
         self.start_ready("east")
         self.center.decide()
-        self.assertEqual(self.center.state()["commands"], [])
+        self.assertEqual(self.after_startup(self.center.state()), [])
         self.center.strategy("stop", {}, "east")
         p = {"side":"buy", "micro":1, "stop_buffer":2}
         self.center.submit("first", self.req(action="order.open", params=p))
@@ -1491,11 +1580,11 @@ class FleetTest(unittest.TestCase):
         self.center.decide()
         self.assertEqual(self.center.state("east")["strategy"]["message"], "批间等待")
         self.center.decide()
-        self.assertEqual(len(self.center.state()["commands"]), 1)
+        self.assertEqual(len(self.after_startup(self.center.state())), 1)
         self.time += 2
         self.center.decide()
-        self.assertEqual(self.center.state()["commands"][0]["account"], "Shared")
-        self.assertEqual(self.center.state("west")["commands"], [])
+        self.assertEqual(self.after_startup(self.center.state())[0]["account"], "Shared")
+        self.assertEqual(self.after_startup(self.center.state("west")), [])
 
     def test_stale_open_card_requests_one_full_list_and_waits_for_positive_confirmation(self):
         self.start_cards([self.card("Holding")])
@@ -1818,7 +1907,7 @@ class FleetTest(unittest.TestCase):
         self.center.decide()
         self.assertFalse(any(s["enabled"] or s["members"] for s in self.center.state()["strategies"]))
         self.center.decide()
-        self.assertEqual(len(self.center.state()["commands"]),2)
+        self.assertEqual(len(self.after_startup(self.center.state())),2)
 
     def test_http_boundary_and_real_transport(self):
         node_token, plugin_token, admin = (secrets.token_urlsafe(30) for _ in range(3))

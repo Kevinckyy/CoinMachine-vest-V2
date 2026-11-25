@@ -148,8 +148,38 @@ try {
     return {...await cdp(target.webSocketDebuggerUrl),targetId};
   }
   const ui=await tab();
-  for (const file of ['core.js','account-notices.js'])
+  for (const file of ['core.js','account-notices.js','stop-protection.js'])
     await ui.evaluate(await readFile(path.join(root,'extension',file),'utf8'));
+  // The editor closes normally while the positions table retains its pre-save price.
+  async function delayedProtection(accepted) {
+    const documentBody=document.body;
+    documentBody.innerHTML='<button data-testid="tpsl-edit-open-p">Edit</button><div role="dialog" hidden><h2>Edit NQ TP/SL</h2>'+
+      '<span data-testid="position-entry-p">20000</span><input data-testid="tpsl-edit-sl-input-0" value="19985">'+
+      '<button data-testid="tpsl-edit-sl-unit-0">Price</button><span data-testid="tpsl-edit-sl-size-unit-0">%</span>'+
+      '<input data-testid="tpsl-edit-sl-qty-0" value="100"><span data-testid="tpsl-edit-sl-size-equiv-0">2 NQ</span>'+
+      '<button data-testid="tpsl-edit-sl-execution-0">Market</button><button type="submit" data-testid="tpsl-edit-submit">Save</button></div>';
+    const dialog=document.querySelector('[role=dialog]');
+    document.querySelector('[data-testid=tpsl-edit-open-p]').onclick=()=>{dialog.hidden=false;};
+    let saves=0,permits=0,now=Date.now();
+    const clock=Date.now;
+    Date.now=()=>now;
+    dialog.querySelector('[type=submit]').onclick=()=>{saves++;dialog.remove();};
+    const filled={position_open:true,position_id:'p',symbol:'NQ-PERP',side:'buy',entry_price:20000,
+      quantity:2,price:20000,native_sl_price:19985,native_tp_price:null,native_tp_absent:true};
+    try {
+      const corrected=await VestStopProtection.correct({
+        guard(){},noDialogs(){},read:()=>({...filled}),one:(s,root)=>root.querySelector(s),
+        visible:e=>e.isConnected && !e.hidden,click:e=>e.click(),delay:async ms=>{now+=ms;},
+        readProtection:async since=>now/1000-since>10 ? {native_sl_price:accepted?19990:19985,native_sl_absent:false} : null,
+        intent:async (_job,_current,targets)=>{permits++;return {authorize_click:true,target_prices:targets};}
+      },{stop_loss:20},filled);
+      return [saves,permits,corrected.stop_check.status,corrected.stop_check.corrected || false];
+    } finally {Date.now=clock;documentBody.replaceChildren();}
+  }
+  for(const accepted of [true,false]){
+    const checks=await ui.evaluate('('+delayedProtection.toString()+')('+accepted+')');
+    assert.deepEqual(checks,[1,1,accepted?'verified':'failed',accepted]);
+  }
   const noticeChecks=await ui.evaluate(`(async()=>{
     const modal=document.createElement('div');modal.setAttribute('role','dialog');document.body.append(modal);
     modal.innerHTML='<div data-slot="dialog-header"><h2 data-slot="dialog-title">Evaluation Passed</h2><div>Congratulations - you&#39;ve passed the Evaluation Phase. Your <span>$5,000</span> Funded Account is now live.</div></div><button>Go to Funded Account</button>';
@@ -212,7 +242,8 @@ try {
       return vest.send('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:200,
         responseHeaders:[{name:'Content-Type',value:'text/html; charset=utf-8'}],body:Buffer.from(html).toString('base64')});
     }
-    if(path.pathname==='/v3/trading-performance/series') archivedPages[path.pathname].items=[{ts:Date.now(),account_id:'Alpha',equity_value:'1050'}];
+    if(path.pathname==='/v3/trading-performance/series') archivedPages[path.pathname].items=[
+      {ts:Date.now(),account_id:'Alpha',equity_value:'1050'},{ts:Date.now(),account_id:'Beta',equity_value:'2000'}];
     let body=archivedPages[path.pathname];
     if(body && ['/v3/accounts','/v3/positions/opened'].includes(path.pathname) && await vest.evaluate("location.pathname.startsWith('/trade/')")) {
       if(path.pathname==='/v3/accounts') body={accounts:await vest.evaluate("accounts.map(([name,,,,equity])=>({account_id:name,amount:tradeEquity(name,equity).replace(/[^0-9.]/g,'')}))")};
@@ -355,8 +386,9 @@ try {
   await api('nodes/lab/strategy/start','POST',{});
   await until(async()=>{
     const s=await api('state?node_id=lab');
-    return s.nodes[0].card_generation>0 && s.workers[0].card_generation===s.nodes[0].card_generation;
-  },'strategy waits for a new full directory read');
+    if (!s.strategy.enabled) throw Error(s.strategy.message);
+    return s.strategy.startup_scans?.[worker.worker_id]?.confirmed && s.workers[0].card_generation===s.nodes[0].card_generation;
+  },'strategy confirms the directory and the full account scan before selecting',50000);
   await vest.evaluate("sessionStorage.setItem('purchased','yes');const p=document.createElement('p');p.setAttribute('role','status');p.textContent='Your Funded Account is ready to trade.';document.body.append(p)");
   await until(async()=>(await api('state?node_id=lab')).accounts.find(a=>a.name==='Gamma')?.in_pool,'new purchase joins a running strategy');
   await api('nodes/lab/strategy/stop','POST',{});
@@ -740,7 +772,8 @@ try {
   await until(async()=>{
     const s=await api('state?node_id=lab');
     return !s.workers[0].notice_waiting && s.workers[0].card_session===beforeUpdate.session_id &&
-      s.workers[0].card_generation===s.nodes[0].card_generation && s.strategy.enabled;
+      s.workers[0].card_generation===s.nodes[0].card_generation && s.strategy.enabled &&
+      s.strategy.startup_scans?.[worker.worker_id]?.confirmed;
   },'successor verified and fresh directory synchronized in original execute session');
   await api('nodes/lab/strategy/stop','POST',{});
   await api('nodes/lab/strategy/config','POST',{batch_size:savedSize});

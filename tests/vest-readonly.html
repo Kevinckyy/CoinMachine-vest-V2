@@ -47,7 +47,7 @@
     document.getElementById('positions').innerHTML = '<table><tr><td><a href="/trade/NQ-PERP"><span data-testid="position-symbol-test">NQ</span></a></td>'+
       '<td data-testid="position-side-test">Long 2x</td><td data-testid="position-entry-test">$'+entry+'</td>'+
       '<td><p><span data-testid="position-value-test">$40000</span></p><p>'+quantity+' NQ</p></td>'+
-      '<td data-testid="td-tpsl"><span class="text-short">$'+stop+'</span></td></tr></table>';
+      '<td data-testid="td-tpsl"><span class="text-long">-</span> / <span class="text-short">$'+stop+'</span></td></tr></table>';
   };
   const lossHelp=document.getElementById('lossHelp'), labels=document.getElementById('lossLabels');
   lossHelp.onpointerover=()=>{labels.hidden=false;lossHelp.setAttribute('aria-describedby',labels.id);};

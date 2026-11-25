@@ -112,6 +112,17 @@
     }
     return rows;
   }
+  function protectionLeg(rows, quantity, key) {
+    if (!Array.isArray(rows)) return {};
+    // Vest's position table shows awaiting legs. Triggered and cancelled legs can still be present in the array.
+    const active=rows.filter(leg=>leg?.status!=='cancelled' && leg?.status!=='triggered');
+    if (!active.length) return {['native_'+key+'_absent']:true,['native_'+key+'_price']:null};
+    const [leg]=active;
+    const single=active.length===1 && leg?.status==='awaiting' && leg.executionType==='market' &&
+      (leg.sizeMode==='full_position' || leg.sizeMode==='fixed' && money(leg.quantity)===quantity);
+    // Preserve an explicit but unsupported protection instead of treating it as an empty leg.
+    return {['native_'+key+'_absent']:false,['native_'+key+'_price']:single ? money(leg.triggerPrice) : null};
+  }
   function openedPositions(payload) {
     // Vest sends an explicit null collection when the user has no open positions.
     if (Object.hasOwn(payload,'positions') && payload.positions===null && !(Number(payload.total)>0)) return new Map();
@@ -135,6 +146,7 @@
       const count=(byAccount.get(accountId)?.count || 0)+1;
       const usable=count===1 && p.symbol==='NDX-USD-PERP' && side && quantity>0 && entry>0;
       byAccount.set(accountId,{count,position:usable ? {position_id:p.positionId,side,quantity,entry_price:entry,
+        ...protectionLeg(p.takeProfits,quantity,'tp'),...protectionLeg(p.stopLosses,quantity,'sl'),
         ...(Number.isSafeInteger(p.openDate) && p.openDate>=1e12 && p.openDate<=Date.now()+1000 ? {opened_at:p.openDate/1000} : {})} : null});
     }
     return byAccount;

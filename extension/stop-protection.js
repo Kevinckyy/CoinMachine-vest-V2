@@ -121,18 +121,30 @@
       }
       const save=one('tpsl-edit-submit');
       if(save.type!=='submit'||save.getAttribute('aria-busy')==='true')throw Error('无法确认止盈止损保存按钮');
-      submitted=true;a.click(save);
-      const deadline=Date.now()+8000;
+      const savedAt=Date.now()/1000;
+      a.click(save);submitted=true;
+      const deadline=Date.now()+20000;
       while(Date.now()<deadline){
-        await a.delay(150);a.guard(job);
-        if(dialog?.isConnected&&a.visible(dialog))continue;
-        dialog=null;current=read();checks=checkLegs(current);
+        await a.delay(400);a.guard(job);
+        const native=await a.readProtection(savedAt);
+        if(!dialog?.isConnected || !a.visible(dialog))dialog=null;
+        current=read();
+        if(dialog && !selected.every(({key})=>native && Object.hasOwn(native,'native_'+key+'_price')))continue;
+        for(const {key} of selected){
+          if(native && Object.hasOwn(native,'native_'+key+'_price')){
+            current['native_'+key+'_price']=native['native_'+key+'_price'];
+            current['native_'+key+'_absent']=native['native_'+key+'_absent'];
+          }
+        }
+        checks=checkLegs(current);
         if(Object.values(checks).every(valid)){
           for(const {report} of changes)checks[report].corrected=true;
           return {...current,...checks};
         }
       }
-      throw Error('止盈止损校正后未确认持仓列表已更新，请核对');
+      const prices=selected.map(({key,report,label})=>label+'目标 '+(checks[report].target_price??'空')+
+        '，实读 '+(current['native_'+key+'_price']??(current['native_'+key+'_absent']?'空':'未知')));
+      throw Error('保护已提交一次，未核验成功 · '+(dialog?'编辑窗口仍打开 · ':'')+prices.join(' / '));
     }catch(error){
       if(dialog&&validEditor&&!submitted){
         try{

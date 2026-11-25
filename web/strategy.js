@@ -186,7 +186,7 @@ function strategyDetail(node) {
     else if (!a.in_pool && !canJoinPool(a)) unavailable = '当前账户状态无法入池';
     const poolButton = '<button type="button" class="link" data-op="'+(a.in_pool ? 'leavePool' : 'joinPool')+'" data-value="'+esc(key)+'"'+
       (unavailable ? ' disabled title="'+esc(unavailable)+'"' : '')+'>'+label+'</button>';
-    const status = active ? '执行中' : a.open_locked ? openLockLabel(a) : a.candidate ? '可候选' : a.in_pool ? '入池待选' : a.live_default_locked ? 'Live 默认锁定' :
+    const status = active ? '执行中' : a.open_locked ? openLockLabel(a) : a.candidate ? '可候选' : a.in_pool ? a.candidate_reason || '等待中心更新候选判定' : a.live_default_locked ? 'Live 默认锁定' :
       a.ambiguous ? '同名待确认' : a.excluded ? '主账户' : !a.enabled ? '已停用' : '未入池';
     return '<tr><td class="cell"><strong>'+esc(a.alias || a.name)+'</strong><small>'+esc((a.alias ? a.name+' · ' : '')+workerLabel(node.id,a.worker_id))+'</small></td>'+
       '<td>'+esc(stageNames[a.phase] || '待确认')+'</td><td class="cell">'+tag(status,active ? 'info' : a.open_locked ? 'warn' : a.candidate ? 'good' : '')+openLockDetail(a)+'</td>'+
