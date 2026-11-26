@@ -245,7 +245,7 @@ function strategyFields(c) {
       numeric('dynamic_live_target','动态 Live 目标存量',1,'1',1000000)+numeric('dynamic_exam_slots','补位考核名额（留空自动）',1,'1','',true)+
       flag('live_priority','启用阶段优先级')+select('account_priority_order','阶段顺序',orders.map(order=>
         option(order.join(','),order.map(p=>stageNames[p]).join(' → '),order.join(',') === c.account_priority_order.join(','))).join(''))+
-      flag('refresh_account_pool','等待新增候选并在美东 20:00 日切刷新'),true)+
+      flag('refresh_account_pool','候选账户不足时等待新增候选'),true)+
     group('批内与批间等待',
       numeric('order_delay_min','批内最短等待 · 秒',0,'any',86400)+numeric('order_delay_max','批内最长等待 · 秒',0,'any',86400)+
       numeric('batch_delay_min','批间最短等待 · 秒',0,'any',86400)+numeric('batch_delay_max','批间最长等待 · 秒',0,'any',86400))+

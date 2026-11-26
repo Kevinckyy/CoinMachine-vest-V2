@@ -19,6 +19,7 @@ from .storage import Database, check_reservations, command, find_command, finish
 
 BATCH_LIST_RETRY = 30
 LIVE_READ_RETRY = 30
+DAILY_READ_RETRY = 60
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -201,6 +202,7 @@ class Center:
 
     def _inventory(self, db, nid=None):
         now = self.clock()
+        day = entry_day_window(now)["start"]
         args = (nid,) if nid else ()
         configs = {(r["node"], r["worker"], r["name"]): r for r in db.execute("SELECT * FROM account_config" + (" WHERE node=?" if nid else ""), args)}
         identities = {(r["node"],r["worker"],r["platform_id"]): r["config_name"] for r in
@@ -232,6 +234,9 @@ class Center:
                 config_name = identities.get((*key[:2],platform_id),a["name"])
                 cfg = configs.get((*key[:2],config_name))
                 worker = workers[key[:2]]
+                detail = a.get("portfolio") or {}
+                awaiting_daily_read = worker.get("account_refresh_day", day) < day and (
+                    detail.get("session_id") != worker["session_id"] or detail.get("observed_at", 0) < day or bool(detail.get("missing")))
                 card_fresh = bool(a.get("card") and a["present"] and worker["online"] and
                                   worker["session_id"]==a["listed_session"] and now-a["card_at"]<=OBS_TTL)
                 eligible = a["present"] and not a["ambiguous"] and not a["excluded"] and a["category"] in ("active","eval","funded","live")
@@ -241,7 +246,7 @@ class Center:
                                  "live_default_locked":bool(live_locked),"open_locked":bool(a.get("open_lock") and now < a["open_lock"]["until"]),
                                  "in_pool": bool(eligible and not live_locked and (cfg["enabled"] and cfg["in_pool"] if cfg else a.get("card"))),
                                  "account_ref": (cfg["account_ref"] if cfg else "") or (config_name if config_name!=a["name"] else ""),
-                                 "card_fresh":card_fresh,
+                                 "card_fresh":card_fresh, "awaiting_daily_read":awaiting_daily_read,
                                  "fresh": card_fresh or bool(worker["online"] and a.get("read_session") == a.get("listed_session") == worker["session_id"]
                                                and a["present"] and not a["read_error"]
                                                and a["observed_at"] and now - a["observed_at"] <= OBS_TTL)}
@@ -563,6 +568,7 @@ class Center:
                                       "warning" if w.get("error") or not live else "info", worker=w["worker_id"])
                 if metrics_only:
                     return
+                self._queue_daily_reads(db, nid, snap["workers"])
                 self._queue_closed_history(db,nid,snap)
                 todo = [r[0] for r in db.execute("""SELECT id FROM commands WHERE node=? AND
                         status IN ('pending','sending','queued','running','unknown') ORDER BY created,id""", (nid,))]
@@ -717,6 +723,39 @@ class Center:
             reporting.log(db,nid,self.clock(),"account","已请求全量拉取账户列表")
             return {"generation":generation}
 
+    def _queue_account_scan(self, db, inventory, worker, source="manual", since=0):
+        nid, wid = worker["node_id"], worker["worker_id"]
+        prior = db.execute("""SELECT id FROM commands WHERE node=? AND worker=? AND action=?
+            AND status IN ('pending','sending','queued','running') AND json_extract(body,'$.session_id')=?
+            AND created>=? ORDER BY created LIMIT 1""", (nid, wid, PORTFOLIO_SCAN, worker["session_id"], since)).fetchone()
+        if prior:
+            return prior["id"]
+        req = request(dict(node_id=nid, worker_id=wid, action=PORTFOLIO_SCAN))
+        cmd = self._prepare(db, uid(), req, inventory, source)
+        insert(db, cmd, "pending", self.clock())
+        return cmd["id"]
+
+    def _queue_daily_reads(self, db, nid, workers):
+        now = self.clock()
+        day = entry_day_window(now)["start"]
+        due = [w for w in workers if w.get("account_refresh_day", day) < day and
+               w.get("portfolio_version") == 1 and now - w["last_seen"] < WORKER_TTL
+               and (w.get("portfolio_scan") or {}).get("status") not in PENDING]
+        if not due:
+            return
+        inventory = self._inventory(db, nid)
+        for w in due:
+            wid = w["worker_id"]
+            # A partial scan may need to wait for the platform's own day reset.
+            recent = db.execute("""SELECT 1 FROM commands WHERE node=? AND worker=? AND action=?
+                AND json_extract(body,'$.session_id')=? AND status IN ('succeeded','failed','expired','cancelled')
+                AND created>=? AND updated>=? LIMIT 1""", (nid, wid, PORTFOLIO_SCAN, w["session_id"], day, now-DAILY_READ_RETRY)).fetchone()
+            if not recent:
+                try:
+                    self._queue_account_scan(db, inventory, inventory[1][nid,wid], "daily-refresh")
+                except Problem:
+                    continue  # A node or extension update in progress can temporarily prevent reads.
+
     def read_accounts(self, nid):
         with self.db.tx() as db:
             inventory = self._inventory(db, nid)
@@ -729,17 +768,7 @@ class Center:
                 if worker.get("portfolio_version") != 1:
                     skipped.append(wid)
                     continue
-                prior = db.execute("""SELECT id FROM commands WHERE node=? AND worker=? AND action=?
-                                   AND status IN ('pending','sending','queued','running')
-                                   AND json_extract(body,'$.session_id')=? ORDER BY created LIMIT 1""",
-                                   (nid, wid, PORTFOLIO_SCAN, worker["session_id"])).fetchone()
-                if prior:
-                    ids.append(prior["id"])
-                    continue
-                req = request(dict(node_id=nid, worker_id=wid, action=PORTFOLIO_SCAN))
-                cmd = self._prepare(db, str(uuid.uuid4()), req, inventory)
-                insert(db, cmd, "pending", self.clock())
-                ids.append(cmd["id"])
+                ids.append(self._queue_account_scan(db, inventory, worker))
             require(ids, "请更新节点桥并重新加载 1.4.0 或更高版本插件" if skipped else "此节点尚无在线浏览器", 409)
             return {"commands": ids, "skipped": skipped}
 
@@ -818,6 +847,8 @@ class Center:
                 reason = "浏览器处于只读模式"
             elif worker.get("notice_waiting"):
                 reason = "等待处理账户弹窗"
+            elif a["awaiting_daily_read"]:
+                reason = "等待美东日切后的账户风控读数"
             elif not a["fresh"]:
                 reason = "等待当前浏览器会话更新账户读数"
             elif a["phase"] not in account_pool.PHASES:
@@ -864,10 +895,8 @@ class Center:
             prior = scans.get(wid)
             if prior and prior["session"] == w["session_id"]:
                 continue
-            req = request(dict(node_id=s["node_id"],worker_id=wid,action=PORTFOLIO_SCAN))
-            cmd = self._prepare(db,uid(),req,inventory,"strategy-"+s["run"])
-            insert(db,cmd,"pending",self.clock())
-            scans[wid] = {"id":cmd["id"],"session":w["session_id"]}
+            key = self._queue_account_scan(db, inventory, w, "strategy-"+s["run"], s.get("started_at", 0))
+            scans[wid] = {"id":key,"session":w["session_id"]}
         complete = 0
         for wid, scan in scans.items():
             if scan.get("confirmed"):
@@ -979,7 +1008,9 @@ class Center:
         node = inventory[0][nid]
         online = [w for w in inventory[1].values() if w["online"]]
         day = entry_day_window(now)["start"]
-        if not node["card_generation"] or (s["config"]["refresh_account_pool"] and s.get("pool_day", day) < day):
+        legacy_rollover = (s["config"]["refresh_account_pool"] and s.get("pool_day", day) < day
+                           and any("account_refresh_day" not in w for w in online))
+        if not node["card_generation"] or legacy_rollover:
             self._request_cards(db,nid)
             s["pool_day"] = day
             return False
@@ -1251,7 +1282,7 @@ class Center:
             if m["status"] not in TERMINAL or m["status"] == "succeeded":
                 continue
             day_end = entry_day_window(m["created_at"])["end"]
-            rolled = (s["config"]["refresh_account_pool"] and m["status"] == "expired" and
+            rolled = (m["status"] == "expired" and
                       m["expires_at"] == day_end and now >= day_end and not m["intents"])
             reselect = m["status"] == "cancelled" and not m["intents"] and (m["result"] or {}).get("reselect")
             if not (rolled or reselect):
@@ -1287,7 +1318,10 @@ class Center:
         if startup and not self._startup_positions_flat(db,s,inventory,now,bool(candidates)):
             return
         if not s["planned"] and not self._plan_orders(s,inventory,candidates,members):
-            if self._discover_phase(db,s,inventory):
+            if any(a["in_pool"] and a["awaiting_daily_read"] and inventory[1][nid,wid]["online"]
+                   and inventory[1][nid,wid]["mode"] == "execute" for (nid,wid,_),a in inventory[2].items()):
+                s["message"] = "等待美东日切后全量读取账户信息"
+            elif self._discover_phase(db,s,inventory):
                 s["message"] = "等待读取新账户的阶段"
             elif not s["config"]["refresh_account_pool"] and not members and not s.get("replace") and any(
                     w["online"] and w["mode"] == "execute" for w in inventory[1].values()):

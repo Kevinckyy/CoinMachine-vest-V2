@@ -28,6 +28,12 @@ assert.deepEqual(metrics(rawRisk,cutoff,cutoff+331),{});
 assert.equal(metrics({...rawRisk,daily_reset_at:cutoff-1}).daily_loss,undefined);
 assert.equal(metrics({...rawRisk,daily_rate:0,daily_reset_at:cutoff}).daily_loss,undefined);
 assert.deepEqual(VestBridgeCore.nativeCapitalMetrics({...rawRisk,daily_reset_at:cutoff},5000,cutoff,cutoff+1,cutoff-1),{});
+const justAfterReset={...rawRisk,equity:4872.08,equity_at:cutoff+1,equity_source:'flat_balance'};
+const awaitingReset=VestBridgeCore.bulkCapitalValues({...justAfterReset,daily_reset_at:cutoff-1},cutoff+2,cutoff+3);
+assert.deepEqual([awaitingReset.health,awaitingReset.daily_loss,awaitingReset.daily_limit,awaitingReset.daily_floor],[null,null,null,null]);
+const afterReset=VestBridgeCore.bulkCapitalValues({...justAfterReset,daily_reset_at:cutoff},cutoff+2,cutoff+160);
+assert.equal(afterReset.health,57);
+assert.equal(afterReset.observed_at,cutoff+1);
 const settle=()=>new Promise(resolve=>setImmediate(resolve));
 function reply(resolve,accounts,extra={}) {
   resolve({status:200,url,clone:()=>({json:async()=>({accounts,...extra})})});

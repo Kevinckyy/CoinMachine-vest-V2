@@ -82,14 +82,15 @@
   }
   function bulkCapitalValues(row, at, now) {
     const sameDay=capitalDay(at)===capitalDay(now);
+    const dailyReady=sameDay && row.daily_reset_at>0 && row.daily_reset_at<=now && capitalDay(row.daily_reset_at)===capitalDay(now);
     const equity=sameDay && row.equity_at && capitalDay(row.equity_at)===capitalDay(now) ? row.equity : null;
-    const metrics=nativeCapitalMetrics(row,equity,at,now);
+    const metrics=nativeCapitalMetrics(row,equity,at,now,row.equity_at);
     const daily=metrics.daily_loss, dd=metrics.drawdown;
     const health=capitalHealth(metrics,row.daily_unlimited);
-    return {equity,health,daily_loss:daily?.current ?? null,daily_limit:sameDay && !row.daily_unlimited ? row.daily_limit : null,
+    return {equity,health,daily_loss:daily?.current ?? null,daily_limit:dailyReady && !row.daily_unlimited ? row.daily_limit : null,
       drawdown:dd?.current ?? null,drawdown_limit:row.initial_capital>0 && row.max_drawdown_floor!=null &&
         row.initial_capital>=row.max_drawdown_floor ? row.initial_capital-row.max_drawdown_floor : null,
-      daily_floor:sameDay ? row.daily_floor : null,max_drawdown_floor:row.max_drawdown_floor,
+      daily_floor:dailyReady && !row.daily_unlimited ? row.daily_floor : null,max_drawdown_floor:row.max_drawdown_floor,
       equity_at:equity!=null ? row.equity_at : null,equity_source:equity!=null ? row.equity_source : null,
       daily_unlimited:row.daily_unlimited,observed_at:Math.min(at,equity!=null ? row.equity_at : at)};
   }

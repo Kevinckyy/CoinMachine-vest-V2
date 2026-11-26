@@ -22,7 +22,7 @@ def schema(db):
         CREATE TABLE IF NOT EXISTS card_locks(worker TEXT,platform_id TEXT,lock TEXT NOT NULL, PRIMARY KEY(worker,platform_id));
     """)
     cols = {r[1] for r in db.execute("PRAGMA table_info(accounts)")}
-    for name, spec in (("card","TEXT"), ("card_at","REAL"), ("risk","TEXT"), ("risk_at","REAL"), ("portfolio","TEXT"), ("preflight_at","REAL"), ("history_due_at","REAL"),
+    for name, spec in (("card","TEXT"), ("card_at","REAL"), ("risk","TEXT"), ("risk_at","REAL"), ("risk_field_times","TEXT"), ("portfolio","TEXT"), ("preflight_at","REAL"), ("history_due_at","REAL"),
                        ("initial_balance","REAL"), ("baseline_phase","TEXT"), ("phase_started_at","REAL"), ("open_lock","TEXT")):
         if name not in cols:
             db.execute(f"ALTER TABLE accounts ADD COLUMN {name} {spec}")
@@ -69,6 +69,14 @@ def risk_error(risk, complete=False):
         if any(risk.get(key) is None for key in required):
             return "交易页风控字段未读全"
     return ""
+
+
+def merge_risk_fields(risk, times, values, sampled_at, trade_at):
+    """A card, a batch response and a trade read can arrive in a different order."""
+    for key, value in values.items():
+        if sampled_at >= max(trade_at or 0, times.get(key, 0)):
+            risk[key] = value
+            times[key] = sampled_at
 
 
 def read_item(raw):
@@ -125,6 +133,9 @@ def update(db, wid, sid, data, now, *, metrics=False, defer_cache=False):
         require(not sync or sync["session"]!=sid or source_at >= (sync["source_at"] or 0),"过期的平台账户清单",409)
     require(full or sync and sync["session"]==sid and sync["generation"]==gen,"需要先完成全量刷新",409)
     require(not sync or sync["session"]!=sid or observed>=sync["seen"],"过期的卡片读数",409)
+    sample = obj(data["positions"]) if "positions" in data else None
+    position_at = number(sample.get("at"),"平台持仓响应时间",observed-120,observed+1) if sample is not None else None
+    native_scan = "details" in data
     previous = {r["name"]:r for r in db.execute("SELECT * FROM accounts WHERE worker_id=?",(wid,))}
     duplicate = set()
     if metrics:
@@ -152,8 +163,9 @@ def update(db, wid, sid, data, now, *, metrics=False, defer_cache=False):
                     else:
                         db.execute("DELETE FROM card_locks WHERE worker=? AND platform_id=?",(wid,old_id))
             if full and row["present"] and name not in items:
-                db.execute("UPDATE accounts SET present=0,card=NULL,card_at=NULL,risk=NULL,risk_at=NULL,portfolio=NULL,read_session=NULL,initial_balance=NULL,baseline_phase=NULL WHERE worker_id=? AND name=?",(wid,name))
+                db.execute("UPDATE accounts SET present=0,card=NULL,card_at=NULL,risk=NULL,risk_at=NULL,risk_field_times=NULL,portfolio=NULL,read_session=NULL,initial_balance=NULL,baseline_phase=NULL WHERE worker_id=? AND name=?",(wid,name))
     changed_risks = {}
+    retained_counts = {}
     for name,item in items.items():
         row = previous.get(name)
         lock = json.loads(row["open_lock"]) if row and row["open_lock"] else None
@@ -171,13 +183,21 @@ def update(db, wid, sid, data, now, *, metrics=False, defer_cache=False):
         phase = row["phase"] if same and row["phase"] and (not item["phase"] or not due and row["risk_at"] and item["phase"]==old_phase) else item["phase"]
         if source_at is not None:
             category,phase = item["category"],item["phase"]
-        risk = json.loads(row["risk"]) if same and row["risk"] else {}
-        if not same or observed >= (row["risk_at"] or 0):
-            for key in AMOUNTS:
-                if key not in risk or item[key] is not None and item[key] != prior.get(key):
-                    risk[key] = item[key]
-        count = item["active_positions"]
+        risk = json.loads(row["risk"]) if same and row["risk"] else dict.fromkeys(AMOUNTS)
+        times = json.loads(row["risk_field_times"] or "{}") if same else {}
+        # A native scan carries each account's actual sample time in its details.
+        # The time the extension sent the directory must never promote those numbers.
+        if not native_scan:
+            changed = {key:item[key] for key in AMOUNTS if item[key] is not None and
+                       (not same or key not in risk or item[key] != prior.get(key))}
+            merge_risk_fields(risk, times, changed, observed, row["risk_at"] if same else None)
         was_open = risk.get("position_open") is True or (prior.get("active_positions") or 0)>0
+        if native_scan and same and risk.get("position_open") is True and not item["active_positions"]:
+            last_open = max(row["observed_at"] or 0, (row["card_at"] or 0) if prior.get("active_positions") else 0)
+            if position_at is None or position_at <= last_open:
+                item["active_positions"] = prior.get("active_positions") or 1
+                retained_counts[item["id"]] = item["active_positions"]
+        count = item["active_positions"]
         if not same or observed >= (row["observed_at"] or 0):
             risk["position_open"] = None if count is None else count > 0
             if same and name not in duplicate and count==0 and was_open:
@@ -190,12 +210,14 @@ def update(db, wid, sid, data, now, *, metrics=False, defer_cache=False):
         if row and not same:
             db.execute("DELETE FROM daily_floors WHERE worker=? AND account=? AND start=?",
                        (wid,name,entry_day_window(observed)["start"]))
-        daily_floor.capture(db,wid,name,observed,item.get("daily_limit"))
-        db.execute("""INSERT INTO accounts(worker_id,name,category,phase,present,ambiguous,excluded,listed_session,card,card_at,risk)
-          VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(worker_id,name) DO UPDATE SET category=excluded.category,
+        if not native_scan:
+            daily_floor.capture(db,wid,name,observed,item.get("daily_limit"))
+        db.execute("""INSERT INTO accounts(worker_id,name,category,phase,present,ambiguous,excluded,listed_session,card,card_at,risk,risk_field_times)
+          VALUES(?,?,?,?,1,?,?,?,?,?,?,?) ON CONFLICT(worker_id,name) DO UPDATE SET category=excluded.category,
           phase=excluded.phase,present=1,ambiguous=excluded.ambiguous,excluded=MAX(accounts.excluded,excluded.excluded),
-          listed_session=excluded.listed_session,card=excluded.card,card_at=excluded.card_at,risk=excluded.risk""",
-          (wid,name,category,phase,name in duplicate,excluded,sid,dump(item),observed,dump(risk)))
+          listed_session=excluded.listed_session,card=excluded.card,card_at=excluded.card_at,risk=excluded.risk,
+          risk_field_times=excluded.risk_field_times""",
+          (wid,name,category,phase,name in duplicate,excluded,sid,dump(item),observed,dump(risk),dump(times)))
         if full:
             db.execute("UPDATE accounts SET open_lock=? WHERE worker_id=? AND name=?",(dump(lock) if lock else None,wid,name))
         if not same or name in duplicate:
@@ -207,12 +229,10 @@ def update(db, wid, sid, data, now, *, metrics=False, defer_cache=False):
             changed_risks[name] = risk
     same_session = sync and sync["session"]==sid
     positions_at, count = (sync["positions_at"], sync["position_count"]) if same_session else (None,None)
-    if "positions" in data:
-        sample = obj(data["positions"])
-        at = number(sample.get("at"),"平台持仓响应时间",observed-120,observed+1)
+    if sample is not None:
         latest = number(sample.get("count"),"平台活动持仓数",0,1000,True)
-        if positions_at is None or at>positions_at or at==positions_at and latest>count:
-            positions_at, count = at, latest
+        if positions_at is None or position_at>positions_at or position_at==positions_at and latest>count:
+            positions_at, count = position_at, latest
     db.execute("""INSERT INTO card_sync(worker,session,generation,full_at,seen,source_at,positions_at,position_count)
                 VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(worker) DO UPDATE SET session=excluded.session,generation=excluded.generation,
                 full_at=excluded.full_at,seen=excluded.seen,source_at=excluded.source_at,
@@ -222,6 +242,8 @@ def update(db, wid, sid, data, now, *, metrics=False, defer_cache=False):
     if metrics:
         return {"observed_at": observed, "risks": changed_risks}
     ack = {"count":len(items),"generation":gen,"supports_metrics":True,"supports_position_totals":True}
+    if retained_counts:
+        ack["retained_counts"] = retained_counts
     if not defer_cache:
         ack.update(directory_cache(db, wid, now))
     return ack

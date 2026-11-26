@@ -19,7 +19,7 @@ def worker_view(row):
 def account_view(row):
     if not row:
         return None
-    return {**{k: row[k] for k in row.keys() if k != "tracked_position"}, "snapshot": json.loads(row["snapshot"]),
+    return {**{k: row[k] for k in row.keys() if k not in ("tracked_position", "risk_field_times")}, "snapshot": json.loads(row["snapshot"]),
             **{k:json.loads(row[k]) if row[k] else None for k in ("card","risk","portfolio","open_lock")},
             **{key: bool(row[key]) for key in ("present", "ambiguous", "excluded")}}
 
@@ -122,6 +122,9 @@ class Bridge:
         daily_floor.schema(self.db.conn)
         reporting.log_schema(self.db.conn)
         with self.db.tx() as db:
+            if "account_refresh_day" not in {r["name"] for r in db.execute("PRAGMA table_info(workers)")}:
+                # Previously installed workers get a catch-up scan at their next connection.
+                db.execute("ALTER TABLE workers ADD COLUMN account_refresh_day REAL NOT NULL DEFAULT 0")
             if "portfolio_version" not in {r["name"] for r in db.execute("PRAGMA table_info(worker_build)")}:
                 db.execute("ALTER TABLE worker_build ADD COLUMN portfolio_version INTEGER NOT NULL DEFAULT 0")
             if "strategy_version" not in {r["name"] for r in db.execute("PRAGMA table_info(worker_build)")}:
@@ -399,10 +402,11 @@ class Bridge:
         if not row or row["session_id"] != sid or row["error"] != error:
             message = error or ("浏览器已连接 · 执行模式" if mode == "execute" else "浏览器已连接 · 只读模式")
             reporting.log(db, self.node_id, now, "browser", message, "warning" if error else "info", worker=wid)
-        db.execute("""INSERT INTO workers VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(worker_id) DO UPDATE SET
+        db.execute("""INSERT INTO workers(worker_id,label,generation,session_id,mode,last_seen,page,error,account_refresh_day)
+            VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(worker_id) DO UPDATE SET
             label=excluded.label,generation=excluded.generation,session_id=excluded.session_id,mode=excluded.mode,
             last_seen=excluded.last_seen,page=excluded.page,error=excluded.error""",
-            (wid, label, generation, sid, mode, now, page, error))
+            (wid, label, generation, sid, mode, now, page, error, row["account_refresh_day"] if row else entry_day_window(now)["start"]))
         return wid, sid
 
     def _inventory(self, db, wid, sid, items):
@@ -491,11 +495,15 @@ class Bridge:
             db.execute("UPDATE accounts SET open_lock=NULL WHERE worker_id=? AND name=?",(wid,name))
         if not preflight:
             previous = json.loads(row["risk"] or "{}")
+            times = json.loads(row["risk_field_times"] or "{}")
             for field in cards.AMOUNTS:
                 if risk[field] is None and not (risk["daily_unlimited"] and field in ("daily_loss","daily_limit")):
                     risk[field] = previous.get(field)
             if "daily_unlimited" not in snap and "daily_unlimited" in previous:
                 risk["daily_unlimited"] = previous["daily_unlimited"]
+            for field, at in times.items():
+                if at > observed:
+                    risk[field] = previous.get(field)
         db.execute("UPDATE accounts SET risk=?,risk_at=? WHERE worker_id=? AND name=?",
                    (dump(risk),observed,wid,name))
         return {"risk":risk,"daily_floor":daily_floor.view(db,wid,name,now)}

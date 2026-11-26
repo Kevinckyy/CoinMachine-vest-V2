@@ -101,7 +101,7 @@ Content-Type: application/json
 | `action` | `account` | `params` | 成功返回的 `result` |
 | --- | --- | --- | --- |
 | `accounts.list` | 省略 | `{}` | 全量拉取账户列表，按平台账户 ID 更新活动清单并合并 `/accounts` 卡片读数，返回 `inventory` 和 `count` |
-| `accounts.read_all` | 省略 | `{}` | 插件 1.11 起在账户页复用有效的原生响应，按平台 ID 合并全表，写入本地缓存后结束。返回 `source,listed_at,total,read,partial,failed,accounts`，各账户列出数据时间、可用数值和缺失项。 |
+| `accounts.read_all` | 省略 | `{}` | 在账户页复用有效的原生响应，按平台 ID 合并全表，写入本地缓存后结束。返回 `source,source_at,listed_at,total,read,partial,failed,accounts`。1.12.4 起，`source_at` 为平台清单时间，`listed_at` 为插件读表时间，账户池按各户 `values.observed_at` 合并风控字段。中心在美东 20:00 日切后用同一指令补读，来源为 `daily-refresh`。 |
 | `account.read` | 必填 | `{}` | `observation`，含余额、净值、浮盈亏、风险指标和时间 |
 | `positions.read` | 必填 | `{}` | `observation.snapshot`，含明确的持仓状态、ID、方向、数量、均价和原生保护价 |
 | `history.read` | 必填 | `{}` | 只读。补读该账户的历史持仓及原生订单，对实盘或已归档账户也尝试读取 Portfolio 出金。返回 `observation,tables`。各表含 `available` 和可用时的 `ready,rows_read,skipped,bottom_seen`。历史行分批写入节点桥 |

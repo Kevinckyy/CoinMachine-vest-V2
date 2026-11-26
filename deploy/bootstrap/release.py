@@ -1,5 +1,6 @@
 """Resolve, verify and display a center-issued Git release."""
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -11,12 +12,14 @@ def git(repo, *args):
 
 
 def select(repo, descriptor, revision=None):
-    git(repo,"fetch","--no-tags","origin","+refs/heads/main:refs/remotes/origin/main")
+    bundle = os.environ.get("VEST_RELEASE_BUNDLE")
+    main_ref = "refs/vest-fleet/bundle-main" if bundle else "refs/remotes/origin/main"
+    git(repo,"fetch","--no-tags",bundle or "origin","+refs/heads/main:"+main_ref)
     pin = json.loads(descriptor.read_text()) if descriptor.is_file() else None
-    target = revision or (pin["revision"] if pin else git(repo,"rev-parse","refs/remotes/origin/main"))
+    target = revision or (pin["revision"] if pin else git(repo,"rev-parse",main_ref))
     if not re.fullmatch("[0-9a-f]{40}",target):
         raise ValueError("Expected a full lowercase Git SHA")
-    git(repo,"merge-base","--is-ancestor",target,"refs/remotes/origin/main")
+    git(repo,"merge-base","--is-ancestor",target,main_ref)
     version = json.loads(git(repo,"show",target+":extension/manifest.json"))["version"]
     if pin and target == pin["revision"] and version != pin["version"]:
         raise ValueError("Release descriptor does not match the published extension manifest")

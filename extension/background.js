@@ -516,7 +516,9 @@ async function directoryRoute(owner,url,work,since) {
       const timing=await nativeDirectory(owner.tabId,undefined,true);
       if (work.command?.action==='accounts.read_all' && timing && timing.bulk_version!==1) break;
       const now=Date.now()/1000;
-      const positionsReady=work.command?.action!=='accounts.list' || timing?.position_at>=since && now-timing.position_at<=30;
+      const action=work.command?.action;
+      const positionsReady=action==='accounts.list' ? timing?.position_at>=since && now-timing.position_at<=30 :
+        action!=='accounts.read_all' || timing?.position_at>=since && now-timing.position_at<=90;
       if (timing?.at!=null && timing.at>=since && now-timing.at<=330 && positionsReady ||
           timing?.pending_at!=null && timing.pending_at>=since && now-timing.pending_at<=12) return null;
       if (i<3) await new Promise(resolve=>setTimeout(resolve,250));
@@ -568,7 +570,7 @@ async function pollWork(owner,cfg,meta,url,documentId,historyPending,noticeKind)
     }
     if (scan) await chrome.storage.session.set({returnCards:owner.session_id});
     if (directory && !data.arrived) {
-      data.directory_since=cmd.created_at-(scan ? 320 : 0);
+      data.directory_since=Math.max(data.directory_since || 0, cmd.created_at-(scan ? 320 : 0));
       const moving=await directoryRoute(owner,url,{...data,owner:publicBinding(owner)},data.directory_since);
       if (moving) return moving;
     } else if (!data.arrived) {
@@ -636,6 +638,11 @@ async function reportCards(owner,cfg,payload) {
   if (bound?.session_id !== owner.session_id || bound.pageId !== owner.pageId) throw Error('提交清单的页面已更换');
   const cards = payload.cards;
   const data = await post('report',payload,cfg);
+  if (data.retained_counts) {
+    for (const item of cards.items) {
+      if (Object.hasOwn(data.retained_counts,item.id)) item.active_positions=data.retained_counts[item.id];
+    }
+  }
   pendingMetricRisks.clear();
   try {
     await chrome.storage.local.set({cardCache:{worker_id:owner.worker_id,items:cards.items,risks:data.risks,
@@ -650,7 +657,7 @@ async function reportCards(owner,cfg,payload) {
   if (cards.scan_id) await chrome.storage.session.remove('lease.'+cards.scan_id);
   if (cards.full && cards.purchase_request && (await chrome.storage.local.get('cardRequest')).cardRequest===cards.purchase_request)
     await chrome.storage.local.remove('cardRequest');
-  return {supports_metrics:data.supports_metrics,supports_position_totals:data.supports_position_totals};
+  return {supports_metrics:data.supports_metrics,supports_position_totals:data.supports_position_totals,retained_counts:data.retained_counts};
 }
 async function reportMetrics(owner,cfg,payload) {
   // The complete DOM sample stays in the browser. Only the numeric changes cross the bridge.

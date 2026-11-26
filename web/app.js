@@ -425,14 +425,8 @@ function nodesView() {
 function renderAccounts() {
   const list = state.accounts.filter(a => a.present && selectedNode === a.node_id && (a.name+' '+a.alias).toLowerCase().includes(accountQuery.trim().toLowerCase()));
   const rows = list.map(a => {
-    const key = addressKey(a), card = a.card || {}, risk = {...a.risk};
+    const key = addressKey(a), card = a.card || {}, risk = a.risk || {};
     const detail=a.portfolio;
-    if (detail?.source==='native') {
-      for (const field of ['equity','health','daily_loss','daily_limit','drawdown','drawdown_limit','daily_unlimited']) {
-        const previousAt=Math.max(a.risk_at || 0,card[field]!=null ? a.card_at || 0 : 0);
-        if (detail[field]!=null && (risk[field]==null || detail.observed_at>=previousAt)) risk[field]=detail[field];
-      }
-    }
     const status = a.ambiguous ? '同名待核对' : !a.fresh ? '待刷新' : a.excluded ? '主账户' : !a.enabled ? '已停用' : category[a.category] || a.category;
     const pnl = Number.isFinite(card.pnl_percent) ? money(card.pnl)+' ('+card.pnl_percent+'%)' : money(card.pnl);
     return `<tr><td class="cell"><strong>${esc(a.alias || a.name)}</strong><small>${routeLabel(a)}</small></td>
@@ -440,7 +434,7 @@ function renderAccounts() {
       <td>${pnl}</td><td>${positionCount(a) ?? '—'}</td>
       <td>${risk.daily_unlimited ? '无限额' : money(risk.daily_loss)+' / '+money(risk.daily_limit)}</td><td>${money(risk.drawdown)} / ${money(risk.drawdown_limit)}</td>
       <td>${money(risk.equity)}</td><td class="cell">${money(a.daily_floor?.floor)}<small>${a.daily_floor?.source === 'platform' ? '页面已读取' : '等待页面读取'}</small></td>
-      <td>${risk.health == null ? '—' : esc(risk.health)+'%'}</td><td class="cell">${a.open_locked ? openLockLabel(a) : a.candidate ? '可候选' : a.in_pool ? '入池待选' : '—'}${openLockDetail(a)}</td>
+      <td>${risk.health == null ? '—' : esc(risk.health)+'%'}</td><td class="cell">${a.open_locked ? openLockLabel(a) : a.candidate ? '可候选' : a.in_pool ? esc(a.candidate_reason || '等待中心更新候选判定') : '—'}${openLockDetail(a)}</td>
       <td class="cell">${time(Math.max(a.card_at || 0,a.observed_at || 0,detail?.observed_at || 0))}${detail ? '<small>详情 '+time(detail.observed_at)+(detail.missing.length ? ' · 字段不全' : '')+'</small>' : ''}${detail?.equity_source==='performance_series' ? '<small>净值采样 '+time(detail.equity_at)+'</small>' : ''}</td><td><div class="actions">${btn('account','管理','link',key)}${btn('accountCmd','指令','link',key)}</div></td></tr>`;
   });
   const node = state.nodes.find(n=>n.id===selectedNode);
@@ -757,6 +751,16 @@ window.addEventListener('DOMContentLoaded', () => {
   $('loginSubmit').disabled = false;
   if (token) refresh();
 });
+let nextStatePoll = 0;
 setInterval(() => {
-  if (token && !document.hidden) refresh();
-}, 4000);
+  if (!token || document.hidden || busy) return;
+  const node = page === 'accounts' ? selectedNode : page === 'strategy' ? strategyNode : null;
+  const reading = node && state && (state.workers.some(w => w.node_id === node &&
+    ['queued','running'].includes(w.portfolio_scan?.status)) || state.commands.some(c => c.node_id === node &&
+    c.action === 'accounts.read_all' && ['pending','sending','queued','running'].includes(c.status)));
+  const now = performance.now();
+  if (reading || now >= nextStatePoll) {
+    nextStatePoll = now + 4000;
+    refresh();
+  }
+}, 1000);

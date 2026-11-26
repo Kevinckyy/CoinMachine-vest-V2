@@ -16,6 +16,7 @@ from fleet import account_pool, daily_floor, ledger, strategy_config, strategy_p
 from fleet.http import make_server
 from fleet.protocol import Problem
 from fleet.reporting import ZONE
+from fleet.trading_day import entry_day_window
 
 
 class FleetTest(unittest.TestCase):
@@ -177,22 +178,27 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(self.plugin(nid,"poll")["command"]["id"],key)
         current = bridge.status()
         items = [a["card"] for a in current["accounts"] if a["present"] and a["card"]]
+        overrides = {a["name"]:{"health":None} for a in items} if partial else {}
+        self.report_native_scan(nid, key, items, positions=positions, overrides=overrides)
+        self.plugin(nid,"poll",cached_scan=key)
+        self.center.sync(nid)
+        self.time += 0.001
+
+    def report_native_scan(self, nid, key, items, *, sampled=None, source_at=None, positions=None, overrides=None):
+        sampled = self.time if sampled is None else sampled
         details = []
         for item in items:
             values = {"health":90,"equity":1000,"daily_limit":30,"daily_loss":0,"drawdown":26.08,"drawdown_limit":300}
             values.update({k:item[k] for k in values if item.get(k) is not None})
-            values.update(observed_at=self.time,equity_at=self.time,equity_source="flat_balance",
+            values.update(observed_at=sampled,equity_at=sampled,equity_source="flat_balance",
                           daily_floor=970,max_drawdown_floor=700)
-            if partial:
-                values["health"] = None
+            values.update((overrides or {}).get(item["name"], {}))
             details.append(dict(id=item["id"],values=values))
         if positions is None:
             positions = dict(at=self.time,count=sum(a["active_positions"] for a in items))
-        self.report(nid,page="/accounts",cards=dict(generation=current["card_generation"],full=True,observed_at=self.time,
-                    source_at=self.time,items=items,scan_id=key,details=details,positions=positions))
-        self.plugin(nid,"poll",cached_scan=key)
-        self.center.sync(nid)
-        self.time += 0.001
+        generation = self.nodes[nid].status()["card_generation"]
+        return self.report(nid, page="/accounts", cards=dict(generation=generation,full=True,observed_at=self.time,
+                    source_at=self.time if source_at is None else source_at,items=items,scan_id=key,details=details,positions=positions))
 
     def test_startup_details_gate_survives_restart_and_rejects_partial_receipt(self):
         self.enable("east")
@@ -417,11 +423,160 @@ class FleetTest(unittest.TestCase):
         for _ in range(2):
             ack=self.scan_directory(key,["New"],details=[detail])
             self.assertEqual(ack["portfolios"]["New"]["equity_at"],self.time-200)
-            self.assertNotEqual(ack["risks"]["New"].get("equity"),987)
+            self.assertEqual((ack["risks"]["New"]["equity"], ack["risks"]["New"]["health"]), (987, 90))
         self.assertIsNone(self.plugin("east","poll",cached_scan=key)["command"])
         self.center.sync("east")
         scan=self.center.get(key)
         self.assertEqual((scan["status"],scan["result"]["read"],scan["result"]["total"]),("succeeded",1,1))
+
+    def test_bulk_health_updates_a_waiting_strategy_from_a_cached_response(self):
+        self.start_cards([self.card("Recover", health=7)])
+        before = self.center.state("east")
+        self.assertTrue(before["strategy"]["enabled"])
+        self.assertFalse(next(a for a in before["accounts"] if a["name"]=="Recover")["candidate"])
+        self.time += 200
+        key = self.start_portfolio_scan()
+        item = self.card("Recover")
+        self.report_native_scan("east", key, [item], sampled=self.time-158, overrides={"Recover":{"health":54}})
+        self.plugin("east", "poll", cached_scan=key)
+        self.center.sync("east")
+        after = self.center.state("east")
+        a = next(a for a in after["accounts"] if a["name"]=="Recover")
+        self.assertEqual((a["risk"]["health"], a["portfolio"]["health"], a["candidate"]), (54, 54, True))
+        self.center.decide()
+        s = self.center.state("east")["strategy"]
+        self.assertEqual(s["run"], before["strategy"]["run"])
+        cmd = self.center.get(s["members"][0])
+        self.assertEqual((cmd["account"], cmd["expected_risk"]["health"]), ("Recover", 54))
+
+    def test_older_bulk_receipt_preserves_newer_detail_trade_and_card_health(self):
+        self.time += 210
+        key = self.start_portfolio_scan()
+        items = [self.card("Trade"), self.card("Card"), self.card("Detail")]
+        self.report_native_scan("east", key, items, sampled=self.time-100)
+        self.time += 1
+        trade = self.reading("Trade")
+        trade["snapshot"]["account_health"] = 12
+        self.report("east", observation=trade)
+        self.card_report("east",[self.card("Trade"),self.card("Card",health=31),self.card("Detail")])
+        stale = [{**item,"health":77} for item in items]
+        ack = self.report_native_scan("east", key, stale, sampled=self.time-150)
+        self.assertEqual([ack["risks"][n]["health"] for n in ("Trade","Card","Detail")], [12,31,90])
+        self.assertEqual(ack["portfolios"]["Detail"]["observed_at"], self.time-101)
+
+    def test_rollover_refreshes_the_running_pool_during_batch_wait(self):
+        cutoff = entry_day_window(self.time)["end"]
+        self.time = cutoff-15
+        self.center.strategy("config", {"refresh_account_pool":False}, "east")
+        items = [self.card("Filled"),self.card("Recover",health=7)]
+        self.start_cards(items)
+        self.center.sync("east")
+        self.fill_exam_order()
+        self.time += 1
+        self.observe("east","Filled")
+        self.center.sync("east")
+        self.center.decide()
+        waiting = self.center.state("east")["strategy"]
+        self.assertEqual(waiting["message"], "批间等待")
+        self.time = cutoff
+        self.plugin("east","heartbeat")
+        self.center.sync("east")
+        self.center.decide()
+        key = self.plugin("east","poll")["command"]["id"]
+        self.assertEqual(self.center.get(key)["source"], "daily-refresh")
+        self.assertEqual(self.center.read_accounts("east")["commands"], [key])
+        pending = next(a for a in self.center.state("east")["accounts"] if a["name"]=="Recover")
+        self.assertFalse(pending["candidate"])
+        self.assertIn("日切",pending["candidate_reason"])
+        self.report_native_scan("east", key, items, overrides={"Recover":{"health":54}})
+        self.plugin("east","poll",cached_scan=key)
+        self.center.sync("east")
+        self.center.decide()
+        state = self.center.state("east")
+        recovered = next(a for a in state["accounts"] if a["name"]=="Recover")
+        self.assertEqual((recovered["risk"]["health"],recovered["candidate"]), (54,True))
+        self.assertEqual(state["strategy"], waiting)
+        self.assertEqual(len([c for c in state["commands"] if c["action"]=="order.open"]),1)
+        self.assertEqual(state["workers"][0]["account_refresh_day"],cutoff)
+
+    def test_full_read_with_older_positions_does_not_finish_an_active_batch(self):
+        self.start_cards([self.card("Holding")])
+        self.center.sync("east")
+        opened = self.fill_exam_order()
+        self.time += 2
+        key = self.start_portfolio_scan()
+        ack = self.report_native_scan("east",key,[self.card("Holding")],positions={"at":self.time-3,"count":0})
+        self.assertEqual(ack["retained_counts"], {"card-Holding":1})
+        self.plugin("east","poll",cached_scan=key)
+        self.center.sync("east")
+        self.center.decide()
+        state = self.center.state("east")
+        self.assertEqual(state["strategy"]["members"], [opened["id"]])
+        account = next(a for a in state["accounts"] if a["name"]=="Holding")
+        self.assertEqual((account["risk"]["position_open"],account["card"]["active_positions"]), (True,1))
+        self.time += 1
+        self.report("east",page="/accounts",metrics=dict(generation=state["nodes"][0]["card_generation"],
+                    base_at=account["card_at"],observed_at=self.time,directory=False,items=[{"name":"Holding","active_positions":0}],
+                    positions={"at":self.time,"count":0}))
+        self.center.sync("east")
+        self.center.decide()
+        self.assertEqual(self.center.state("east")["strategy"]["message"], "批间等待")
+
+    def test_rollover_reuses_a_scan_started_in_the_extension(self):
+        self.time = entry_day_window(self.time)["end"]+1
+        self.plugin("east","read-all",id="local-daily")
+        self.center.sync("east")
+        self.assertFalse(self.center.state("east")["commands"])
+        self.assertEqual(self.plugin("east","poll")["command"]["id"], "local-daily")
+        self.report_native_scan("east","local-daily",[self.card("Shared")])
+        self.plugin("east","poll",cached_scan="local-daily")
+        self.center.sync("east")
+        self.assertFalse(self.center.state("east")["commands"])
+
+    def test_offline_readonly_rollover_retries_partial_and_survives_restart(self):
+        cutoff = entry_day_window(self.time)["end"]
+        self.time = cutoff+3
+        self.center.sync("east")
+        self.assertFalse(self.center.state("east")["commands"])
+        self.plugin_meta.update(mode="readonly", session_id="rebound", generation=2)
+        self.plugin("east","heartbeat")
+        self.center.sync("east")
+        poll = self.plugin("east","poll")
+        key = poll["command"]["id"]
+        self.assertEqual((poll["command"]["source"],poll["directory_since"]), ("daily-refresh",cutoff))
+        items = [self.card("Partial"), self.card("Ready")]
+        with self.assertRaisesRegex(Problem, "清单早于"):
+            self.report_native_scan("east", key, items, source_at=cutoff-1, sampled=cutoff-1)
+        with self.assertRaisesRegex(Problem, "早于本次美东日切"):
+            self.report_native_scan("east", key, items, sampled=cutoff-1)
+        self.report_native_scan("east", key, items, overrides={"Partial":{"health":None}})
+        self.plugin("east","poll",cached_scan=key)
+        self.center.sync("east")
+        state = self.center.state("east")
+        self.assertFalse(state["strategy"]["enabled"])
+        self.assertEqual({a["name"]:a["awaiting_daily_read"] for a in state["accounts"] if a["present"]},
+                         {"Ready":False,"Partial":True})
+        self.time += 10
+        self.center.sync("east")
+        self.assertEqual(len(self.center.state("east")["commands"]), 1)
+        self.time += 55
+        self.plugin("east","heartbeat")
+        self.center.sync("east")
+        retry = self.plugin("east","poll")["command"]["id"]
+        self.assertNotEqual(retry,key)
+        self.report_native_scan("east", retry, items)
+        self.plugin("east","poll",cached_scan=retry)
+        self.center.db.close()
+        self.center = Center(self.root/"center",self.clock,self.transport)
+        self.nodes["east"].db.close()
+        self.nodes["east"] = Bridge(self.root/"east","east",self.clock)
+        self.time += 180
+        self.plugin("east","heartbeat")
+        self.center.sync("east")
+        state = self.center.state("east")
+        self.assertEqual(len(state["commands"]), 2)
+        self.assertEqual(state["workers"][0]["account_refresh_day"], cutoff)
+        self.assertFalse(state["strategy"]["enabled"])
 
     def test_empty_portfolio_scan_cache_ack_and_idle_timeout(self):
         key = self.start_portfolio_scan()
@@ -918,6 +1073,13 @@ class FleetTest(unittest.TestCase):
         self.time = end+1
         self.card_report("east",items)
         self.center.sync("east")
+        daily = self.plugin("east","poll")["command"]
+        self.assertEqual(daily["action"], "accounts.read_all")
+        self.report_native_scan("east",daily["id"],items)
+        self.plugin("east","poll",cached_scan=daily["id"])
+        self.center.sync("east")
+        verified = next(a for a in self.center.state("east")["accounts"] if a["name"]=="Shared")
+        self.assertEqual((verified["open_lock"], verified["risk"]["health"]), (None, 90))
         self.center.submit("new-day",self.req(action="order.open",params=params))
         self.center.sync("east")
         self.assertEqual(self.plugin("east","poll")["command"]["id"],"new-day")

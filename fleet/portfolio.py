@@ -4,6 +4,7 @@ import json
 from . import cards, daily_floor
 from .protocol import PORTFOLIO_SCAN, RUN_TTL, boolean, dump, fields, ident, number, obj, require, string
 from .storage import command, finish
+from .trading_day import entry_day_window
 
 
 def progress(row):
@@ -29,6 +30,11 @@ def save(db, row, scan, now):
         if scan["failed"] or (scan["partial"] and scan.get("source") != "native"):
             error = f"完整 {scan['read']}，字段不全 {scan['partial']}，失败 {scan['failed']}"
         finish(db, row["id"], "failed" if error else "succeeded", now, error, scan)
+        day = entry_day_window(now)["start"]
+        if (scan["read"] == scan["total"] and scan["listed_at"] >= day
+                and scan.get("source_at", scan["listed_at"]) >= day
+                and all(item["values"]["observed_at"] >= day for item in scan["accounts"])):
+            db.execute("UPDATE workers SET account_refresh_day=? WHERE worker_id=?", (day, row["worker"]))
     else:
         db.execute("UPDATE commands SET result=?,updated=? WHERE id=?", (dump(scan), now, row["id"]))
 
@@ -41,7 +47,7 @@ def listed(db, row, reading, now):
     bulk = "details" in reading
     if bulk:
         require(reading.get("source_at") is not None, "批量详情缺少平台响应时间")
-    earliest = row["created"] - (330 if bulk else 0.001)
+    earliest = max(entry_day_window(now)["start"], row["created"] - (330 if bulk else 0.001))
     require(reading.get("source_at", reading["observed_at"]) >= earliest, "平台清单早于本次指令，请重新拉取", 409)
     seen = set()
     targets = []
@@ -58,7 +64,8 @@ def listed(db, row, reading, now):
         if current["ambiguous"]:
             target.update(status="failed", error="活动列表中账户重名")
         targets.append(target)
-    scan.update(stage="cache", listed_at=reading["observed_at"], accounts=targets, total=len(targets), read=0, partial=0,
+    scan.update(stage="cache", listed_at=reading["observed_at"], source_at=reading.get("source_at", reading["observed_at"]),
+                accounts=targets, total=len(targets), read=0, partial=0,
                 failed=sum(item["status"] == "failed" for item in targets))
     if bulk:
         rows = reading["details"]
@@ -92,7 +99,8 @@ def delivery(db, row, cached_scan, now):
             return {"command": None, "card_generation": db.execute("SELECT generation FROM card_request").fetchone()[0]}
     target = next_item(scan) if scan["stage"] == "portfolio" else None
     step = {"stage": "portfolio", "target": target} if target else {"stage": "list"}
-    return {"command": json.loads(row["body"]), "scan": step, "run_until": row["updated"] + RUN_TTL,
+    return {"command": json.loads(row["body"]), "scan": step, "directory_since": entry_day_window(now)["start"],
+            "run_until": row["updated"] + RUN_TTL,
             "card_generation": db.execute("SELECT generation FROM card_request").fetchone()[0]}
 
 
@@ -114,6 +122,7 @@ def native_values(data, source_at, now):
     raw = {k: v for k, v in data.items() if k not in ("daily_floor", "max_drawdown_floor", "equity_at", "equity_source")}
     detail = values(raw, now, max_age=610)
     require(detail["observed_at"] <= source_at + 1, "账户详情时间与平台响应不符")
+    require(detail["observed_at"] >= entry_day_window(now)["start"], "账户详情早于本次美东日切，请重新读取", 409)
     if detail["equity"] is not None:
         require(data.get("equity_source") in ("performance_series", "flat_balance"), "账户净值来源无效")
         detail["equity_source"] = data["equity_source"]
@@ -129,19 +138,36 @@ def native_values(data, source_at, now):
 def record_detail(db, account, item, detail, now):
     item.update(status="partial" if detail["missing"] else "read", values=detail)
     risk = json.loads(account["risk"] or "{}")
+    times = json.loads(account["risk_field_times"] or "{}")
     worker, name = account["worker_id"], account["name"]
-    recent_enough = detail.get("source") != "native" or now - detail["observed_at"] <= 90
-    if recent_enough and detail["observed_at"] >= (account["risk_at"] or 0):
-        for key in cards.AMOUNTS:
-            if detail[key] is not None or detail["daily_unlimited"] and key in ("daily_loss", "daily_limit"):
-                risk[key] = detail[key]
+    at = detail["observed_at"]
+    previous = json.loads(account["portfolio"] or "{}")
+    previous_at = previous.get("observed_at", 0)
+    if at >= entry_day_window(now)["start"]:
+        values = {key:detail[key] for key in cards.AMOUNTS if detail[key] is not None
+                  or detail["daily_unlimited"] and key in ("daily_loss", "daily_limit")}
         if detail["daily_unlimited"] or detail["daily_limit"] is not None:
-            risk["daily_unlimited"] = detail["daily_unlimited"]
-        daily_floor.capture(db, worker, name, detail["observed_at"], detail["daily_limit"], platform=detail.get("daily_floor"))
+            values["daily_unlimited"] = detail["daily_unlimited"]
         if detail.get("max_drawdown_floor") is not None:
-            risk["max_drawdown_floor"] = detail["max_drawdown_floor"]
-    db.execute("UPDATE accounts SET portfolio=?,risk=? WHERE worker_id=? AND name=?", (dump(detail), dump(risk), worker, name))
-    return {"risk": risk, "portfolio": detail}
+            values["max_drawdown_floor"] = detail["max_drawdown_floor"]
+        # Older installations already have portfolio samples, but no per-field clocks.
+        known_at = max(account["risk_at"] or 0, previous_at)
+        cards.merge_risk_fields(risk, times, values, at, known_at)
+        if at >= known_at:
+            allowance = detail["daily_limit"] if at >= times.get("daily_limit", 0) else None
+            daily_floor.capture(db, worker, name, at, allowance, platform=detail.get("daily_floor"))
+        lock = json.loads(account["open_lock"] or "{}")
+        if (lock and lock.get("card_id") == item["card_id"] and not detail["missing"]
+                and at >= max(lock["until"], known_at) and detail.get("source") == "native"):
+            db.execute("UPDATE accounts SET open_lock=NULL WHERE worker_id=? AND name=?", (worker, name))
+            db.execute("DELETE FROM card_locks WHERE worker=? AND platform_id=?", (worker, item["card_id"]))
+    latest = previous
+    if (at > previous_at or at == previous_at and
+            (previous.get("session_id") != account["listed_session"] or len(detail["missing"]) <= len(previous["missing"]))):
+        latest = {**detail, "session_id":account["listed_session"]}
+    db.execute("UPDATE accounts SET portfolio=?,risk=?,risk_field_times=? WHERE worker_id=? AND name=?",
+               (dump(latest), dump(risk), dump(times), worker, name))
+    return {"risk": risk, "portfolio": latest}
 
 
 def observe(db, worker, session, payload, now):

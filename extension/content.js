@@ -106,9 +106,10 @@
     do {
       const source=await nativeAccounts('bulk'), now=Date.now()/1000;
       if (source?.at>=since && now-source.at<=330 && Array.isArray(source.rows)) {
+        const positionsReady=source.position_at>=since && now-source.position_at<=90;
         const details=source.rows.map(row=>({id:row.id,values:VestBridgeCore.bulkCapitalValues(row,source.at,now)}));
         const items=source.rows.map(({id,name,phase,category,active_positions},index)=>{
-          const card={id,name,phase,category,active_positions}, v=details[index].values;
+          const card={id,name,phase,category,active_positions:positionsReady ? active_positions : null}, v=details[index].values;
           if (now-v.observed_at<=90) {
             for (const field of ['equity','health','daily_loss','daily_limit','drawdown','drawdown_limit'])
               if (v[field]!=null) card[field]=v[field];
@@ -116,7 +117,7 @@
           return card;
         });
         reading={source,items,observed_at:now,source_at:source.at,details};
-        if (source.rows.every(row=>row.equity!=null) || Date.now()+350>=until) return reading;
+        if (positionsReady && details.every(({values})=>values.health!=null) || Date.now()+350>=until) return reading;
       } else reading=null;
       await new Promise(resolve=>setTimeout(resolve,300));
     } while(Date.now()<until);
@@ -155,7 +156,8 @@
     const signature = VestCards.membership(reading.items);
     const changedList = signature !== directory?.signature;
     const positionAt=reading.source?.position_at;
-    const positionSample=positionAt>0 && Number.isSafeInteger(reading.source.position_count) && Date.now()/1000-positionAt<=90 &&
+    const positionSample=positionAt>0 && (!scanId || positionAt>=data.directory_since) &&
+      Number.isSafeInteger(reading.source.position_count) && Date.now()/1000-positionAt<=90 &&
       (full || changedList || directory?.supportsPositionTotals && positionAt!==directory.positionAt)
       ? {at:positionAt,count:reading.source.position_count} : null;
     const positions=positionSample ? {positions:positionSample} : {};
@@ -163,6 +165,11 @@
       const {source,details,...cardReading}=reading;
       const ack = await report({cards:{...cardReading,...positions,generation,full:full || changedList,
         purchase_request:data.purchase_request,...(scanId ? {scan_id:scanId,details,sources:source.sources} : {})}});
+      if (ack?.retained_counts) {
+        for (const item of reading.items) {
+          if (Object.hasOwn(ack.retained_counts,item.id)) item.active_positions=ack.retained_counts[item.id];
+        }
+      }
       directory = {signature,generation,source,byId:new Map(reading.items.map(x=>[x.id,x])),
         baseline:VestCards.index(reading.items),supportsMetrics:ack?.supports_metrics===true,
         supportsPositionTotals:ack?.supports_position_totals===true};
